@@ -473,6 +473,8 @@ o_iterate_index(OIndexDescr *indexDescr, OScanState *ostate,
 			/*
 			 * Lockstep scanning: when we have prefix array keys, we compare
 			 * tuples from the iterator with current array element combination.
+			 * We advance array elements inline without calling switch_to_next_range
+			 * to avoid unnecessary range recalculation.
 			 */
 			if (has_prefix_array_keys)
 			{
@@ -480,13 +482,21 @@ o_iterate_index(OIndexDescr *indexDescr, OScanState *ostate,
 				{
 					int			cmp;
 
-					tup = o_btree_iterator_fetch(ostate->iterator, tupleCsn,
-												 bound, BTreeKeyBound,
-												 true, hint);
+					/* 
+					 * Reuse tuple from previous iteration if we have one 
+					 * (happens when tuple > current array element)
+					 */
+					if (O_TUPLE_IS_NULL(tup))
+						tup = o_btree_iterator_fetch(ostate->iterator, tupleCsn,
+													 bound, BTreeKeyBound,
+													 true, hint);
 
 					if (O_TUPLE_IS_NULL(tup))
 					{
-						/* End of iterator, try next array combination */
+						/* 
+						 * End of iterator. Try to advance array and restart 
+						 * from beginning if we haven't tried all combinations.
+						 */
 						tup_is_valid = true;
 						break;
 					}
@@ -499,19 +509,31 @@ o_iterate_index(OIndexDescr *indexDescr, OScanState *ostate,
 					{
 						/* Tuple is less than current array element, skip it */
 						pfree(tup.data);
+						O_TUPLE_SET_NULL(tup);
 						continue;
 					}
 					else if (cmp > 0)
 					{
 						/*
 						 * Tuple is greater than current array element.
-						 * We need to advance to the next array combination.
-						 * Keep this tuple for comparison with next array element.
+						 * Advance to next array element inline without breaking out.
 						 */
-						pfree(tup.data);
-						O_TUPLE_SET_NULL(tup);
-						tup_is_valid = true;
-						break;
+						bool	array_advanced;
+						
+						array_advanced = o_bt_advance_array_keys_increment(ostate, 
+																		   ostate->scanDir);
+						if (!array_advanced)
+						{
+							/* 
+							 * No more array elements. Keep the tuple and break
+							 * to let outer loop call switch_to_next_range.
+							 */
+							tup_is_valid = false;
+							break;
+						}
+						
+						/* Continue with same tuple against next array element */
+						continue;
 					}
 					else
 					{
@@ -529,6 +551,7 @@ o_iterate_index(OIndexDescr *indexDescr, OScanState *ostate,
 							break;
 						}
 						pfree(tup.data);
+						O_TUPLE_SET_NULL(tup);
 					}
 				} while (true);
 			}
