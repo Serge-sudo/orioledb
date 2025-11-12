@@ -36,12 +36,6 @@ typedef struct
 	ArraySearchFunc funcs[FASTPATH_FIND_DOWNLINK_MAX_KEYS];
 	Datum		values[FASTPATH_FIND_DOWNLINK_MAX_KEYS];
 	uint8		flags[FASTPATH_FIND_DOWNLINK_MAX_KEYS];
-
-	/* Cache for chunk search results */
-	OInMemoryBlkno cachedBlkno;
-	uint64		cachedChangeCount;
-	int			cachedChunkIndex;
-	bool		cacheValid;
 } FastpathFindDownlinkMeta;
 
 typedef enum

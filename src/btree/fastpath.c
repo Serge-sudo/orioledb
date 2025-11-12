@@ -142,12 +142,6 @@ can_fastpath_find_downlink(OBTreeFindPageContext *context,
 
 	meta->enabled = true;
 	meta->length = MAXALIGN(id->nonLeafSpec.len);
-
-	/* Initialize cache as invalid */
-	meta->cacheValid = false;
-	meta->cachedBlkno = OInvalidInMemoryBlkno;
-	meta->cachedChangeCount = 0;
-	meta->cachedChunkIndex = 0;
 }
 
 static ArraySearchDesc *
@@ -285,29 +279,10 @@ fastpath_find_downlink(Pointer pagePtr,
 	OBTreeFastPathFindResult result;
 	static BTreeNonLeafTuphdr tuphdr;
 
-	/* Check if we have a cached chunk index for this page */
-	if (meta->cacheValid && 
-		meta->cachedBlkno == blkno && 
-		meta->cachedChangeCount == imageChangeCount)
-	{
-		/* Use cached chunk index */
-		chunkIndex = meta->cachedChunkIndex;
-		result = OBTreeFastPathFindOK;
-	}
-	else
-	{
-		/* Need to find the chunk */
-		result = fastpath_find_chunk(pagePtr, blkno, meta, &chunkIndex);
+	result = fastpath_find_chunk(pagePtr, blkno, meta, &chunkIndex);
 
-		if (result != OBTreeFastPathFindOK)
-			return result;
-
-		/* Cache the result */
-		meta->cacheValid = true;
-		meta->cachedBlkno = blkno;
-		meta->cachedChangeCount = imageChangeCount;
-		meta->cachedChunkIndex = chunkIndex;
-	}
+	if (result != OBTreeFastPathFindOK)
+		return result;
 
 	if (!hdr->chunkDesc[chunkIndex].chunkKeysFixed)
 		return OBTreeFastPathFindSlowpath;
