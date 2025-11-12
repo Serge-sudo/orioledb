@@ -102,6 +102,49 @@ o_bound_is_coercible(OBTreeValueBound *bound, OIndexField *field)
 		IsBinaryCoercible(bound->type, field->inputtype);
 }
 
+/*
+ * Compare tuple's prefix keys against current array elements for lockstep scanning.
+ * Returns:
+ *   -1 if tuple is less than current array combination
+ *    0 if tuple matches current array combination  
+ *    1 if tuple is greater than current array combination
+ */
+static int
+compare_tuple_with_array_keys(OTuple tup, OIndexDescr *id,
+							   BTScanOpaque so, int numPrefixExactKeys)
+{
+	BTArrayKeyInfo *arrayKeys = so->arrayKeys;
+	int			i;
+
+	for (i = 0; i < so->numArrayKeys; i++)
+	{
+		BTArrayKeyInfo *arrayKey = arrayKeys + i;
+		ScanKey		key = so->keyData + arrayKey->scan_key;
+		int			cmp;
+
+		/* Only process prefix array keys for lockstep scanning */
+		if (arrayKey->scan_key >= numPrefixExactKeys)
+			break;
+
+		Assert((key->sk_flags & SK_SEARCHARRAY) &&
+			   key->sk_strategy == BTEqualStrategyNumber &&
+			   arrayKey->num_elems > 0);
+
+		bool		isnull;
+		Datum		value = o_fastgetattr(tup, key->sk_attno, id->leafTupdesc,
+										  &id->leafSpec, &isnull);
+		Datum		arrayValue = arrayKey->elem_values[arrayKey->cur_elem];
+		OIndexField *field = &id->fields[key->sk_attno - 1];
+
+		/* Compare tuple value with current array element */
+		cmp = o_call_comparator(field->comparator, value, arrayValue);
+		if (cmp != 0)
+			return cmp;
+	}
+
+	return 0;
+}
+
 static bool
 is_tuple_valid(OTuple tup, OIndexDescr *id, OBTreeKeyRange *range,
 			   BTScanOpaque so, int numPrefixExactKeys)
@@ -270,6 +313,19 @@ switch_to_next_range(OIndexDescr *indexDescr, OScanState *ostate,
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	MemoryContext oldcontext;
 	bool		result = true;
+	bool		has_prefix_array_keys = false;
+	int			i;
+
+	/* Check if we have array keys in the prefix for lockstep scanning */
+	for (i = 0; i < so->numArrayKeys; i++)
+	{
+		BTArrayKeyInfo *arrayKey = so->arrayKeys + i;
+		if (arrayKey->scan_key < ostate->numPrefixExactKeys)
+		{
+			has_prefix_array_keys = true;
+			break;
+		}
+	}
 
 #if PG_VERSION_NUM >= 170000
 
@@ -312,7 +368,12 @@ switch_to_next_range(OIndexDescr *indexDescr, OScanState *ostate,
 	if (!result)
 		return false;
 
-	if (ostate->iterator != NULL)
+	/*
+	 * For lockstep scanning with prefix array keys, keep the iterator alive
+	 * across array element advances. It will scan the entire range covering
+	 * all array elements, comparing tuples sequentially.
+	 */
+	if (ostate->iterator != NULL && !has_prefix_array_keys)
 	{
 		btree_iterator_free(ostate->iterator);
 		ostate->iterator = NULL;
@@ -327,7 +388,11 @@ switch_to_next_range(OIndexDescr *indexDescr, OScanState *ostate,
 											indexDescr->nonLeafTupdesc->natts,
 											indexDescr->fields);
 
-	if (!ostate->exact)
+	/*
+	 * Create iterator only if we don't have one already (for lockstep scanning)
+	 * or if we need a new one.
+	 */
+	if (!ostate->exact && ostate->iterator == NULL)
 	{
 		bound = (ostate->scanDir == ForwardScanDirection
 				 ? &ostate->curKeyRange.low
@@ -352,6 +417,19 @@ o_iterate_index(OIndexDescr *indexDescr, OScanState *ostate,
 	bool		tup_fetched = false;
 	IndexScanDesc scan = &ostate->scandesc;
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	bool		has_prefix_array_keys = false;
+	int			i;
+
+	/* Check if we have array keys in the prefix for lockstep scanning */
+	for (i = 0; i < so->numArrayKeys; i++)
+	{
+		BTArrayKeyInfo *arrayKey = so->arrayKeys + i;
+		if (arrayKey->scan_key < ostate->numPrefixExactKeys)
+		{
+			has_prefix_array_keys = true;
+			break;
+		}
+	}
 
 	if (ostate->exact || ostate->curKeyRange.empty)
 	{
@@ -384,24 +462,90 @@ o_iterate_index(OIndexDescr *indexDescr, OScanState *ostate,
 			bound = (ostate->scanDir == ForwardScanDirection
 					 ? &ostate->curKeyRange.high : &ostate->curKeyRange.low);
 
-			do
+			/*
+			 * Lockstep scanning: when we have prefix array keys, we compare
+			 * tuples from the iterator with current array element combination.
+			 */
+			if (has_prefix_array_keys)
 			{
-				tup = o_btree_iterator_fetch(ostate->iterator, tupleCsn,
-											 bound, BTreeKeyBound,
-											 true, hint);
-
-				if (O_TUPLE_IS_NULL(tup))
-					tup_is_valid = true;
-				else
+				do
 				{
-					tup_is_valid = is_tuple_valid(tup, indexDescr,
-												  &ostate->curKeyRange,
-												  so,
-												  ostate->numPrefixExactKeys);
-					if (tup_is_valid)
-						tup_fetched = true;
-				}
-			} while (!tup_is_valid);
+					int			cmp;
+
+					tup = o_btree_iterator_fetch(ostate->iterator, tupleCsn,
+												 bound, BTreeKeyBound,
+												 true, hint);
+
+					if (O_TUPLE_IS_NULL(tup))
+					{
+						/* End of iterator, try next array combination */
+						tup_is_valid = true;
+						break;
+					}
+
+					/* Compare tuple with current array element combination */
+					cmp = compare_tuple_with_array_keys(tup, indexDescr, so,
+													   ostate->numPrefixExactKeys);
+
+					if (cmp < 0)
+					{
+						/* Tuple is less than current array element, skip it */
+						pfree(tup.data);
+						continue;
+					}
+					else if (cmp > 0)
+					{
+						/*
+						 * Tuple is greater than current array element.
+						 * We need to advance to the next array combination.
+						 * Keep this tuple for comparison with next array element.
+						 */
+						pfree(tup.data);
+						O_TUPLE_SET_NULL(tup);
+						tup_is_valid = true;
+						break;
+					}
+					else
+					{
+						/*
+						 * Tuple matches current array element.
+						 * Still need to validate against non-prefix array keys.
+						 */
+						tup_is_valid = is_tuple_valid(tup, indexDescr,
+													  &ostate->curKeyRange,
+													  so,
+													  ostate->numPrefixExactKeys);
+						if (tup_is_valid)
+						{
+							tup_fetched = true;
+							break;
+						}
+						pfree(tup.data);
+					}
+				} while (true);
+			}
+			else
+			{
+				/* Regular range scanning without array keys in prefix */
+				do
+				{
+					tup = o_btree_iterator_fetch(ostate->iterator, tupleCsn,
+												 bound, BTreeKeyBound,
+												 true, hint);
+
+					if (O_TUPLE_IS_NULL(tup))
+						tup_is_valid = true;
+					else
+					{
+						tup_is_valid = is_tuple_valid(tup, indexDescr,
+													  &ostate->curKeyRange,
+													  so,
+													  ostate->numPrefixExactKeys);
+						if (tup_is_valid)
+							tup_fetched = true;
+					}
+				} while (!tup_is_valid);
+			}
 		}
 		else
 		{

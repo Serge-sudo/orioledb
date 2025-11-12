@@ -181,27 +181,22 @@ o_key_data_to_key_range(OBTreeKeyRange *res, ScanKeyData *keyData,
 			Assert(arrayKeys && arrayKeys->num_elems > 0);
 			if (o_key_range_is_unbounded(res, attnum))
 			{
-				if (i < numPrefixExactKeys)
-				{
-					o_fill_key_bounds(arrayKeys->elem_values[arrayKeys->cur_elem],
-									  key->sk_subtype,
-									  setLow ? &low : NULL,
-									  setHigh ? &high : NULL,
-									  field);
-				}
-				else
-				{
-					o_fill_key_bounds(arrayKeys->elem_values[0],
-									  key->sk_subtype,
-									  setLow ? &low : NULL,
-									  NULL,
-									  field);
-					o_fill_key_bounds(arrayKeys->elem_values[arrayKeys->num_elems - 1],
-									  key->sk_subtype,
-									  NULL,
-									  setHigh ? &high : NULL,
-									  field);
-				}
+				/*
+				 * For lockstep scanning optimization: use a range from first
+				 * to last array element instead of treating each as exact.
+				 * This allows the iterator to scan sequentially through the
+				 * index while comparing against sorted array elements.
+				 */
+				o_fill_key_bounds(arrayKeys->elem_values[0],
+								  key->sk_subtype,
+								  setLow ? &low : NULL,
+								  NULL,
+								  field);
+				o_fill_key_bounds(arrayKeys->elem_values[arrayKeys->num_elems - 1],
+								  key->sk_subtype,
+								  NULL,
+								  setHigh ? &high : NULL,
+								  field);
 				if (setLow)
 					res->low.keys[attnum] = low;
 				if (setHigh)
