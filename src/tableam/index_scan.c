@@ -139,7 +139,12 @@ compare_tuple_with_array_keys(OTuple tup, OIndexDescr *id,
 		arrayValue = arrayKey->elem_values[arrayKey->cur_elem];
 		field = &id->fields[key->sk_attno - 1];
 
-		/* Compare tuple value with current array element */
+		/*
+		 * Compare tuple value with current array element.
+		 * Note: NULL handling is done by the comparator. PostgreSQL's
+		 * array handling excludes NULL from IN arrays, and NULL tuples
+		 * will not match any array element per SQL semantics.
+		 */
 		cmp = o_call_comparator(field->comparator, value, arrayValue);
 		if (cmp != 0)
 			return cmp;
