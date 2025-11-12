@@ -38,6 +38,8 @@ typedef struct OScanState
 	/* used only by direct modify functions */
 	CmdType		cmd;
 	OSnapshot	oSnapshot;
+	/* LRU cache for hot chunk lookups */
+	struct FastpathChunkCache *fastpathCache;
 } OScanState;
 
 typedef struct OIndexPlanState

@@ -357,6 +357,7 @@ extern uint32 rewind_buffers_count;
 extern Pointer o_shared_buffers;
 extern ODBProcData *oProcData;
 extern int	max_procs;
+extern int	fastpath_chunk_cache_size;
 extern OrioleDBPageDesc *page_descs;
 extern bool remove_old_checkpoint_files;
 extern bool skip_unmodified_trees;

@@ -101,6 +101,7 @@ static int	main_buffers_guc;
 static int	undo_buffers_guc;
 static int	xid_buffers_guc;
 static int	rewind_buffers_guc;
+int			fastpath_chunk_cache_size = 64;	/* Default cache size */
 int			max_procs;
 Size		orioledb_buffers_size;
 Size		orioledb_buffers_count;
@@ -401,6 +402,19 @@ _PG_init(void)
 							INT_MAX,
 							PGC_POSTMASTER,
 							GUC_UNIT_BLOCKS,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("orioledb.fastpath_chunk_cache_size",
+							"Size of the fastpath chunk LRU cache for index scans.",
+							NULL,
+							&fastpath_chunk_cache_size,
+							64,
+							0,
+							1024,
+							PGC_USERSET,
+							0,
 							NULL,
 							NULL,
 							NULL);

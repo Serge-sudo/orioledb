@@ -67,6 +67,9 @@ typedef struct
 	 */
 	OFixedKey	undoLokey;
 	uint16		flags;
+
+	/* Fastpath chunk cache for index scans */
+	struct FastpathChunkCache *fastpathCache;
 } OBTreeFindPageContext;
 
 /* OBTreeFindPageContext flags */

@@ -509,6 +509,13 @@ o_btree_iterator_set_callback(BTreeIterator *it,
 	it->fetchCallbackArg = arg;
 }
 
+void
+o_btree_iterator_set_fastpath_cache(BTreeIterator *it,
+									FastpathChunkCache *cache)
+{
+	it->context.fastpathCache = cache;
+}
+
 OTuple
 o_btree_iterator_fetch(BTreeIterator *it, CommitSeqNo *tupleCsn,
 					   void *end, BTreeKeyType endType,

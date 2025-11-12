@@ -15,6 +15,7 @@
 
 #include "orioledb.h"
 
+#include "btree/fastpath.h"
 #include "btree/io.h"
 #include "btree/iterator.h"
 #include "tableam/bitmap_scan.h"
@@ -48,6 +49,9 @@ init_index_scan_state(OPlanState *o_plan_state, OScanState *ostate, Relation ind
 
 	scan->parallel_scan = NULL;
 	scan->xs_temp_snap = false;
+
+	/* Initialize fastpath chunk cache */
+	ostate->fastpathCache = fastpath_cache_init(fastpath_chunk_cache_size, ostate->cxt);
 }
 
 static bool
@@ -336,6 +340,7 @@ switch_to_next_range(OIndexDescr *indexDescr, OScanState *ostate,
 												   BTreeKeyBound, &ostate->oSnapshot,
 												   ostate->scanDir);
 		o_btree_iterator_set_tuple_ctx(ostate->iterator, tupleCxt);
+		o_btree_iterator_set_fastpath_cache(ostate->iterator, ostate->fastpathCache);
 	}
 
 	MemoryContextSwitchTo(oldcontext);

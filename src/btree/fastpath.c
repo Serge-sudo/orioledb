@@ -28,6 +28,7 @@
 #include "postgres_ext.h"
 #include "storage/itemptr.h"
 #include "tableam/key_range.h"
+#include "utils/memutils.h"
 
 #include "catalog/pg_opclass_d.h"
 #include "commands/defrem.h"
@@ -260,7 +261,8 @@ fastpath_find_downlink(Pointer pagePtr,
 					   OInMemoryBlkno blkno,
 					   FastpathFindDownlinkMeta *meta,
 					   BTreePageItemLocator *loc,
-					   BTreeNonLeafTuphdr **tuphdrPtr)
+					   BTreeNonLeafTuphdr **tuphdrPtr,
+					   FastpathChunkCache *cache)
 {
 	BTreePageHeader *imgHdr = (BTreePageHeader *) pagePtr;
 	BTreePageHeader *hdr = (BTreePageHeader *) O_GET_IN_MEMORY_PAGE(blkno);
@@ -279,10 +281,21 @@ fastpath_find_downlink(Pointer pagePtr,
 	OBTreeFastPathFindResult result;
 	static BTreeNonLeafTuphdr tuphdr;
 
-	result = fastpath_find_chunk(pagePtr, blkno, meta, &chunkIndex);
+	/* Try to use the cache first */
+	if (fastpath_cache_lookup(cache, blkno, imageChangeCount, &chunkIndex))
+	{
+		result = OBTreeFastPathFindOK;
+	}
+	else
+	{
+		result = fastpath_find_chunk(pagePtr, blkno, meta, &chunkIndex);
 
-	if (result != OBTreeFastPathFindOK)
-		return result;
+		if (result != OBTreeFastPathFindOK)
+			return result;
+
+		/* Cache the successful chunk lookup */
+		fastpath_cache_insert(cache, blkno, imageChangeCount, chunkIndex);
+	}
 
 	if (!hdr->chunkDesc[chunkIndex].chunkKeysFixed)
 		return OBTreeFastPathFindSlowpath;
@@ -749,4 +762,217 @@ tid_array_search(Pointer p, int stride, int *lower, int *upper, Datum keyDatum)
 	}
 
 	*upper = low;
+}
+
+/*
+ * Initialize a new fastpath chunk cache with given capacity.
+ * The cache uses an LRU eviction policy implemented as a doubly-linked list.
+ */
+FastpathChunkCache *
+fastpath_cache_init(int capacity, MemoryContext mctx)
+{
+FastpathChunkCache *cache;
+MemoryContext oldContext;
+
+if (capacity <= 0)
+return NULL;
+
+oldContext = MemoryContextSwitchTo(mctx);
+
+cache = (FastpathChunkCache *) palloc0(sizeof(FastpathChunkCache));
+cache->head = NULL;
+cache->tail = NULL;
+cache->size = 0;
+cache->capacity = capacity;
+cache->mctx = mctx;
+
+MemoryContextSwitchTo(oldContext);
+
+return cache;
+}
+
+/*
+ * Lookup an entry in the cache. If found and valid, move it to head (MRU)
+ * and return true. Returns false if not found or invalidated.
+ */
+bool
+fastpath_cache_lookup(FastpathChunkCache *cache,
+  OInMemoryBlkno blkno,
+  uint64 changeCount,
+  int *chunkIndex)
+{
+FastpathChunkCacheEntry *entry;
+
+if (cache == NULL)
+return false;
+
+/* Linear search through the list */
+for (entry = cache->head; entry != NULL; entry = entry->next)
+{
+if (entry->blkno == blkno)
+{
+/* Found entry, check if still valid */
+if (entry->changeCount != changeCount)
+{
+/* Invalidated, remove from list */
+if (entry->prev)
+entry->prev->next = entry->next;
+else
+cache->head = entry->next;
+
+if (entry->next)
+entry->next->prev = entry->prev;
+else
+cache->tail = entry->prev;
+
+cache->size--;
+pfree(entry);
+return false;
+}
+
+/* Valid entry found, move to head if not already there */
+if (entry != cache->head)
+{
+/* Remove from current position */
+if (entry->prev)
+entry->prev->next = entry->next;
+
+if (entry->next)
+entry->next->prev = entry->prev;
+else
+cache->tail = entry->prev;
+
+/* Insert at head */
+entry->prev = NULL;
+entry->next = cache->head;
+if (cache->head)
+cache->head->prev = entry;
+cache->head = entry;
+
+if (cache->tail == NULL)
+cache->tail = entry;
+}
+
+*chunkIndex = entry->chunkIndex;
+return true;
+}
+}
+
+return false;
+}
+
+/*
+ * Insert or update an entry in the cache. If cache is full, evict the LRU entry.
+ * New entries are added at the head (MRU position).
+ */
+void
+fastpath_cache_insert(FastpathChunkCache *cache,
+  OInMemoryBlkno blkno,
+  uint64 changeCount,
+  int chunkIndex)
+{
+FastpathChunkCacheEntry *entry;
+MemoryContext oldContext;
+
+if (cache == NULL)
+return;
+
+oldContext = MemoryContextSwitchTo(cache->mctx);
+
+/* Check if entry already exists (update scenario) */
+for (entry = cache->head; entry != NULL; entry = entry->next)
+{
+if (entry->blkno == blkno)
+{
+/* Update existing entry */
+entry->changeCount = changeCount;
+entry->chunkIndex = chunkIndex;
+
+/* Move to head if not already there */
+if (entry != cache->head)
+{
+/* Remove from current position */
+if (entry->prev)
+entry->prev->next = entry->next;
+
+if (entry->next)
+entry->next->prev = entry->prev;
+else
+cache->tail = entry->prev;
+
+/* Insert at head */
+entry->prev = NULL;
+entry->next = cache->head;
+if (cache->head)
+cache->head->prev = entry;
+cache->head = entry;
+}
+
+MemoryContextSwitchTo(oldContext);
+return;
+}
+}
+
+/* New entry needed */
+if (cache->size >= cache->capacity)
+{
+/* Evict LRU entry (tail) */
+FastpathChunkCacheEntry *lru = cache->tail;
+
+if (lru)
+{
+cache->tail = lru->prev;
+if (cache->tail)
+cache->tail->next = NULL;
+else
+cache->head = NULL;
+
+pfree(lru);
+cache->size--;
+}
+}
+
+/* Create and insert new entry at head */
+entry = (FastpathChunkCacheEntry *) palloc(sizeof(FastpathChunkCacheEntry));
+entry->blkno = blkno;
+entry->changeCount = changeCount;
+entry->chunkIndex = chunkIndex;
+entry->prev = NULL;
+entry->next = cache->head;
+
+if (cache->head)
+cache->head->prev = entry;
+cache->head = entry;
+
+if (cache->tail == NULL)
+cache->tail = entry;
+
+cache->size++;
+
+MemoryContextSwitchTo(oldContext);
+}
+
+/*
+ * Destroy the cache and free all resources.
+ */
+void
+fastpath_cache_destroy(FastpathChunkCache *cache)
+{
+FastpathChunkCacheEntry *entry,
+   *next;
+
+if (cache == NULL)
+return;
+
+/* Free all entries */
+entry = cache->head;
+while (entry != NULL)
+{
+next = entry->next;
+pfree(entry);
+entry = next;
+}
+
+/* Free the cache structure itself */
+pfree(cache);
 }

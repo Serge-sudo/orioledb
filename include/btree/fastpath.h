@@ -46,6 +46,28 @@ typedef enum
 	OBTreeFastPathFindSlowpath
 } OBTreeFastPathFindResult;
 
+/*
+ * LRU cache for hot chunk lookups during index scans.
+ * Entries are stored in a doubly-linked list with most recently used at head.
+ */
+typedef struct FastpathChunkCacheEntry
+{
+	OInMemoryBlkno blkno;		/* Page block number */
+	uint64		changeCount;	/* Page change count for validation */
+	int			chunkIndex;		/* Cached chunk index */
+	struct FastpathChunkCacheEntry *prev;	/* Previous in LRU list */
+	struct FastpathChunkCacheEntry *next;	/* Next in LRU list */
+} FastpathChunkCacheEntry;
+
+typedef struct FastpathChunkCache
+{
+	FastpathChunkCacheEntry *head;	/* Most recently used */
+	FastpathChunkCacheEntry *tail;	/* Least recently used */
+	int			size;			/* Current number of entries */
+	int			capacity;		/* Maximum number of entries */
+	MemoryContext mctx;			/* Memory context for allocations */
+} FastpathChunkCache;
+
 extern void can_fastpath_find_downlink(OBTreeFindPageContext *context,
 									   void *key,
 									   BTreeKeyType keyType,
@@ -58,6 +80,19 @@ extern OBTreeFastPathFindResult fastpath_find_downlink(Pointer pagePtr,
 													   OInMemoryBlkno blkno,
 													   FastpathFindDownlinkMeta *meta,
 													   BTreePageItemLocator *loc,
-													   BTreeNonLeafTuphdr **tuphdrPtr);
+													   BTreeNonLeafTuphdr **tuphdrPtr,
+													   FastpathChunkCache *cache);
+
+/* Cache management functions */
+extern FastpathChunkCache *fastpath_cache_init(int capacity, MemoryContext mctx);
+extern bool fastpath_cache_lookup(FastpathChunkCache *cache,
+								  OInMemoryBlkno blkno,
+								  uint64 changeCount,
+								  int *chunkIndex);
+extern void fastpath_cache_insert(FastpathChunkCache *cache,
+								  OInMemoryBlkno blkno,
+								  uint64 changeCount,
+								  int chunkIndex);
+extern void fastpath_cache_destroy(FastpathChunkCache *cache);
 
 #endif							/* __BTREE_FASTPATH_H__ */

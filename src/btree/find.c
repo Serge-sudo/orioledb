@@ -80,6 +80,7 @@ init_page_find_context(OBTreeFindPageContext *context, BTreeDescr *desc,
 	context->parentImgEntry = NULL;
 	O_TUPLE_SET_NULL(context->insertTuple);
 	O_TUPLE_SET_NULL(context->lokey.tuple);
+	context->fastpathCache = NULL;
 }
 
 
@@ -103,7 +104,8 @@ page_find_downlink(OBTreeFindPageInternalContext *intCxt,
 		OBTreeFastPathFindResult result;
 
 		result = fastpath_find_downlink(intCxt->pagePtr, intCxt->blkno,
-										meta, loc, tuphdr);
+										meta, loc, tuphdr,
+										context->fastpathCache);
 
 		if (result != OBTreeFastPathFindSlowpath)
 			return result;
