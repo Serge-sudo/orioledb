@@ -142,6 +142,12 @@ can_fastpath_find_downlink(OBTreeFindPageContext *context,
 
 	meta->enabled = true;
 	meta->length = MAXALIGN(id->nonLeafSpec.len);
+
+	/* Initialize cache as invalid */
+	meta->cacheValid = false;
+	meta->cachedBlkno = OInvalidInMemoryBlkno;
+	meta->cachedChangeCount = 0;
+	meta->cachedChunkIndex = 0;
 }
 
 static ArraySearchDesc *
@@ -279,10 +285,29 @@ fastpath_find_downlink(Pointer pagePtr,
 	OBTreeFastPathFindResult result;
 	static BTreeNonLeafTuphdr tuphdr;
 
-	result = fastpath_find_chunk(pagePtr, blkno, meta, &chunkIndex);
+	/* Check if we have a cached chunk index for this page */
+	if (meta->cacheValid && 
+		meta->cachedBlkno == blkno && 
+		meta->cachedChangeCount == imageChangeCount)
+	{
+		/* Use cached chunk index */
+		chunkIndex = meta->cachedChunkIndex;
+		result = OBTreeFastPathFindOK;
+	}
+	else
+	{
+		/* Need to find the chunk */
+		result = fastpath_find_chunk(pagePtr, blkno, meta, &chunkIndex);
 
-	if (result != OBTreeFastPathFindOK)
-		return result;
+		if (result != OBTreeFastPathFindOK)
+			return result;
+
+		/* Cache the result */
+		meta->cacheValid = true;
+		meta->cachedBlkno = blkno;
+		meta->cachedChangeCount = imageChangeCount;
+		meta->cachedChunkIndex = chunkIndex;
+	}
 
 	if (!hdr->chunkDesc[chunkIndex].chunkKeysFixed)
 		return OBTreeFastPathFindSlowpath;
@@ -490,167 +515,206 @@ fastpath_find_chunk(Pointer pagePtr,
 /*
  * Find the given value in the fixed-stride array of integers.  The functions
  * below do the same for other datatypes.
+ * 
+ * Uses binary search for better performance on larger arrays.
  */
 static void
 int4_array_search(Pointer p, int stride, int *lower, int *upper, Datum keyDatum)
 {
-	int			i;
-	bool		lowerSet = false;
+	int			low = *lower;
+	int			high = *upper;
 	int32		key = DatumGetInt32(keyDatum);
+	Pointer		base = p;
 
-	p += *lower * stride;
-
-	for (i = *lower; i < *upper; i++)
+	/* Binary search to find the first element >= key */
+	while (low < high)
 	{
-		int32		value = *((int32 *) p);
+		int			mid = low + (high - low) / 2;
+		int32		value = *((int32 *) (base + mid * stride));
 
-		if (value == key && !lowerSet)
-		{
-			*lower = i;
-			lowerSet = true;
-		}
-		else if (value > key)
-		{
-			if (!lowerSet)
-				*lower = i;
-			*upper = i;
-			return;
-		}
-
-		p += stride;
+		if (value < key)
+			low = mid + 1;
+		else
+			high = mid;
 	}
-	if (!lowerSet)
-		*lower = *upper;
+
+	/* low now points to first element >= key */
+	*lower = low;
+
+	/* Now find the upper bound (first element > key) */
+	high = *upper;
+	while (low < high)
+	{
+		int			mid = low + (high - low) / 2;
+		int32		value = *((int32 *) (base + mid * stride));
+
+		if (value <= key)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+
+	*upper = low;
 }
 
 static void
 int8_array_search(Pointer p, int stride, int *lower, int *upper, Datum keyDatum)
 {
-	int			i;
-	bool		lowerSet = false;
+	int			low = *lower;
+	int			high = *upper;
 	int64		key = DatumGetInt64(keyDatum);
+	Pointer		base = p;
 
-	p += *lower * stride;
-
-	for (i = *lower; i < *upper; i++)
+	/* Binary search to find the first element >= key */
+	while (low < high)
 	{
-		int64		value = *((int64 *) p);
+		int			mid = low + (high - low) / 2;
+		int64		value = *((int64 *) (base + mid * stride));
 
-		if (value == key && !lowerSet)
-		{
-			*lower = i;
-			lowerSet = true;
-		}
-		else if (value > key)
-		{
-			if (!lowerSet)
-				*lower = i;
-			*upper = i;
-			return;
-		}
-
-		p += stride;
+		if (value < key)
+			low = mid + 1;
+		else
+			high = mid;
 	}
-	if (!lowerSet)
-		*lower = *upper;
+
+	/* low now points to first element >= key */
+	*lower = low;
+
+	/* Now find the upper bound (first element > key) */
+	high = *upper;
+	while (low < high)
+	{
+		int			mid = low + (high - low) / 2;
+		int64		value = *((int64 *) (base + mid * stride));
+
+		if (value <= key)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+
+	*upper = low;
 }
 
 static void
 oid_array_search(Pointer p, int stride, int *lower, int *upper, Datum keyDatum)
 {
-	int			i;
-	bool		lowerSet = false;
+	int			low = *lower;
+	int			high = *upper;
 	Oid			key = DatumGetObjectId(keyDatum);
+	Pointer		base = p;
 
-	p += *lower * stride;
-
-	for (i = *lower; i < *upper; i++)
+	/* Binary search to find the first element >= key */
+	while (low < high)
 	{
-		Oid			value = *((Oid *) p);
+		int			mid = low + (high - low) / 2;
+		Oid			value = *((Oid *) (base + mid * stride));
 
-		if (value == key && !lowerSet)
-		{
-			*lower = i;
-			lowerSet = true;
-		}
-		else if (value > key)
-		{
-			if (!lowerSet)
-				*lower = i;
-			*upper = i;
-			return;
-		}
-
-		p += stride;
+		if (value < key)
+			low = mid + 1;
+		else
+			high = mid;
 	}
-	if (!lowerSet)
-		*lower = *upper;
+
+	/* low now points to first element >= key */
+	*lower = low;
+
+	/* Now find the upper bound (first element > key) */
+	high = *upper;
+	while (low < high)
+	{
+		int			mid = low + (high - low) / 2;
+		Oid			value = *((Oid *) (base + mid * stride));
+
+		if (value <= key)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+
+	*upper = low;
 }
 
 static void
 float4_array_search(Pointer p, int stride, int *lower, int *upper, Datum keyDatum)
 {
-	int			i;
-	bool		lowerSet = false;
+	int			low = *lower;
+	int			high = *upper;
 	float4		key = DatumGetFloat4(keyDatum);
+	Pointer		base = p;
 
-	p += *lower * stride;
-
-	for (i = *lower; i < *upper; i++)
+	/* Binary search to find the first element >= key */
+	while (low < high)
 	{
+		int			mid = low + (high - low) / 2;
 		/* cppcheck-suppress invalidPointerCast */
-		float4		value = *((float4 *) p);
+		float4		value = *((float4 *) (base + mid * stride));
 
-		if (value == key && !lowerSet)
-		{
-			*lower = i;
-			lowerSet = true;
-		}
-		else if (value > key)
-		{
-			if (!lowerSet)
-				*lower = i;
-			*upper = i;
-			return;
-		}
-
-		p += stride;
+		if (value < key)
+			low = mid + 1;
+		else
+			high = mid;
 	}
-	if (!lowerSet)
-		*lower = *upper;
+
+	/* low now points to first element >= key */
+	*lower = low;
+
+	/* Now find the upper bound (first element > key) */
+	high = *upper;
+	while (low < high)
+	{
+		int			mid = low + (high - low) / 2;
+		/* cppcheck-suppress invalidPointerCast */
+		float4		value = *((float4 *) (base + mid * stride));
+
+		if (value <= key)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+
+	*upper = low;
 }
 
 static void
 float8_array_search(Pointer p, int stride, int *lower, int *upper, Datum keyDatum)
 {
-	int			i;
-	bool		lowerSet = false;
+	int			low = *lower;
+	int			high = *upper;
 	float8		key = DatumGetFloat8(keyDatum);
+	Pointer		base = p;
 
-	p += *lower * stride;
-
-	for (i = *lower; i < *upper; i++)
+	/* Binary search to find the first element >= key */
+	while (low < high)
 	{
+		int			mid = low + (high - low) / 2;
 		/* cppcheck-suppress invalidPointerCast */
-		float8		value = *((float8 *) p);
+		float8		value = *((float8 *) (base + mid * stride));
 
-		if (value == key && !lowerSet)
-		{
-			*lower = i;
-			lowerSet = true;
-		}
-		else if (value > key)
-		{
-			if (!lowerSet)
-				*lower = i;
-			*upper = i;
-			return;
-		}
-
-		p += stride;
+		if (value < key)
+			low = mid + 1;
+		else
+			high = mid;
 	}
-	if (!lowerSet)
-		*lower = *upper;
+
+	/* low now points to first element >= key */
+	*lower = low;
+
+	/* Now find the upper bound (first element > key) */
+	high = *upper;
+	while (low < high)
+	{
+		int			mid = low + (high - low) / 2;
+		/* cppcheck-suppress invalidPointerCast */
+		float8		value = *((float8 *) (base + mid * stride));
+
+		if (value <= key)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+
+	*upper = low;
 }
 
 static int
@@ -676,31 +740,38 @@ tid_cmp(ItemPointer arg1, ItemPointer arg2)
 static void
 tid_array_search(Pointer p, int stride, int *lower, int *upper, Datum keyDatum)
 {
-	int			i;
-	bool		lowerSet = false;
+	int			low = *lower;
+	int			high = *upper;
 	ItemPointer key = DatumGetItemPointer(keyDatum);
+	Pointer		base = p;
 
-	p += *lower * stride;
-
-	for (i = *lower; i < *upper; i++)
+	/* Binary search to find the first element >= key */
+	while (low < high)
 	{
-		int			cmp = tid_cmp((ItemPointer) p, key);
+		int			mid = low + (high - low) / 2;
+		int			cmp = tid_cmp((ItemPointer) (base + mid * stride), key);
 
-		if (cmp == 0 && !lowerSet)
-		{
-			*lower = i;
-			lowerSet = true;
-		}
-		else if (cmp > 0)
-		{
-			if (!lowerSet)
-				*lower = i;
-			*upper = i;
-			return;
-		}
-
-		p += stride;
+		if (cmp < 0)
+			low = mid + 1;
+		else
+			high = mid;
 	}
-	if (!lowerSet)
-		*lower = *upper;
+
+	/* low now points to first element >= key */
+	*lower = low;
+
+	/* Now find the upper bound (first element > key) */
+	high = *upper;
+	while (low < high)
+	{
+		int			mid = low + (high - low) / 2;
+		int			cmp = tid_cmp((ItemPointer) (base + mid * stride), key);
+
+		if (cmp <= 0)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+
+	*upper = low;
 }
