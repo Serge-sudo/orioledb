@@ -121,6 +121,10 @@ compare_tuple_with_array_keys(OTuple tup, OIndexDescr *id,
 		BTArrayKeyInfo *arrayKey = arrayKeys + i;
 		ScanKey		key = so->keyData + arrayKey->scan_key;
 		int			cmp;
+		bool		isnull;
+		Datum		value;
+		Datum		arrayValue;
+		OIndexField *field;
 
 		/* Only process prefix array keys for lockstep scanning */
 		if (arrayKey->scan_key >= numPrefixExactKeys)
@@ -130,11 +134,10 @@ compare_tuple_with_array_keys(OTuple tup, OIndexDescr *id,
 			   key->sk_strategy == BTEqualStrategyNumber &&
 			   arrayKey->num_elems > 0);
 
-		bool		isnull;
-		Datum		value = o_fastgetattr(tup, key->sk_attno, id->leafTupdesc,
-										  &id->leafSpec, &isnull);
-		Datum		arrayValue = arrayKey->elem_values[arrayKey->cur_elem];
-		OIndexField *field = &id->fields[key->sk_attno - 1];
+		value = o_fastgetattr(tup, key->sk_attno, id->leafTupdesc,
+							  &id->leafSpec, &isnull);
+		arrayValue = arrayKey->elem_values[arrayKey->cur_elem];
+		field = &id->fields[key->sk_attno - 1];
 
 		/* Compare tuple value with current array element */
 		cmp = o_call_comparator(field->comparator, value, arrayValue);
