@@ -547,6 +547,25 @@ o_iterate_index(OIndexDescr *indexDescr, OScanState *ostate,
 													  ostate->numPrefixExactKeys);
 						if (tup_is_valid)
 						{
+							/*
+							 * Optimization: Since array is sorted without duplicates
+							 * and index has unique values (for primary key), we know
+							 * the next tuple will be > current array element. 
+							 * Advance array immediately to avoid redundant comparison.
+							 */
+							bool	array_advanced;
+							
+							array_advanced = o_bt_advance_array_keys_increment(ostate, 
+																			   ostate->scanDir);
+							if (!array_advanced)
+							{
+								/* 
+								 * No more array elements. Mark range as exhausted
+								 * so outer loop will try switch_to_next_range.
+								 */
+								ostate->curKeyRange.empty = true;
+							}
+							
 							tup_fetched = true;
 							break;
 						}
