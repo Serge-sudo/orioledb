@@ -84,12 +84,12 @@ o_tuple_read_next_field_ptr(OTupleReaderState *state)
 	Form_pg_attribute att;
 	uint32		off;
 
-	if (state->attnum >= state->natts)
+	if (unlikely(state->attnum >= state->natts))
 		return NULL;
 
 	att = TupleDescAttr(state->desc, state->attnum);
 
-	if (state->hasnulls && att_isnull(state->attnum, state->bp))
+	if (unlikely(state->hasnulls && att_isnull(state->attnum, state->bp)))
 	{
 		state->slow = true;
 		state->attnum++;
@@ -166,7 +166,7 @@ o_toast_nocachegetattr_ptr(OTuple tuple,
 	{
 		tp = (char *) tuple.data;
 	}
-	else if (tup->hasnulls)
+	else if (unlikely(tup->hasnulls))
 	{
 		/*
 		 * there's a null somewhere in the tuple
@@ -201,13 +201,13 @@ o_toast_nocachegetattr_ptr(OTuple tuple,
 
 	att = TupleDescAttr(tupleDesc, attnum);
 
-	if (!slow)
+	if (likely(!slow))
 	{
 		/*
 		 * If we get here, there are no nulls up to and including the target
 		 * attribute.  If we have a cached offset, we can use it.
 		 */
-		if (att->attcacheoff >= 0)
+		if (likely(att->attcacheoff >= 0))
 			return tp + att->attcacheoff;
 	}
 
@@ -255,7 +255,7 @@ o_toast_nocachegetattr(OTuple tuple,
 	{
 		tp = (char *) tuple.data;
 	}
-	else if (tup->hasnulls)
+	else if (unlikely(tup->hasnulls))
 	{
 		/*
 		 * there's a null somewhere in the tuple
@@ -288,7 +288,7 @@ o_toast_nocachegetattr(OTuple tuple,
 		tp = (char *) (tuple.data + SizeOfOTupleHeader);
 	}
 
-	if (!slow)
+	if (likely(!slow))
 	{
 		Form_pg_attribute att;
 
@@ -297,7 +297,7 @@ o_toast_nocachegetattr(OTuple tuple,
 		 * attribute.  If we have a cached offset, we can use it.
 		 */
 		att = TupleDescAttr(tupleDesc, attnum);
-		if (att->attcacheoff >= 0)
+		if (likely(att->attcacheoff >= 0))
 			return fetchatt(att, tp + att->attcacheoff);
 	}
 
@@ -305,7 +305,7 @@ o_toast_nocachegetattr(OTuple tuple,
 	for (i = 0; i <= attnum; i++)
 		result = o_tuple_read_next_field(&reader, is_null);
 
-	if (*is_null && !tup->hasnulls && tup->natts < tupleDesc->natts)
+	if (unlikely(*is_null && !tup->hasnulls && tup->natts < tupleDesc->natts))
 	{
 		/*
 		 * This possible when reading tuple without nulls after adding null
