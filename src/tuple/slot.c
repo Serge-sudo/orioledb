@@ -235,14 +235,14 @@ tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 
 	/*
 	 * Early return if the requested number of attributes is already valid or
-	 * the tuple is null. These are the most common early exit cases.
+	 * the tuple is null.
 	 */
-	if (likely(__natts <= slot->tts_nvalid) || unlikely(O_TUPLE_IS_NULL(oslot->tuple)))
+	if (__natts <= slot->tts_nvalid || O_TUPLE_IS_NULL(oslot->tuple))
 		return;
 
 	/* Ensure the descriptor is not NULL. */
 	Assert(descr);
-	if (unlikely(oslot->ixnum == BridgeIndexNumber))
+	if (oslot->ixnum == BridgeIndexNumber)
 		idx = descr->bridge;
 	else
 		idx = descr->indices[oslot->ixnum];
@@ -301,111 +301,139 @@ tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 		natts = oslot->state.desc->natts;
 	}
 
-	/* Iterate over the attributes to populate values and null flags. */
-	for (attnum = slot->tts_nvalid; attnum < natts; attnum++)
+	/*
+	 * Iterate over the attributes to populate values and null flags.
+	 * Optimize by hoisting invariant conditions outside the loop.
+	 */
+	if (oslot->ixnum == PrimaryIndexNumber)
 	{
-		Form_pg_attribute thisatt;
-		int			res_attnum = 0;
-
-		/*
-		 * Determine the result attribute number based on the index type and
-		 * the order of attributes.
-		 */
-		if (likely(oslot->ixnum == PrimaryIndexNumber))
+		if (index_order)
 		{
-			if (index_order)
+			/* Primary index with index order - most complex case */
+			for (attnum = slot->tts_nvalid; attnum < natts; attnum++)
 			{
-				if (unlikely(cur_tbl_attnum >= idx->nFields ||
-							 attnum != idx->pk_tbl_field_map[cur_tbl_attnum].key))
-					res_attnum = -2;
-				else
+				Form_pg_attribute thisatt;
+				int			res_attnum;
+
+				if (cur_tbl_attnum >= idx->nFields ||
+					attnum != idx->pk_tbl_field_map[cur_tbl_attnum].key)
 				{
-					res_attnum = idx->pk_tbl_field_map[cur_tbl_attnum].value;
-					cur_tbl_attnum++;
+					/* Dropped attribute - skip it */
+					bool		dropped_null;
+					(void) o_tuple_read_next_field(&oslot->state, &dropped_null);
+					continue;
+				}
+
+				res_attnum = idx->pk_tbl_field_map[cur_tbl_attnum].value;
+				cur_tbl_attnum++;
+
+				values[res_attnum] = o_tuple_read_next_field(&oslot->state,
+															 &isnull[res_attnum]);
+
+				thisatt = TupleDescAttr(idx->leafTupdesc, attnum);
+
+				/* Check for TOASTed attributes */
+				if (!isnull[res_attnum] && !thisatt->attbyval && thisatt->attlen < 0)
+				{
+					Pointer		p = DatumGetPointer(values[res_attnum]);
+
+					Assert(p);
+					if (IS_TOAST_POINTER(p) && !VARATT_IS_EXTERNAL_ORIOLEDB(p))
+					{
+						hastoast = true;
+						natts = Max(natts, idx->maxTableAttnum - ctid_off);
+					}
 				}
 			}
-			else
-				res_attnum = attnum;
-		}
-		else if (index_order)
-		{
-			if (unlikely(GET_PRIMARY(descr)->primaryIsCtid && attnum == natts - 1))
-				res_attnum = -1;
-			else
-				res_attnum = attnum;
 		}
 		else
 		{
-			Assert(false);
-		}
-
-		/* Ensure the result attribute number is valid. */
-		Assert(res_attnum >= -2);
-		if (likely(res_attnum >= 0))
-		{
-			if (unlikely(oslot->ixnum == BridgeIndexNumber && attnum == 0))
+			/* Primary index without index order - simpler case */
+			for (attnum = slot->tts_nvalid; attnum < natts; attnum++)
 			{
-				/*
-				 * first bridge_ctid attribute was already read in
-				 * tts_orioledb_init_reader
-				 */
-				values[res_attnum] = PointerGetDatum(&oslot->bridge_ctid);
-				isnull[res_attnum] = false;
+				Form_pg_attribute thisatt;
+
+				values[attnum] = o_tuple_read_next_field(&oslot->state,
+														 &isnull[attnum]);
+
+				thisatt = TupleDescAttr(slot->tts_tupleDescriptor, attnum);
+
+				/* Check for TOASTed attributes */
+				if (!isnull[attnum] && !thisatt->attbyval && thisatt->attlen < 0)
+				{
+					Pointer		p = DatumGetPointer(values[attnum]);
+
+					Assert(p);
+					if (IS_TOAST_POINTER(p) && !VARATT_IS_EXTERNAL_ORIOLEDB(p))
+					{
+						hastoast = true;
+						natts = Max(natts, idx->maxTableAttnum - ctid_off);
+					}
+				}
+			}
+		}
+	}
+	else if (index_order)
+	{
+		/* Secondary index with index order */
+		bool primaryIsCtid = GET_PRIMARY(descr)->primaryIsCtid;
+		int last_attnum = natts - 1;
+
+		for (attnum = slot->tts_nvalid; attnum < natts; attnum++)
+		{
+			Form_pg_attribute thisatt;
+			int			res_attnum;
+
+			if (oslot->ixnum == BridgeIndexNumber && attnum == 0)
+			{
+				/* Special case: first bridge_ctid attribute */
+				values[attnum] = PointerGetDatum(&oslot->bridge_ctid);
+				isnull[attnum] = false;
 				continue;
 			}
 
-			/*
-			 * Read the next field value and update the slot's value and null
-			 * arrays.
-			 */
+			if (primaryIsCtid && attnum == last_attnum)
+			{
+				/* Special handling for ctid attribute */
+				if (!idx->bridging)
+				{
+					Datum		iptr_value PG_USED_FOR_ASSERTS_ONLY;
+					bool		iptr_null;
+
+					iptr_value = o_tuple_read_next_field(&oslot->state,
+														 &iptr_null);
+
+					Assert(iptr_null == false);
+					Assert(memcmp(&slot->tts_tid,
+								  (ItemPointer) iptr_value, sizeof(ItemPointerData)) == 0);
+				}
+				continue;
+			}
+
+			res_attnum = attnum;
+
 			values[res_attnum] = o_tuple_read_next_field(&oslot->state,
 														 &isnull[res_attnum]);
 
-			/* Determine the attribute metadata based on the index and order. */
-			if (unlikely(oslot->ixnum == PrimaryIndexNumber && !index_order))
-				thisatt = TupleDescAttr(slot->tts_tupleDescriptor, attnum);
-			else
-				thisatt = TupleDescAttr(idx->leafTupdesc, attnum);
+			thisatt = TupleDescAttr(idx->leafTupdesc, attnum);
 
-			/*
-			 * Check for TOASTed attributes and adjust the number of
-			 * attributes if necessary.
-			 */
-			if (unlikely(!isnull[res_attnum] && !thisatt->attbyval && thisatt->attlen < 0))
+			/* Check for TOASTed attributes */
+			if (!isnull[res_attnum] && !thisatt->attbyval && thisatt->attlen < 0)
 			{
 				Pointer		p = DatumGetPointer(values[res_attnum]);
 
 				Assert(p);
-				if (unlikely(IS_TOAST_POINTER(p) && !VARATT_IS_EXTERNAL_ORIOLEDB(p)))
+				if (IS_TOAST_POINTER(p) && !VARATT_IS_EXTERNAL_ORIOLEDB(p))
 				{
 					hastoast = true;
 					natts = Max(natts, idx->maxTableAttnum - ctid_off);
 				}
 			}
 		}
-		else if (res_attnum == -1)
-		{
-			if (!idx->bridging)
-			{
-				/* Special handling for ctid attribute. */
-				Datum		iptr_value PG_USED_FOR_ASSERTS_ONLY;
-				bool		iptr_null;
-
-				iptr_value = o_tuple_read_next_field(&oslot->state,
-													 &iptr_null);
-
-				Assert(iptr_null == false);
-				Assert(memcmp(&slot->tts_tid,
-							  (ItemPointer) iptr_value, sizeof(ItemPointerData)) == 0);
-			}
-		}
-		else if (res_attnum == -2)
-		{
-			/* Handle dropped attributes by reading and ignoring the value. */
-			bool		dropped_null;
-
-			(void) o_tuple_read_next_field(&oslot->state, &dropped_null);
-		}
+	}
+	else
+	{
+		Assert(false);
 	}
 
 	/* Process TOASTed attributes if any were found. */

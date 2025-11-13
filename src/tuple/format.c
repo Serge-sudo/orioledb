@@ -22,27 +22,13 @@
 
 #include "access/htup_details.h"
 
+/* Does att's datatype allow packing into the 1-byte-header varlena format? */
+#define ATT_IS_PACKABLE(att) \
+	((att)->attlen == -1 && (att)->attstorage != 'p')
+
 /* Use this if it's already known varlena */
 #define VARLENA_ATT_IS_PACKABLE(att) \
 	((att)->attstorage != 'p')
-
-/*
- * Non-inline wrapper functions for external linkage.
- * The actual implementations are inlined in the header file for performance.
- * These wrappers are provided for cases where function pointers are needed
- * or for backwards compatibility.
- */
-uint32
-o_tuple_next_field_offset_impl(OTupleReaderState *state, Form_pg_attribute att)
-{
-	return o_tuple_next_field_offset(state, att);
-}
-
-Datum
-o_tuple_read_next_field_impl(OTupleReaderState *state, bool *isnull)
-{
-	return o_tuple_read_next_field(state, isnull);
-}
 
 void
 o_tuple_init_reader(OTupleReaderState *state, OTuple tuple, TupleDesc desc,
@@ -78,18 +64,130 @@ o_tuple_init_reader(OTupleReaderState *state, OTuple tuple, TupleDesc desc,
 	state->slow = false;
 }
 
+uint32
+o_tuple_next_field_offset(OTupleReaderState *state, Form_pg_attribute att)
+{
+	uint32		off;
+	char	   *data_ptr;
+
+	/* Fast path: use cached offset if available and not in slow mode */
+	if (!state->slow && att->attcacheoff >= 0)
+	{
+		off = att->attcacheoff;
+		state->off = off;
+		data_ptr = state->tp + off;
+	}
+	else if (att->attlen == -1)
+	{
+		/* Variable-length attribute */
+		if (!state->slow &&
+			state->off == att_align_nominal(state->off, att->attalign))
+		{
+			att->attcacheoff = state->off;
+		}
+		else
+		{
+			state->off = att_align_pointer(state->off, att->attalign, -1,
+										   state->tp + state->off);
+			state->slow = true;
+		}
+		off = state->off;
+		data_ptr = state->tp + off;
+	}
+	else
+	{
+		/* Fixed-length attribute */
+		state->off = att_align_nominal(state->off, att->attalign);
+		if (!state->slow)
+			att->attcacheoff = state->off;
+		off = state->off;
+		data_ptr = state->tp + off;
+	}
+
+	/* Update state offset for next field - combine checks to reduce branches */
+	if (att->attbyval)
+	{
+		/* Pass-by-value: just add the length */
+		state->off = off + att->attlen;
+	}
+	else if (att->attlen >= 0)
+	{
+		/* Fixed-length pass-by-reference */
+		state->off = off + att->attlen;
+	}
+	else if (IS_TOAST_POINTER(data_ptr))
+	{
+		/* Toast pointer has fixed size */
+		state->off = off + sizeof(OToastValue);
+		state->slow = true;
+	}
+	else
+	{
+		/* Variable-length data */
+		state->off = att_addlength_pointer(off, att->attlen, data_ptr);
+		state->slow = true;
+	}
+
+	state->attnum++;
+
+	return off;
+}
+
+Datum
+o_tuple_read_next_field(OTupleReaderState *state, bool *isnull)
+{
+	Form_pg_attribute att;
+	Datum		result;
+	uint32		off;
+
+	if (state->attnum >= state->natts)
+	{
+		Form_pg_attribute attr = &state->desc->attrs[state->attnum];
+
+		if (attr->atthasmissing)
+		{
+			result = getmissingattr(state->desc,
+									state->attnum + 1,
+									isnull);
+			state->attnum++;
+			return result;
+		}
+		else
+		{
+			*isnull = true;
+			state->attnum++;
+			return (Datum) 0;
+		}
+	}
+
+	att = TupleDescAttr(state->desc, state->attnum);
+
+	if (state->hasnulls && att_isnull(state->attnum, state->bp))
+	{
+		*isnull = true;
+		state->slow = true;
+		state->attnum++;
+		return (Datum) 0;
+	}
+
+	*isnull = false;
+	off = o_tuple_next_field_offset(state, att);
+
+	return fetchatt(att, state->tp + off);
+}
+
 static Pointer
 o_tuple_read_next_field_ptr(OTupleReaderState *state)
 {
 	Form_pg_attribute att;
 	uint32		off;
 
-	if (unlikely(state->attnum >= state->natts))
+	if (state->attnum >= state->natts)
 		return NULL;
 
 	att = TupleDescAttr(state->desc, state->attnum);
 
-	if (unlikely(state->hasnulls && att_isnull(state->attnum, state->bp)))
+	if (state->hasnulls && att_isnull(state->attnum, state->bp))
 	{
 		state->slow = true;
 		state->attnum++;
@@ -166,7 +264,7 @@ o_toast_nocachegetattr_ptr(OTuple tuple,
 	{
 		tp = (char *) tuple.data;
 	}
-	else if (unlikely(tup->hasnulls))
+	else if (tup->hasnulls)
 	{
 		/*
 		 * there's a null somewhere in the tuple
@@ -201,13 +299,13 @@ o_toast_nocachegetattr_ptr(OTuple tuple,
 
 	att = TupleDescAttr(tupleDesc, attnum);
 
-	if (likely(!slow))
+	if (!slow)
 	{
 		/*
 		 * If we get here, there are no nulls up to and including the target
 		 * attribute.  If we have a cached offset, we can use it.
 		 */
-		if (likely(att->attcacheoff >= 0))
+		if (att->attcacheoff >= 0)
 			return tp + att->attcacheoff;
 	}
 
@@ -255,7 +353,7 @@ o_toast_nocachegetattr(OTuple tuple,
 	{
 		tp = (char *) tuple.data;
 	}
-	else if (unlikely(tup->hasnulls))
+	else if (tup->hasnulls)
 	{
 		/*
 		 * there's a null somewhere in the tuple
@@ -288,7 +386,7 @@ o_toast_nocachegetattr(OTuple tuple,
 		tp = (char *) (tuple.data + SizeOfOTupleHeader);
 	}
 
-	if (likely(!slow))
+	if (!slow)
 	{
 		Form_pg_attribute att;
 
@@ -297,7 +395,7 @@ o_toast_nocachegetattr(OTuple tuple,
 		 * attribute.  If we have a cached offset, we can use it.
 		 */
 		att = TupleDescAttr(tupleDesc, attnum);
-		if (likely(att->attcacheoff >= 0))
+		if (att->attcacheoff >= 0)
 			return fetchatt(att, tp + att->attcacheoff);
 	}
 
@@ -305,7 +403,7 @@ o_toast_nocachegetattr(OTuple tuple,
 	for (i = 0; i <= attnum; i++)
 		result = o_tuple_read_next_field(&reader, is_null);
 
-	if (unlikely(*is_null && !tup->hasnulls && tup->natts < tupleDesc->natts))
+	if (*is_null && !tup->hasnulls && tup->natts < tupleDesc->natts)
 	{
 		/*
 		 * This possible when reading tuple without nulls after adding null
