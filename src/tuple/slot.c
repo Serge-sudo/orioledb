@@ -235,14 +235,14 @@ tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 
 	/*
 	 * Early return if the requested number of attributes is already valid or
-	 * the tuple is null.
+	 * the tuple is null. These are the most common early exit cases.
 	 */
-	if (__natts <= slot->tts_nvalid || O_TUPLE_IS_NULL(oslot->tuple))
+	if (likely(__natts <= slot->tts_nvalid) || unlikely(O_TUPLE_IS_NULL(oslot->tuple)))
 		return;
 
 	/* Ensure the descriptor is not NULL. */
 	Assert(descr);
-	if (oslot->ixnum == BridgeIndexNumber)
+	if (unlikely(oslot->ixnum == BridgeIndexNumber))
 		idx = descr->bridge;
 	else
 		idx = descr->indices[oslot->ixnum];
@@ -311,12 +311,12 @@ tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 		 * Determine the result attribute number based on the index type and
 		 * the order of attributes.
 		 */
-		if (oslot->ixnum == PrimaryIndexNumber)
+		if (likely(oslot->ixnum == PrimaryIndexNumber))
 		{
 			if (index_order)
 			{
-				if (cur_tbl_attnum >= idx->nFields ||
-					attnum != idx->pk_tbl_field_map[cur_tbl_attnum].key)
+				if (unlikely(cur_tbl_attnum >= idx->nFields ||
+							 attnum != idx->pk_tbl_field_map[cur_tbl_attnum].key))
 					res_attnum = -2;
 				else
 				{
@@ -329,7 +329,7 @@ tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 		}
 		else if (index_order)
 		{
-			if (GET_PRIMARY(descr)->primaryIsCtid && attnum == natts - 1)
+			if (unlikely(GET_PRIMARY(descr)->primaryIsCtid && attnum == natts - 1))
 				res_attnum = -1;
 			else
 				res_attnum = attnum;
@@ -341,9 +341,9 @@ tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 
 		/* Ensure the result attribute number is valid. */
 		Assert(res_attnum >= -2);
-		if (res_attnum >= 0)
+		if (likely(res_attnum >= 0))
 		{
-			if (oslot->ixnum == BridgeIndexNumber && attnum == 0)
+			if (unlikely(oslot->ixnum == BridgeIndexNumber && attnum == 0))
 			{
 				/*
 				 * first bridge_ctid attribute was already read in
@@ -362,7 +362,7 @@ tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 														 &isnull[res_attnum]);
 
 			/* Determine the attribute metadata based on the index and order. */
-			if (oslot->ixnum == PrimaryIndexNumber && !index_order)
+			if (unlikely(oslot->ixnum == PrimaryIndexNumber && !index_order))
 				thisatt = TupleDescAttr(slot->tts_tupleDescriptor, attnum);
 			else
 				thisatt = TupleDescAttr(idx->leafTupdesc, attnum);
@@ -371,12 +371,12 @@ tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 			 * Check for TOASTed attributes and adjust the number of
 			 * attributes if necessary.
 			 */
-			if (!isnull[res_attnum] && !thisatt->attbyval && thisatt->attlen < 0)
+			if (unlikely(!isnull[res_attnum] && !thisatt->attbyval && thisatt->attlen < 0))
 			{
 				Pointer		p = DatumGetPointer(values[res_attnum]);
 
 				Assert(p);
-				if (IS_TOAST_POINTER(p) && !VARATT_IS_EXTERNAL_ORIOLEDB(p))
+				if (unlikely(IS_TOAST_POINTER(p) && !VARATT_IS_EXTERNAL_ORIOLEDB(p)))
 				{
 					hastoast = true;
 					natts = Max(natts, idx->maxTableAttnum - ctid_off);

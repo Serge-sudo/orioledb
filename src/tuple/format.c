@@ -22,13 +22,27 @@
 
 #include "access/htup_details.h"
 
-/* Does att's datatype allow packing into the 1-byte-header varlena format? */
-#define ATT_IS_PACKABLE(att) \
-	((att)->attlen == -1 && (att)->attstorage != 'p')
-
 /* Use this if it's already known varlena */
 #define VARLENA_ATT_IS_PACKABLE(att) \
 	((att)->attstorage != 'p')
+
+/*
+ * Non-inline wrapper functions for external linkage.
+ * The actual implementations are inlined in the header file for performance.
+ * These wrappers are provided for cases where function pointers are needed
+ * or for backwards compatibility.
+ */
+uint32
+o_tuple_next_field_offset_impl(OTupleReaderState *state, Form_pg_attribute att)
+{
+	return o_tuple_next_field_offset(state, att);
+}
+
+Datum
+o_tuple_read_next_field_impl(OTupleReaderState *state, bool *isnull)
+{
+	return o_tuple_read_next_field(state, isnull);
+}
 
 void
 o_tuple_init_reader(OTupleReaderState *state, OTuple tuple, TupleDesc desc,
@@ -62,101 +76,6 @@ o_tuple_init_reader(OTupleReaderState *state, OTuple tuple, TupleDesc desc,
 	state->attnum = 0;
 	state->desc = desc;
 	state->slow = false;
-}
-
-uint32
-o_tuple_next_field_offset(OTupleReaderState *state, Form_pg_attribute att)
-{
-	uint32		off;
-
-	if (!state->slow && att->attcacheoff >= 0)
-	{
-		state->off = att->attcacheoff;
-	}
-	else if (att->attlen == -1)
-	{
-		if (!state->slow &&
-			state->off == att_align_nominal(state->off, att->attalign))
-		{
-			att->attcacheoff = state->off;
-		}
-		else
-		{
-			state->off = att_align_pointer(state->off, att->attalign, -1,
-										   state->tp + state->off);
-			state->slow = true;
-		}
-	}
-	else
-	{
-		state->off = att_align_nominal(state->off, att->attalign);
-		if (!state->slow)
-			att->attcacheoff = state->off;
-	}
-
-	off = state->off;
-
-	if (!att->attbyval && att->attlen < 0 &&
-		IS_TOAST_POINTER(state->tp + state->off))
-	{
-		state->off += sizeof(OToastValue);
-	}
-	else
-	{
-		state->off = att_addlength_pointer(state->off,
-										   att->attlen,
-										   state->tp + state->off);
-	}
-
-	if (att->attlen <= 0)
-		state->slow = true;
-
-	state->attnum++;
-
-	return off;
-}
-
-Datum
-o_tuple_read_next_field(OTupleReaderState *state, bool *isnull)
-{
-	Form_pg_attribute att;
-	Datum		result;
-	uint32		off;
-
-	if (state->attnum >= state->natts)
-	{
-		Form_pg_attribute attr = &state->desc->attrs[state->attnum];
-
-		if (attr->atthasmissing)
-		{
-			result = getmissingattr(state->desc,
-									state->attnum + 1,
-									isnull);
-			state->attnum++;
-			return result;
-		}
-		else
-		{
-			*isnull = true;
-			state->attnum++;
-			return (Datum) 0;
-		}
-	}
-
-	att = TupleDescAttr(state->desc, state->attnum);
-
-	if (state->hasnulls && att_isnull(state->attnum, state->bp))
-	{
-		*isnull = true;
-		state->slow = true;
-		state->attnum++;
-		return (Datum) 0;
-	}
-
-	*isnull = false;
-	off = o_tuple_next_field_offset(state, att);
-
-	return fetchatt(att, state->tp + off);
 }
 
 static Pointer
