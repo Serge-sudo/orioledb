@@ -31,6 +31,7 @@
 #include "utils/lsyscache.h"
 
 #include "nodes/nodeFuncs.h"
+#include "parser/parse_coerce.h"
 
 static void tts_orioledb_init_reader(TupleTableSlot *slot);
 static void tts_orioledb_get_index_values(TupleTableSlot *slot,

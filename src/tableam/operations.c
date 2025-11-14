@@ -37,6 +37,7 @@
 #include "catalog/storage.h"
 #include "commands/vacuum.h"
 #include "nodes/execnodes.h"
+#include "parser/parse_coerce.h"
 #include "parser/parsetree.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
