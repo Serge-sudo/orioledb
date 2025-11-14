@@ -321,19 +321,6 @@ switch_to_next_range(OIndexDescr *indexDescr, OScanState *ostate,
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	MemoryContext oldcontext;
 	bool		result = true;
-	bool		has_prefix_array_keys = false;
-	int			i;
-
-	/* Check if we have array keys in the prefix for lockstep scanning */
-	for (i = 0; i < so->numArrayKeys; i++)
-	{
-		BTArrayKeyInfo *arrayKey = so->arrayKeys + i;
-		if (arrayKey->scan_key < ostate->numPrefixExactKeys)
-		{
-			has_prefix_array_keys = true;
-			break;
-		}
-	}
 
 #if PG_VERSION_NUM >= 170000
 
@@ -377,11 +364,11 @@ switch_to_next_range(OIndexDescr *indexDescr, OScanState *ostate,
 		return false;
 
 	/*
-	 * For lockstep scanning with prefix array keys, keep the iterator alive
+	 * For lockstep scanning with SK_SEARCHARRAY, keep the iterator alive
 	 * across array element advances. It will scan the entire range covering
 	 * all array elements, comparing tuples sequentially.
 	 */
-	if (ostate->iterator != NULL && !has_prefix_array_keys)
+	if (ostate->iterator != NULL && so->numArrayKeys == 0)
 	{
 		btree_iterator_free(ostate->iterator);
 		ostate->iterator = NULL;
@@ -425,19 +412,6 @@ o_iterate_index(OIndexDescr *indexDescr, OScanState *ostate,
 	bool		tup_fetched = false;
 	IndexScanDesc scan = &ostate->scandesc;
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
-	bool		has_prefix_array_keys = false;
-	int			i;
-
-	/* Check if we have array keys in the prefix for lockstep scanning */
-	for (i = 0; i < so->numArrayKeys; i++)
-	{
-		BTArrayKeyInfo *arrayKey = so->arrayKeys + i;
-		if (arrayKey->scan_key < ostate->numPrefixExactKeys)
-		{
-			has_prefix_array_keys = true;
-			break;
-		}
-	}
 
 	if (ostate->exact || ostate->curKeyRange.empty)
 	{
@@ -471,12 +445,12 @@ o_iterate_index(OIndexDescr *indexDescr, OScanState *ostate,
 					 ? &ostate->curKeyRange.high : &ostate->curKeyRange.low);
 
 			/*
-			 * Lockstep scanning: when we have prefix array keys, we compare
-			 * tuples from the iterator with current array element combination.
-			 * We advance array elements inline without calling switch_to_next_range
-			 * to avoid unnecessary range recalculation.
+			 * Lockstep scanning optimization for SK_SEARCHARRAY (sorted arrays).
+			 * Check if we have array keys (which are always SK_SEARCHARRAY).
+			 * We compare tuples from the iterator with current array element,
+			 * advancing inline to avoid unnecessary range recalculation.
 			 */
-			if (has_prefix_array_keys)
+			if (so->numArrayKeys > 0)
 			{
 				do
 				{
