@@ -1102,9 +1102,13 @@ tts_orioledb_fill_key_bound(TupleTableSlot *slot, OIndexDescr *idx,
 
 		bound->keys[i].value = value;
 		bound->keys[i].type = typid;
-		bound->keys[i].flags = O_VALUE_BOUND_PLAIN_VALUE;
+		bound->keys[i].flags = O_VALUE_BOUND_LOWER | O_VALUE_BOUND_INCLUSIVE;
 		if (isnull)
 			bound->keys[i].flags |= O_VALUE_BOUND_NULL;
+		/* Check if type is coercible to field's inputtype and cache the result */
+		if (typid == idx->fields[i].opclass || typid == idx->fields[i].inputtype ||
+			IsBinaryCoercible(typid, idx->fields[i].inputtype))
+			bound->keys[i].flags |= O_VALUE_BOUND_COERCIBLE;
 		bound->keys[i].comparator = idx->fields[i].comparator;
 	}
 }
