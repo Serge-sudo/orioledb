@@ -181,26 +181,101 @@ o_key_data_to_key_range(OBTreeKeyRange *res, ScanKeyData *keyData,
 			Assert(arrayKeys && arrayKeys->num_elems > 0);
 			if (o_key_range_is_unbounded(res, attnum))
 			{
+				bool use_range_scan = false;
+				
 				/*
-				 * For lockstep scanning optimization: use a range from first
-				 * to last array element instead of treating each as exact.
-				 * This allows the iterator to scan sequentially through the
-				 * index while comparing against sorted array elements.
+				 * Decide whether to use lockstep scanning (range) or exact matching.
+				 * For sparse arrays (many holes), lockstep may scan many non-matching
+				 * tuples. Use exact matching for such cases.
 				 */
-				o_fill_key_bounds(arrayKeys->elem_values[0],
-								  key->sk_subtype,
-								  setLow ? &low : NULL,
-								  NULL,
-								  field);
-				o_fill_key_bounds(arrayKeys->elem_values[arrayKeys->num_elems - 1],
-								  key->sk_subtype,
-								  NULL,
-								  setHigh ? &high : NULL,
-								  field);
-				if (setLow)
-					res->low.keys[attnum] = low;
-				if (setHigh)
-					res->high.keys[attnum] = high;
+				if (arrayKeys->num_elems > 10 && i < numPrefixExactKeys)
+				{
+					/*
+					 * Try to estimate sparseness for numeric types by comparing
+					 * the range distance with number of elements.
+					 */
+					Datum first_val = arrayKeys->elem_values[0];
+					Datum last_val = arrayKeys->elem_values[arrayKeys->num_elems - 1];
+					
+					/* For integer types, we can calculate the distance */
+					if (field->inputtype == INT4OID)
+					{
+						int32 first = DatumGetInt32(first_val);
+						int32 last = DatumGetInt32(last_val);
+						int64 range_size = (int64)last - (int64)first + 1;
+						int64 threshold = arrayKeys->num_elems * 2; /* 50% holes threshold */
+						
+						use_range_scan = (range_size <= threshold);
+					}
+					else if (field->inputtype == INT8OID)
+					{
+						int64 first = DatumGetInt64(first_val);
+						int64 last = DatumGetInt64(last_val);
+						/* For int64, check if range is reasonable */
+						if (last > first && (last - first) < INT64_MAX / 2)
+						{
+							int64 range_size = last - first + 1;
+							int64 threshold = arrayKeys->num_elems * 2;
+							
+							use_range_scan = (range_size <= threshold);
+						}
+						else
+						{
+							/* Very large range or overflow risk, use exact */
+							use_range_scan = false;
+						}
+					}
+					else
+					{
+						/* For non-integer types, always use range scan */
+						use_range_scan = true;
+					}
+				}
+				else if (i < numPrefixExactKeys)
+				{
+					/* Small arrays (<= 10 elements) always use range scan */
+					use_range_scan = true;
+				}
+				
+				if (use_range_scan)
+				{
+					/*
+					 * For lockstep scanning optimization: use a range from first
+					 * to last array element instead of treating each as exact.
+					 * This allows the iterator to scan sequentially through the
+					 * index while comparing against sorted array elements.
+					 */
+					o_fill_key_bounds(arrayKeys->elem_values[0],
+									  key->sk_subtype,
+									  setLow ? &low : NULL,
+									  NULL,
+									  field);
+					o_fill_key_bounds(arrayKeys->elem_values[arrayKeys->num_elems - 1],
+									  key->sk_subtype,
+									  NULL,
+									  setHigh ? &high : NULL,
+									  field);
+					if (setLow)
+						res->low.keys[attnum] = low;
+					if (setHigh)
+						res->high.keys[attnum] = high;
+				}
+				else
+				{
+					/*
+					 * Sparse array with many holes - use exact matching for
+					 * current element to avoid scanning many non-matching tuples.
+					 */
+					o_fill_key_bounds(arrayKeys->elem_values[arrayKeys->cur_elem],
+									  key->sk_subtype,
+									  setLow ? &low : NULL,
+									  setHigh ? &high : NULL,
+									  field);
+					if (setLow)
+						res->low.keys[attnum] = low;
+					if (setHigh)
+						res->high.keys[attnum] = high;
+				}
 			}
 			arrayKeys++;
 		}
