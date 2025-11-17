@@ -98,12 +98,16 @@ row_key_tuple_is_valid(OBtreeRowKeyBound *row_key, OTuple tup, OIndexDescr *id,
 static inline bool
 o_bound_is_coercible(OBTreeValueBound *bound, OIndexField *field)
 {
+	bool		result;
+
 	if (bound->flags & O_VALUE_BOUND_COERCIBLE)
 		return true;
 	if (bound->flags & O_VALUE_BOUND_NON_COERCIBLE)
 		return false;
 	/* Neither flag is set, compute and cache the result */
-	return IsBinaryCoercible(bound->type, field->inputtype);
+	result = IsBinaryCoercible(bound->type, field->inputtype);
+	bound->flags |= result ? O_VALUE_BOUND_COERCIBLE : O_VALUE_BOUND_NON_COERCIBLE;
+	return result;
 }
 
 static bool

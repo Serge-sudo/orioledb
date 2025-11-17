@@ -465,12 +465,16 @@ o_sidx_tuple_make_key(BTreeDescr *desc, OTuple tuple, Pointer data,
 static inline bool
 o_bound_is_coercible(OBTreeValueBound *bound, OIndexField *field)
 {
+	bool		result;
+
 	if (bound->flags & O_VALUE_BOUND_COERCIBLE)
 		return true;
 	if (bound->flags & O_VALUE_BOUND_NON_COERCIBLE)
 		return false;
 	/* Neither flag is set, compute and cache the result */
-	return IsBinaryCoercible(bound->type, field->inputtype);
+	result = IsBinaryCoercible(bound->type, field->inputtype);
+	bound->flags |= result ? O_VALUE_BOUND_COERCIBLE : O_VALUE_BOUND_NON_COERCIBLE;
+	return result;
 }
 
 /* fills key bound from tuple or index tuple that belongs to current BTree */
