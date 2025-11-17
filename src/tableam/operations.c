@@ -394,6 +394,7 @@ fill_pkey_bound(TupleTableSlot *slot, OIndexDescr *idx, OBTreeKeyBound *pkey)
 	{
 		Datum		value;
 		Oid			type = TIDOID;
+		bool		coercible;
 
 		pkey->nkeys = 1;
 		if (idx->bridging)
@@ -405,9 +406,9 @@ fill_pkey_bound(TupleTableSlot *slot, OIndexDescr *idx, OBTreeKeyBound *pkey)
 		pkey->keys[0].type = type;
 		pkey->keys[0].flags = O_VALUE_BOUND_LOWER | O_VALUE_BOUND_INCLUSIVE;
 		/* TIDOID is always coercible to the index field type for ctid fields */
-		if (type == idx->fields[0].opclass || type == idx->fields[0].inputtype ||
-			IsBinaryCoercible(type, idx->fields[0].inputtype))
-			pkey->keys[0].flags |= O_VALUE_BOUND_COERCIBLE;
+		coercible = (type == idx->fields[0].opclass || type == idx->fields[0].inputtype ||
+					 IsBinaryCoercible(type, idx->fields[0].inputtype));
+		pkey->keys[0].flags |= coercible ? O_VALUE_BOUND_COERCIBLE : O_VALUE_BOUND_NON_COERCIBLE;
 		pkey->keys[0].comparator = idx->fields[0].comparator;
 	}
 	else
@@ -423,6 +424,7 @@ fill_pkey_bound(TupleTableSlot *slot, OIndexDescr *idx, OBTreeKeyBound *pkey)
 			AttrNumber	attnum = idx->primaryFieldsAttnums[i];
 			Oid			type;
 			OIndexField *pkField = &idx->fields[pk_from + i];
+			bool		coercible;
 
 			pkey->keys[i].value = slot->tts_values[attnum - 1];
 			type = idx->leafTupdesc->attrs[pk_from + i].atttypid;
@@ -431,9 +433,9 @@ fill_pkey_bound(TupleTableSlot *slot, OIndexDescr *idx, OBTreeKeyBound *pkey)
 			if (slot->tts_isnull[attnum - 1])
 				pkey->keys[i].flags |= O_VALUE_BOUND_NULL;
 			/* Check if type is coercible to field's inputtype and cache the result */
-			if (type == pkField->opclass || type == pkField->inputtype ||
-				IsBinaryCoercible(type, pkField->inputtype))
-				pkey->keys[i].flags |= O_VALUE_BOUND_COERCIBLE;
+			coercible = (type == pkField->opclass || type == pkField->inputtype ||
+						 IsBinaryCoercible(type, pkField->inputtype));
+			pkey->keys[i].flags |= coercible ? O_VALUE_BOUND_COERCIBLE : O_VALUE_BOUND_NON_COERCIBLE;
 			pkey->keys[i].comparator = idx->fields[pk_from + i].comparator;
 		}
 	}
@@ -1021,6 +1023,7 @@ fill_key_bound(TupleTableSlot *slot, OIndexDescr *idx, OBTreeKeyBound *bound)
 		Datum		value;
 		bool		isnull;
 		Oid			typid;
+		bool		coercible;
 
 		typid = idx->nonLeafTupdesc->attrs[i].atttypid;
 
@@ -1054,9 +1057,9 @@ fill_key_bound(TupleTableSlot *slot, OIndexDescr *idx, OBTreeKeyBound *bound)
 		if (isnull)
 			bound->keys[i].flags |= O_VALUE_BOUND_NULL;
 		/* Check if type is coercible to field's inputtype and cache the result */
-		if (typid == idx->fields[i].opclass || typid == idx->fields[i].inputtype ||
-			IsBinaryCoercible(typid, idx->fields[i].inputtype))
-			bound->keys[i].flags |= O_VALUE_BOUND_COERCIBLE;
+		coercible = (typid == idx->fields[i].opclass || typid == idx->fields[i].inputtype ||
+					 IsBinaryCoercible(typid, idx->fields[i].inputtype));
+		bound->keys[i].flags |= coercible ? O_VALUE_BOUND_COERCIBLE : O_VALUE_BOUND_NON_COERCIBLE;
 		bound->keys[i].comparator = idx->fields[i].comparator;
 	}
 }

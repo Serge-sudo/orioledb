@@ -1086,6 +1086,7 @@ tts_orioledb_fill_key_bound(TupleTableSlot *slot, OIndexDescr *idx,
 		bool		isnull;
 		int			attnum;
 		Oid			typid;
+		bool		coercible;
 
 		attnum = idx->tableAttnums[i];
 
@@ -1107,9 +1108,9 @@ tts_orioledb_fill_key_bound(TupleTableSlot *slot, OIndexDescr *idx,
 		if (isnull)
 			bound->keys[i].flags |= O_VALUE_BOUND_NULL;
 		/* Check if type is coercible to field's inputtype and cache the result */
-		if (typid == idx->fields[i].opclass || typid == idx->fields[i].inputtype ||
-			IsBinaryCoercible(typid, idx->fields[i].inputtype))
-			bound->keys[i].flags |= O_VALUE_BOUND_COERCIBLE;
+		coercible = (typid == idx->fields[i].opclass || typid == idx->fields[i].inputtype ||
+					 IsBinaryCoercible(typid, idx->fields[i].inputtype));
+		bound->keys[i].flags |= coercible ? O_VALUE_BOUND_COERCIBLE : O_VALUE_BOUND_NON_COERCIBLE;
 		bound->keys[i].comparator = idx->fields[i].comparator;
 	}
 }

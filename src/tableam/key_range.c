@@ -311,16 +311,14 @@ o_fill_key_bounds(Datum v, Oid type,
 		low->value = v;
 		low->type = type;
 		low->comparator = comparator;
-		if (coercible)
-			low->flags |= O_VALUE_BOUND_COERCIBLE;
+		low->flags |= coercible ? O_VALUE_BOUND_COERCIBLE : O_VALUE_BOUND_NON_COERCIBLE;
 	}
 	if (high != NULL)
 	{
 		high->value = v;
 		high->type = type;
 		high->comparator = comparator;
-		if (coercible)
-			high->flags |= O_VALUE_BOUND_COERCIBLE;
+		high->flags |= coercible ? O_VALUE_BOUND_COERCIBLE : O_VALUE_BOUND_NON_COERCIBLE;
 	}
 }
 

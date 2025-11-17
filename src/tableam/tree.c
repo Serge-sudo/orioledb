@@ -465,7 +465,12 @@ o_sidx_tuple_make_key(BTreeDescr *desc, OTuple tuple, Pointer data,
 static inline bool
 o_bound_is_coercible(OBTreeValueBound *bound, OIndexField *field)
 {
-	return (bound->flags & O_VALUE_BOUND_COERCIBLE);
+	if (bound->flags & O_VALUE_BOUND_COERCIBLE)
+		return true;
+	if (bound->flags & O_VALUE_BOUND_NON_COERCIBLE)
+		return false;
+	/* Neither flag is set, compute and cache the result */
+	return IsBinaryCoercible(bound->type, field->inputtype);
 }
 
 /* fills key bound from tuple or index tuple that belongs to current BTree */
@@ -495,6 +500,7 @@ o_fill_key_bound(OIndexDescr *id, OTuple tuple,
 	for (i = 0; i < id->nonLeafTupdesc->natts; i++)
 	{
 		Oid			type;
+		bool		coercible;
 
 		attnum = OIndexKeyAttnumToTupleAttnum(keyType, id, i + 1);
 		bound->keys[i].value = o_fastgetattr(tuple, attnum, tupdesc, spec, &isnull);
@@ -504,9 +510,9 @@ o_fill_key_bound(OIndexDescr *id, OTuple tuple,
 		if (isnull)
 			bound->keys[i].flags |= O_VALUE_BOUND_NULL;
 		/* Check if type is coercible to field's inputtype and cache the result */
-		if (type == id->fields[i].opclass || type == id->fields[i].inputtype ||
-			IsBinaryCoercible(type, id->fields[i].inputtype))
-			bound->keys[i].flags |= O_VALUE_BOUND_COERCIBLE;
+		coercible = (type == id->fields[i].opclass || type == id->fields[i].inputtype ||
+					 IsBinaryCoercible(type, id->fields[i].inputtype));
+		bound->keys[i].flags |= coercible ? O_VALUE_BOUND_COERCIBLE : O_VALUE_BOUND_NON_COERCIBLE;
 		bound->keys[i].comparator = id->fields[i].comparator;
 	}
 }
@@ -519,6 +525,7 @@ o_fill_bridge_index_key_bound(BTreeDescr *secondary, OTuple tuple, OBTreeKeyBoun
 	bool		isnull;
 	Oid			type;
 	int			fieldIdx = td->nFields - 1;
+	bool		coercible;
 
 	bound->nkeys = 1;
 
@@ -529,9 +536,9 @@ o_fill_bridge_index_key_bound(BTreeDescr *secondary, OTuple tuple, OBTreeKeyBoun
 	if (isnull)
 		bound->keys[0].flags |= O_VALUE_BOUND_NULL;
 	/* Check if type is coercible to field's inputtype and cache the result */
-	if (type == td->fields[fieldIdx].opclass || type == td->fields[fieldIdx].inputtype ||
-		IsBinaryCoercible(type, td->fields[fieldIdx].inputtype))
-		bound->keys[0].flags |= O_VALUE_BOUND_COERCIBLE;
+	coercible = (type == td->fields[fieldIdx].opclass || type == td->fields[fieldIdx].inputtype ||
+				 IsBinaryCoercible(type, td->fields[fieldIdx].inputtype));
+	bound->keys[0].flags |= coercible ? O_VALUE_BOUND_COERCIBLE : O_VALUE_BOUND_NON_COERCIBLE;
 	bound->keys[0].comparator = td->fields[fieldIdx].comparator;
 }
 
@@ -557,6 +564,7 @@ o_fill_pindex_tuple_key_bound(BTreeDescr *desc,
 		AttrNumber	attnum = id->primaryFieldsAttnums[i];
 		Oid			type;
 		OIndexField *pkField = &id->fields[id->primaryFieldsAttnums[i] - 1];
+		bool		coercible;
 
 		bound->keys[i].value = o_fastgetattr(tup, attnum, id->leafTupdesc, &id->leafSpec, &isnull);
 		type = id->leafTupdesc->attrs[pk_from + i].atttypid;
@@ -565,9 +573,9 @@ o_fill_pindex_tuple_key_bound(BTreeDescr *desc,
 		if (isnull)
 			bound->keys[i].flags |= O_VALUE_BOUND_NULL;
 		/* Check if type is coercible to field's inputtype and cache the result */
-		if (type == pkField->opclass || type == pkField->inputtype ||
-			IsBinaryCoercible(type, pkField->inputtype))
-			bound->keys[i].flags |= O_VALUE_BOUND_COERCIBLE;
+		coercible = (type == pkField->opclass || type == pkField->inputtype ||
+					 IsBinaryCoercible(type, pkField->inputtype));
+		bound->keys[i].flags |= coercible ? O_VALUE_BOUND_COERCIBLE : O_VALUE_BOUND_NON_COERCIBLE;
 		bound->keys[i].comparator = id->pk_comparators[i];
 	}
 }
