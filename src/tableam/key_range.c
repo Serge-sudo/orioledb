@@ -79,6 +79,68 @@ o_fill_row_key_bound(OBTreeKeyBound *bound,
 	return result;
 }
 
+/*
+ * Check if an array is sparse (has many holes between first and last elements).
+ * Returns true if lockstep scanning should be used, false if exact matching is better.
+ * 
+ * For sparse arrays with >50% holes, exact matching avoids scanning many
+ * non-matching tuples. For dense arrays, lockstep scanning is more efficient.
+ */
+static bool
+should_use_lockstep_scan(BTArrayKeyInfo *arrayKey, OIndexField *field,
+						 int numPrefixExactKeys, int keypos)
+{
+	Datum		first_val;
+	Datum		last_val;
+	
+	/* Only apply to prefix keys */
+	if (keypos >= numPrefixExactKeys)
+		return false;
+	
+	/* Small arrays (<= 10 elements) always use range scan (minimal overhead) */
+	if (arrayKey->num_elems <= 10)
+		return true;
+	
+	/*
+	 * For larger arrays, estimate sparseness by comparing range distance
+	 * with number of elements. Only works for numeric types.
+	 */
+	first_val = arrayKey->elem_values[0];
+	last_val = arrayKey->elem_values[arrayKey->num_elems - 1];
+	
+	if (field->inputtype == INT4OID)
+	{
+		int32		first = DatumGetInt32(first_val);
+		int32		last = DatumGetInt32(last_val);
+		int64		range_size = (int64) last - (int64) first + 1;
+		int64		threshold = arrayKey->num_elems * 2; /* 50% holes threshold */
+		
+		return (range_size <= threshold);
+	}
+	else if (field->inputtype == INT8OID)
+	{
+		int64		first = DatumGetInt64(first_val);
+		int64		last = DatumGetInt64(last_val);
+		
+		/* Check for overflow risk */
+		if (last > first && (last - first) < INT64_MAX / 2)
+		{
+			int64		range_size = last - first + 1;
+			int64		threshold = arrayKey->num_elems * 2;
+			
+			return (range_size <= threshold);
+		}
+		else
+		{
+			/* Very large range or overflow risk, use exact matching */
+			return false;
+		}
+	}
+	
+	/* For non-integer types, always use range scan (can't measure sparseness) */
+	return true;
+}
+
 bool
 o_key_data_to_key_range(OBTreeKeyRange *res, ScanKeyData *keyData,
 						int numberOfKeys, BTArrayKeyInfo *arrayKeys,
@@ -181,61 +243,15 @@ o_key_data_to_key_range(OBTreeKeyRange *res, ScanKeyData *keyData,
 			Assert(arrayKeys && arrayKeys->num_elems > 0);
 			if (o_key_range_is_unbounded(res, attnum))
 			{
-				bool use_range_scan = false;
+				bool		use_range_scan;
 				
 				/*
 				 * Decide whether to use lockstep scanning (range) or exact matching.
 				 * For sparse arrays (many holes), lockstep may scan many non-matching
 				 * tuples. Use exact matching for such cases.
 				 */
-				if (arrayKeys->num_elems > 10 && i < numPrefixExactKeys)
-				{
-					/*
-					 * Try to estimate sparseness for numeric types by comparing
-					 * the range distance with number of elements.
-					 */
-					Datum first_val = arrayKeys->elem_values[0];
-					Datum last_val = arrayKeys->elem_values[arrayKeys->num_elems - 1];
-					
-					/* For integer types, we can calculate the distance */
-					if (field->inputtype == INT4OID)
-					{
-						int32 first = DatumGetInt32(first_val);
-						int32 last = DatumGetInt32(last_val);
-						int64 range_size = (int64)last - (int64)first + 1;
-						int64 threshold = arrayKeys->num_elems * 2; /* 50% holes threshold */
-						
-						use_range_scan = (range_size <= threshold);
-					}
-					else if (field->inputtype == INT8OID)
-					{
-						int64 first = DatumGetInt64(first_val);
-						int64 last = DatumGetInt64(last_val);
-						/* For int64, check if range is reasonable */
-						if (last > first && (last - first) < INT64_MAX / 2)
-						{
-							int64 range_size = last - first + 1;
-							int64 threshold = arrayKeys->num_elems * 2;
-							
-							use_range_scan = (range_size <= threshold);
-						}
-						else
-						{
-							/* Very large range or overflow risk, use exact */
-							use_range_scan = false;
-						}
-					}
-					else
-					{
-						/* For non-integer types, always use range scan */
-						use_range_scan = true;
-					}
-				}
-				else if (i < numPrefixExactKeys)
-				{
-					/* Small arrays (<= 10 elements) always use range scan */
-					use_range_scan = true;
-				}
+				use_range_scan = should_use_lockstep_scan(arrayKeys, field,
+														  numPrefixExactKeys, i);
 				
 				if (use_range_scan)
 				{
