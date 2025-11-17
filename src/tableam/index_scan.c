@@ -111,7 +111,8 @@ o_bound_is_coercible(OBTreeValueBound *bound, OIndexField *field)
  */
 static int
 compare_tuple_with_array_keys(OTuple tup, OIndexDescr *id,
-							   BTScanOpaque so, int numPrefixExactKeys)
+							   BTScanOpaque so, int numPrefixExactKeys,
+							   OBTreeKeyBound *low)
 {
 	BTArrayKeyInfo *arrayKeys = so->arrayKeys;
 	int			i;
@@ -125,6 +126,7 @@ compare_tuple_with_array_keys(OTuple tup, OIndexDescr *id,
 		Datum		value;
 		Datum		arrayValue;
 		OIndexField *field;
+		OBTreeValueBound *bound;
 
 		/* Only process prefix array keys for lockstep scanning */
 		if (arrayKey->scan_key >= numPrefixExactKeys)
@@ -138,14 +140,19 @@ compare_tuple_with_array_keys(OTuple tup, OIndexDescr *id,
 							  &id->leafSpec, &isnull);
 		arrayValue = arrayKey->elem_values[arrayKey->cur_elem];
 		field = &id->fields[key->sk_attno - 1];
+		bound = &low->keys[key->sk_attno - 1];
 
 		/*
 		 * Compare tuple value with current array element.
+		 * Use appropriate comparator based on whether types are coercible.
 		 * Note: NULL handling is done by the comparator. PostgreSQL's
 		 * array handling excludes NULL from IN arrays, and NULL tuples
 		 * will not match any array element per SQL semantics.
 		 */
-		cmp = o_call_comparator(field->comparator, value, arrayValue);
+		if (o_bound_is_coercible(bound, field))
+			cmp = o_call_comparator(field->comparator, value, arrayValue);
+		else
+			cmp = o_call_comparator(bound->comparator, value, arrayValue);
 		if (cmp != 0)
 			return cmp;
 	}
@@ -477,7 +484,8 @@ o_iterate_index(OIndexDescr *indexDescr, OScanState *ostate,
 
 					/* Compare tuple with current array element combination */
 					cmp = compare_tuple_with_array_keys(tup, indexDescr, so,
-													   ostate->numPrefixExactKeys);
+													   ostate->numPrefixExactKeys,
+													   &ostate->curKeyRange.low);
 
 					if (cmp < 0)
 					{
