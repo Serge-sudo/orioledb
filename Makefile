@@ -75,6 +75,7 @@ OBJS = src/btree/btree.o \
 	   src/tableam/scan.o \
 	   src/tableam/tree.o \
 	   src/tableam/vacuum.o \
+	   src/tableam/visibility_map.o \
 	   src/transam/undo.o \
 	   src/transam/oxid.o \
 	   src/tuple/format.o \

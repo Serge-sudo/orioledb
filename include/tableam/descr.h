@@ -229,6 +229,9 @@ struct OTableDescr
 	OIndexDescr *bridge;
 	OIndexDescr *toast;
 
+	/* Primary-key-based visibility map */
+	struct OVisibilityMap *vmap;
+
 	/* list of TOASTable values */
 	AttrNumber *toastable;
 	/* number of toastable fields */

@@ -26,6 +26,7 @@
 #include "tableam/descr.h"
 #include "tableam/key_range.h"
 #include "tableam/vacuum.h"
+#include "tableam/visibility_map.h"
 #include "utils/page_pool.h"
 
 #include "access/multixact.h"
@@ -1366,22 +1367,34 @@ orioledb_vacuum_bridged_indexes(Relation rel, OTableDescr *descr,
 	new_rel_pages = vacrel->rel_pages;	/* After possible rel truncation */
 
 	/*
-	 * Update pg_class for the main table. For OrioleDB tables, since we use
-	 * CSN-based MVCC without visibility maps, all pages are effectively
-	 * all-visible. Set relallvisible to the current page count to enable
-	 * index-only scans.
+	 * Rebuild the visibility map and update pg_class statistics.
+	 * For OrioleDB tables with a primary-key-based visibility map,
+	 * we maintain relallvisible to reflect the actual visible pages.
 	 */
 	{
 		OIndexDescr *primary = GET_PRIMARY(vacrel->descr);
 		BlockNumber primary_pages;
+		BlockNumber visible_pages;
 		
 		o_btree_load_shmem(&primary->desc);
 		primary_pages = pg_atomic_read_u32(&BTREE_GET_META(&primary->desc)->leafPagesNum);
 		
+		/* Build or rebuild the visibility map */
+		if (!vacrel->descr->vmap)
+		{
+			vacrel->descr->vmap = o_visibility_map_create(primary);
+		}
+		o_visibility_map_build(vacrel->descr->vmap, vacrel->descr);
+		
+		/* Get the count of visible pages from VM */
+		visible_pages = o_visibility_map_get_visible_pages(vacrel->descr->vmap, 
+															primary_pages);
+		
+		/* Update pg_class with current statistics */
 		vac_update_relstats(rel,
 							primary_pages,
 							vacrel->live_tuples,
-							primary_pages,	/* all pages are all-visible */
+							visible_pages,
 							true,			/* hasindex */
 							InvalidTransactionId,
 							InvalidMultiXactId,

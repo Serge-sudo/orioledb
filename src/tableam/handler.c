@@ -32,6 +32,7 @@
 #include "tableam/operations.h"
 #include "tableam/tree.h"
 #include "tableam/vacuum.h"
+#include "tableam/visibility_map.h"
 #include "transam/oxid.h"
 #include "tuple/slot.h"
 #include "utils/compress.h"
@@ -1366,16 +1367,38 @@ orioledb_estimate_rel_size(Relation rel, int32 *attr_widths,
 	*tuples = rint(density * (double) curpages);
 
 	/*
-	 * OrioleDB uses CSN-based MVCC and doesn't use visibility maps. All
-	 * committed data is visible without needing VM checks, so we can consider
-	 * all pages as all-visible for the purposes of enabling index-only scans.
-	 * This is a key difference from heap tables where only pages marked in the
-	 * visibility map are considered all-visible.
+	 * For OrioleDB tables, use the primary-key-based visibility map to
+	 * determine the fraction of pages that are all-visible. This enables
+	 * index-only scans on secondary indexes without needing to check the
+	 * primary index for visibility.
 	 */
-	if (curpages > 0)
-		*allvisfrac = 1.0;
-	else
-		*allvisfrac = 0;
+	{
+		OTableDescr *descr = relation_get_descr(rel);
+		
+		if (descr && descr->vmap)
+		{
+			BlockNumber visible_pages;
+			
+			visible_pages = o_visibility_map_get_visible_pages(descr->vmap, curpages);
+			
+			if (visible_pages == 0 || curpages <= 0)
+				*allvisfrac = 0;
+			else if ((double) visible_pages >= curpages)
+				*allvisfrac = 1;
+			else
+				*allvisfrac = (double) visible_pages / curpages;
+		}
+		else
+		{
+			/* No VM yet, use relallvisible from pg_class */
+			if (relallvisible == 0 || curpages <= 0)
+				*allvisfrac = 0;
+			else if ((double) relallvisible >= curpages)
+				*allvisfrac = 1;
+			else
+				*allvisfrac = (double) relallvisible / curpages;
+		}
+	}
 }
 
 
@@ -1885,6 +1908,13 @@ orioledb_analyze_table(Relation relation,
 	OIndexDescr *pk = GET_PRIMARY(descr);
 
 	o_btree_load_shmem(&pk->desc);
+
+	/* Build or rebuild the visibility map */
+	if (!descr->vmap)
+	{
+		descr->vmap = o_visibility_map_create(pk);
+	}
+	o_visibility_map_build(descr->vmap, descr);
 
 	*func = orioledb_acquire_sample_rows;
 	*totalpages = TREE_NUM_LEAF_PAGES(&pk->desc);
