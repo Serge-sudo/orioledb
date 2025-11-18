@@ -24,6 +24,8 @@ The data structure behind the `vegetables` table is given below. Both primary an
 
 The primary index and secondary index are not tied together; they are only connected by logical values persisting in table rows. OrioleDB automatically creates a primary index on the virtual `ctid` column when no primary index is given.
 
+For a detailed analysis of secondary indexes, including MVCC handling, index-only scans, and pointer management, see [Secondary Indexes](secondary-indexes.mdx).
+
 ## Dual pointers
 
 OrioleDB uses a so-called `dual pointers` scheme to evade buffer mapping and corresponding bottlenecks. The idea of `dual pointers` is that downlinks in non-leaf in-memory pages could point to either in-memory or storage pages. Therefore, one could navigate in-memory pages using direct links without any buffer table. The storage page must be loaded into the main memory if one needs to traverse downlink, which points to storage. The corresponding downlink had to be replaced with an in-memory downlink.

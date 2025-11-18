@@ -18,6 +18,10 @@ OrioleDB uses index-organized tables where data is stored in B+-tree structures.
 
 The key architectural principle is that **primary and secondary indexes are not physically tied together**; they are only connected by logical values (the primary key) persisting in table rows.
 
+![Indexes of vegetables table](../images/vegetables_indexes.svg)
+
+*Example: The vegetables table with primary index on `id` and secondary index on `count`. Both indexes are B+-trees, but only the primary index contains the complete table rows.*
+
 ## Secondary Index Structure
 
 ### Tuple Composition
@@ -225,6 +229,44 @@ From `doc/architecture/recovery.mdx`:
 However, this design choice is fundamental to OrioleDB's approach of using undo logs for MVCC, which eliminates bloat and reduces the need for vacuum.
 
 ## Summary
+
+To illustrate these concepts, consider this example:
+
+```sql
+CREATE TABLE vegetables (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    count INTEGER
+) USING orioledb;
+
+CREATE INDEX vegetables_count_idx ON vegetables (count);
+
+INSERT INTO vegetables VALUES (1, 'Tomato', 10);
+```
+
+**What happens internally:**
+
+1. **Primary index** stores: `{id: 1, name: 'Tomato', count: 10}` plus MVCC info (transaction ID, CSN)
+2. **Secondary index** stores: `{count: 10, id: 1}` (no MVCC info!)
+3. **Undo log** contains: row-level undo record for id=1 in primary index only
+
+**On SELECT with secondary index:**
+```sql
+SELECT * FROM vegetables WHERE count = 10;
+```
+1. Scan secondary index for count=10 → finds `{count: 10, id: 1}`
+2. Extract primary key: id=1
+3. **Look up primary index** using id=1 to get full row and check visibility
+4. Return row if visible to current transaction
+
+**On UPDATE:**
+```sql
+UPDATE vegetables SET count = 15 WHERE id = 1;
+```
+1. Update primary index: old tuple → undo log, new tuple with count=15
+2. Delete from secondary index: `{count: 10, id: 1}`
+3. Insert into secondary index: `{count: 15, id: 1}`
+4. All in same transaction - commit makes all changes visible together
 
 | Question | Answer |
 |----------|--------|
