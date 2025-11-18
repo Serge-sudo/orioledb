@@ -1366,17 +1366,16 @@ orioledb_estimate_rel_size(Relation rel, int32 *attr_widths,
 	*tuples = rint(density * (double) curpages);
 
 	/*
-	 * We use relallvisible as-is, rather than scaling it up like we do for
-	 * the pages and tuples counts, on the theory that any pages added since
-	 * the last VACUUM are most likely not marked all-visible.  But costsize.c
-	 * wants it converted to a fraction.
+	 * OrioleDB uses CSN-based MVCC and doesn't use visibility maps. All
+	 * committed data is visible without needing VM checks, so we can consider
+	 * all pages as all-visible for the purposes of enabling index-only scans.
+	 * This is a key difference from heap tables where only pages marked in the
+	 * visibility map are considered all-visible.
 	 */
-	if (relallvisible == 0 || curpages <= 0)
-		*allvisfrac = 0;
-	else if ((double) relallvisible >= curpages)
-		*allvisfrac = 1;
+	if (curpages > 0)
+		*allvisfrac = 1.0;
 	else
-		*allvisfrac = (double) relallvisible / curpages;
+		*allvisfrac = 0;
 }
 
 

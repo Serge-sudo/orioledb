@@ -1366,9 +1366,28 @@ orioledb_vacuum_bridged_indexes(Relation rel, OTableDescr *descr,
 	new_rel_pages = vacrel->rel_pages;	/* After possible rel truncation */
 
 	/*
-	 * Not calling vac_update_relstats here, because we only analyze bridged
-	 * index;
+	 * Update pg_class for the main table. For OrioleDB tables, since we use
+	 * CSN-based MVCC without visibility maps, all pages are effectively
+	 * all-visible. Set relallvisible to the current page count to enable
+	 * index-only scans.
 	 */
+	{
+		OIndexDescr *primary = GET_PRIMARY(vacrel->descr);
+		BlockNumber primary_pages;
+		
+		o_btree_load_shmem(&primary->desc);
+		primary_pages = pg_atomic_read_u32(&BTREE_GET_META(&primary->desc)->leafPagesNum);
+		
+		vac_update_relstats(rel,
+							primary_pages,
+							vacrel->live_tuples,
+							primary_pages,	/* all pages are all-visible */
+							true,			/* hasindex */
+							InvalidTransactionId,
+							InvalidMultiXactId,
+							NULL, NULL, false);
+	}
+
 	/* Reporting to pgstat of this info should not break anything */
 	pgstat_report_vacuum(RelationGetRelid(rel),
 						 rel->rd_rel->relisshared,
