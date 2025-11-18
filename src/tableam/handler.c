@@ -1912,9 +1912,12 @@ orioledb_analyze_table(Relation relation,
 	/* Build or rebuild the visibility map */
 	if (!descr->vmap)
 	{
-		descr->vmap = o_visibility_map_create(pk);
+		descr->vmap = o_visibility_map_create(pk, descr->oids);
 	}
 	o_visibility_map_build(descr->vmap, descr);
+	
+	/* Flush VM to disk for persistence */
+	o_visibility_map_flush(descr->vmap);
 
 	*func = orioledb_acquire_sample_rows;
 	*totalpages = TREE_NUM_LEAF_PAGES(&pk->desc);

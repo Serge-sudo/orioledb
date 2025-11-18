@@ -1,15 +1,15 @@
 /*-------------------------------------------------------------------------
  *
  * visibility_map.h
- *		Primary-key-based visibility map for OrioleDB tables.
+ *		Segment-tree-based visibility map for OrioleDB tables.
  *
- * Unlike traditional block-based visibility maps, OrioleDB's VM tracks
- * ranges of primary keys that are all-visible. This allows secondary
- * index-only scans to check visibility without accessing the primary index.
+ * Unlike traditional block-based visibility maps, OrioleDB's VM uses a
+ * segment tree structure with bounds from primary index leaf pages.
+ * Each segment node stores the AND of all-visible bits from its children,
+ * with lazy propagation for efficient updates.
  *
- * The VM maintains sorted ranges like [pk:1..500] -> all visible,
- * [pk:770..1000] -> all visible. Adjacent ranges can be merged, and
- * ranges can be split when primary key changes occur.
+ * The segment tree enables O(log n) lookup and update operations, with
+ * persistent storage on disk for durability.
  *
  * Copyright (c) 2021-2025, Oriole DB Inc.
  * Copyright (c) 2025, Supabase Inc.
@@ -24,54 +24,75 @@
 
 #include "btree/btree.h"
 #include "tableam/descr.h"
+#include "storage/fd.h"
 
 /*
- * A range of primary keys that are all-visible.
- * The range is [start, end) - inclusive start, exclusive end.
+ * Segment tree node for visibility map.
+ * Each node represents a range of primary keys and stores whether
+ * all tuples in that range are visible.
  */
-typedef struct OVisibilityRange
+typedef struct OVMapSegmentNode
 {
-	OTuple		start_pk;		/* Start of range (inclusive) */
-	OTuple		end_pk;			/* End of range (exclusive), or NULL for infinity */
-	bool		all_visible;	/* True if all tuples in range are visible */
-	struct OVisibilityRange *next;	/* Next range in linked list */
-} OVisibilityRange;
+	uint64		left_bound;		/* Left page boundary (primary index page number) */
+	uint64		right_bound;	/* Right page boundary (primary index page number) */
+	bool		all_visible;	/* AND of all children's all_visible bits */
+	bool		lazy_mark;		/* Lazy propagation flag for batch updates */
+	int32		left_child;		/* Index of left child node (-1 if leaf) */
+	int32		right_child;	/* Index of right child node (-1 if leaf) */
+} OVMapSegmentNode;
 
 /*
- * Visibility map for a table, tracking PK ranges.
+ * Persistent segment tree structure for visibility map.
+ * Stored on disk with memory-mapped access for efficiency.
+ */
+typedef struct OVMapSegmentTree
+{
+	uint32		num_nodes;		/* Total number of nodes in tree */
+	uint32		num_leaves;		/* Number of leaf nodes (primary index pages) */
+	uint32		tree_height;	/* Height of the segment tree */
+	OVMapSegmentNode *nodes;	/* Array of segment tree nodes */
+	bool		dirty;			/* True if tree needs to be flushed to disk */
+} OVMapSegmentTree;
+
+/*
+ * Visibility map for a table, using segment tree.
  */
 typedef struct OVisibilityMap
 {
-	OIndexDescr *primary_idx;	/* Primary index descriptor for PK comparisons */
-	OVisibilityRange *ranges;	/* Linked list of ranges, sorted by start_pk */
+	ORelOids	oids;			/* Table OIDs for identification */
+	OIndexDescr *primary_idx;	/* Primary index descriptor for comparisons */
+	OVMapSegmentTree *tree;		/* Segment tree structure */
+	File		vmap_file;		/* File descriptor for persistent storage */
 	MemoryContext mctx;			/* Memory context for allocations */
-	int			num_ranges;		/* Number of ranges in the list */
+	bool		loaded;			/* True if loaded from disk */
 } OVisibilityMap;
 
-/* Functions for managing visibility maps */
-extern OVisibilityMap *o_visibility_map_create(OIndexDescr *primary_idx);
+/* VM file operations */
+extern OVisibilityMap *o_visibility_map_create(OIndexDescr *primary_idx, ORelOids oids);
 extern void o_visibility_map_free(OVisibilityMap *vmap);
+extern void o_visibility_map_load(OVisibilityMap *vmap);
+extern void o_visibility_map_flush(OVisibilityMap *vmap);
 
-/* Check if a PK is in an all-visible range */
-extern bool o_visibility_map_check_pk(OVisibilityMap *vmap, OTuple pk);
+/* Segment tree operations */
+extern void o_visibility_map_build_tree(OVisibilityMap *vmap, OTableDescr *descr);
+extern bool o_visibility_map_check_page(OVisibilityMap *vmap, uint64 page_num);
+extern void o_visibility_map_mark_page_range(OVisibilityMap *vmap, 
+											 uint64 left_page, 
+											 uint64 right_page,
+											 bool all_visible);
 
-/* Mark a range of PKs as all-visible */
-extern void o_visibility_map_mark_range(OVisibilityMap *vmap, 
-										OTuple start_pk, 
-										OTuple end_pk,
-										bool all_visible);
+/* Lazy propagation helpers */
+extern void o_visibility_map_push_lazy(OVisibilityMap *vmap, int32 node_idx);
+extern void o_visibility_map_update_node(OVisibilityMap *vmap, int32 node_idx);
 
 /* Build VM by scanning the primary index */
 extern void o_visibility_map_build(OVisibilityMap *vmap, OTableDescr *descr);
 
-/* Update VM when a PK is modified or deleted */
-extern void o_visibility_map_update_pk(OVisibilityMap *vmap, OTuple pk, bool visible);
-
-/* Merge adjacent ranges that are both all-visible */
-extern void o_visibility_map_merge_ranges(OVisibilityMap *vmap);
-
 /* Get statistics about the VM for pg_class.relallvisible */
 extern BlockNumber o_visibility_map_get_visible_pages(OVisibilityMap *vmap, 
 													  BlockNumber total_pages);
+
+/* File path helpers */
+extern char *o_visibility_map_get_path(ORelOids oids);
 
 #endif							/* __TABLEAM_VISIBILITY_MAP_H__ */

@@ -1382,9 +1382,12 @@ orioledb_vacuum_bridged_indexes(Relation rel, OTableDescr *descr,
 		/* Build or rebuild the visibility map */
 		if (!vacrel->descr->vmap)
 		{
-			vacrel->descr->vmap = o_visibility_map_create(primary);
+			vacrel->descr->vmap = o_visibility_map_create(primary, vacrel->descr->oids);
 		}
 		o_visibility_map_build(vacrel->descr->vmap, vacrel->descr);
+		
+		/* Flush VM to disk for persistence */
+		o_visibility_map_flush(vacrel->descr->vmap);
 		
 		/* Get the count of visible pages from VM */
 		visible_pages = o_visibility_map_get_visible_pages(vacrel->descr->vmap, 
