@@ -1,0 +1,132 @@
+-- Test PK-based visibility map for OrioleDB tables
+-- This tests the new PK-range-based VM that enables index-only scans
+-- without checking the primary index for visibility
+CREATE SCHEMA pk_visibility_map;
+SET SESSION search_path = 'pk_visibility_map';
+CREATE EXTENSION orioledb;
+-- Create a simple table with a secondary index
+CREATE TABLE o_test_vm
+(
+	id int PRIMARY KEY,
+	val int,
+	data text
+) USING orioledb;
+-- Create a secondary index on val
+CREATE INDEX o_test_vm_val_idx ON o_test_vm(val);
+-- Insert some data
+INSERT INTO o_test_vm SELECT i, i * 10, 'data_' || i FROM generate_series(1, 1000) i;
+-- Run ANALYZE to build the visibility map
+ANALYZE o_test_vm;
+-- Check that relallvisible is set correctly in pg_class
+-- The VM should report pages as all-visible
+SELECT c.relname, c.relpages > 0 as has_pages, c.relallvisible > 0 as has_allvisible
+FROM pg_class c
+WHERE c.relname = 'o_test_vm';
+   relname   | has_pages | has_allvisible 
+-------------+-----------+----------------
+ o_test_vm   | t         | t
+(1 row)
+
+-- Test 1: Index-only scan on secondary index
+-- This should use Index Only Scan and the VM should indicate visibility
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT val FROM o_test_vm WHERE val > 500 AND val < 600 ORDER BY val LIMIT 10;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Limit
+   ->  Index Only Scan using o_test_vm_val_idx on o_test_vm
+         Index Cond: ((val > 500) AND (val < 600))
+(3 rows)
+
+SELECT val FROM o_test_vm WHERE val > 500 AND val < 600 ORDER BY val LIMIT 10;
+ val 
+-----
+ 510
+ 520
+ 530
+ 540
+ 550
+ 560
+ 570
+ 580
+ 590
+(9 rows)
+
+-- Test 2: Covering index with INCLUDE
+CREATE INDEX o_test_vm_val_id_idx ON o_test_vm(val) INCLUDE (id);
+EXPLAIN (COSTS OFF) SELECT val, id FROM o_test_vm WHERE val > 500 AND val < 600 ORDER BY val LIMIT 10;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Limit
+   ->  Index Only Scan using o_test_vm_val_id_idx on o_test_vm
+         Index Cond: ((val > 500) AND (val < 600))
+(3 rows)
+
+SELECT val, id FROM o_test_vm WHERE val > 500 AND val < 600 ORDER BY val LIMIT 10;
+ val | id 
+-----+----
+ 510 | 51
+ 520 | 52
+ 530 | 53
+ 540 | 54
+ 550 | 55
+ 560 | 56
+ 570 | 57
+ 580 | 58
+ 590 | 59
+(9 rows)
+
+-- Test 3: After VACUUM, VM should be rebuilt
+VACUUM o_test_vm;
+-- Check that relallvisible is maintained after VACUUM
+SELECT c.relname, c.relpages > 0 as has_pages, c.relallvisible > 0 as has_allvisible
+FROM pg_class c
+WHERE c.relname = 'o_test_vm';
+   relname   | has_pages | has_allvisible 
+-------------+-----------+----------------
+ o_test_vm   | t         | t
+(1 row)
+
+-- Test 4: Insert more data and re-analyze
+INSERT INTO o_test_vm SELECT i, i * 10, 'data_' || i FROM generate_series(1001, 2000) i;
+ANALYZE o_test_vm;
+-- VM should be updated to include new PK ranges
+SELECT c.relname, c.relpages, c.relallvisible, 
+       CASE WHEN c.relallvisible = c.relpages THEN 'all_visible' ELSE 'partial' END as status
+FROM pg_class c
+WHERE c.relname = 'o_test_vm';
+   relname   | relpages | relallvisible |   status    
+-------------+----------+---------------+-------------
+ o_test_vm   |       30 |            30 | all_visible
+(1 row)
+
+-- Index-only scan should still work with expanded data
+EXPLAIN (COSTS OFF) SELECT val FROM o_test_vm WHERE val > 1500 ORDER BY val LIMIT 10;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Limit
+   ->  Index Only Scan using o_test_vm_val_idx on o_test_vm
+         Index Cond: (val > 1500)
+(3 rows)
+
+SELECT val FROM o_test_vm WHERE val > 1500 ORDER BY val LIMIT 10;
+  val  
+-------
+ 15010
+ 15020
+ 15030
+ 15040
+ 15050
+ 15060
+ 15070
+ 15080
+ 15090
+ 15100
+(10 rows)
+
+-- Clean up
+DROP SCHEMA pk_visibility_map CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table o_test_vm
+drop cascades to sequence o_test_vm_id_seq
