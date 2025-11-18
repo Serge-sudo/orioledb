@@ -1,0 +1,244 @@
+---
+id: secondary-indexes
+sidebar_position: 5
+sidebar_label: Secondary Indexes
+---
+
+# Secondary Indexes in OrioleDB
+
+This document provides a detailed analysis of how OrioleDB implements and manages secondary indexes, including their relationship with primary indexes, MVCC handling, and pointer management.
+
+## Overview
+
+OrioleDB uses index-organized tables where data is stored in B+-tree structures. Each table has:
+
+1. **Primary index** - Contains the complete table rows as leaf tuples
+2. **Secondary indexes** - Contain index keys plus primary key values
+3. **TOAST tree** - Stores large attribute values
+
+The key architectural principle is that **primary and secondary indexes are not physically tied together**; they are only connected by logical values (the primary key) persisting in table rows.
+
+## Secondary Index Structure
+
+### Tuple Composition
+
+Secondary index tuples have a specific structure:
+
+```
+[Secondary Index Key Columns] + [Primary Key Columns]
+```
+
+For example, if you have:
+- Table: `vegetables(id PRIMARY KEY, name, count)`
+- Secondary index on `count`
+
+The secondary index leaf tuples contain:
+- `count` value (the indexed column)
+- `id` value (the primary key)
+
+This is implemented in the code as documented in `include/tableam/descr.h`:
+
+```c
+/*
+ * Attnums for primary key values in the secondary index tuples. We may
+ * assume that secondary index tuple just contain primary key values in
+ * the tail. But we would like to save the space if secondary index
+ * shares some attributes with primary key.
+ */
+int nPrimaryFields;
+AttrNumber primaryFieldsAttnums[INDEX_MAX_KEYS];
+```
+
+### Non-Leaf Tuples
+
+Both leaf and non-leaf tuples in secondary indexes consist of:
+- Secondary index columns
+- Primary index columns
+
+This allows the secondary index to be self-contained for navigation purposes while maintaining a logical pointer back to the primary index through the primary key values.
+
+## MVCC and Undo Logs in Secondary Indexes
+
+### Key Finding: No MVCC in Secondary Indexes
+
+**Secondary indexes do NOT maintain their own MVCC information or undo logs.** This is a critical architectural decision in OrioleDB.
+
+Evidence from the code:
+
+1. **No undo support in secondary indexes** (`src/tableam/tree.c`):
+```c
+secondaryOps = {
+    .len = o_idx_len,
+    .key_to_jsonb = o_key_to_jsonb,
+    .tuple_make_key = o_sidx_tuple_make_key,
+    .needs_undo = NULL,  // ← No undo for secondary indexes!
+    .cmp = o_idx_cmp,
+    .hash = o_idx_hash,
+    .unique_hash = o_idx_unique_hash
+}
+```
+
+2. **WAL logging only for primary and TOAST** (`doc/architecture/recovery.mdx`):
+> "TOAST and primary key trees are subjects of WAL-logging, while secondary keys trees aren't. Secondary keys are recovering based on changes in TOAST and primary key."
+
+### Implications
+
+- **MVCC is only maintained in the primary index** - All version information, transaction IDs, and commit sequence numbers are stored only in primary index tuples
+- **Undo logs only exist for primary index** - When transactions need to rollback or when old tuple versions need to be accessed, only the primary index contains this information
+- **Secondary indexes are derived state** - They can always be reconstructed from the primary index and TOAST trees
+
+## Index-Only Scans on Secondary Indexes
+
+### The Primary Index Requirement
+
+**Yes, index-only scans on secondary indexes DO require accessing the primary index in most cases to retrieve MVCC information.**
+
+This is evident from the code in `src/tableam/index_scan.c`:
+
+```c
+bool scan_primary = ostate->ixNum == PrimaryIndexNumber ||
+    !ostate->onlyCurIx;
+```
+
+### Why Primary Index Access is Necessary
+
+Even for "index-only" scans on secondary indexes, OrioleDB needs to:
+
+1. **Check tuple visibility** - MVCC information (transaction IDs, commit sequence numbers) is only in the primary index
+2. **Verify tuple existence** - The secondary index entry may point to a tuple that has been deleted
+3. **Handle concurrent modifications** - Ensure consistent reads by checking MVCC state
+
+### The Process
+
+For an index-only scan on a secondary index:
+
+1. Scan the secondary index to find matching tuples
+2. Extract the primary key from the secondary index tuple
+3. Look up the primary index using the extracted primary key
+4. Check MVCC information in the primary index tuple
+5. If visible and valid, return the data
+
+This is why the code shows:
+```c
+tuple = o_index_scan_getnext(descr, ostate, &tupleCsn, 
+                             scan_primary, // true even for secondary index scans
+                             tupleCxt, &hint);
+```
+
+### Exception: When All Required Columns Are in Secondary Index
+
+If the secondary index is a covering index (includes all columns needed by the query), the scan may be more efficient, but **visibility checks still require primary index access** due to MVCC requirements.
+
+## Handling Primary Index Changes
+
+### What Happens When Primary Index Data Changes
+
+When a tuple in the primary index is modified or deleted, the secondary indexes must be updated accordingly. This is handled in `src/tableam/operations.c`:
+
+```c
+OTableModifyResult
+o_update_secondary_index(OIndexDescr *id,
+                         OIndexNumber ix_num,
+                         bool new_valid,
+                         bool old_valid,
+                         TupleTableSlot *newSlot,
+                         OTuple new_ix_tup,
+                         TupleTableSlot *oldSlot,
+                         OXid oxid,
+                         CommitSeqNo csn)
+```
+
+### Update Process
+
+When a primary index tuple is updated or deleted:
+
+1. **Calculate old and new keys** - Extract index keys from old and new tuples
+2. **Compare keys** - Check if the secondary index key has changed
+3. **Delete old entry** (if key changed or tuple deleted):
+   ```c
+   if (old_valid)
+       res.success = o_btree_modify(&id->desc, BTreeOperationDelete,
+                                   nullTup, BTreeKeyNone,
+                                   (Pointer) &old_key, BTreeKeyBound,
+                                   oxid, csn, RowLockUpdate,
+                                   NULL, &callbackInfo);
+   ```
+4. **Insert new entry** (if key changed or tuple inserted):
+   ```c
+   if (new_valid)
+       res.success = o_btree_modify(&id->desc, BTreeOperationInsert,
+                                   new_ix_tup, BTreeKeyLeafTuple,
+                                   (Pointer) &new_key, BTreeKeyBound,
+                                   oxid, csn, RowLockUpdate,
+                                   NULL, &callbackInfo);
+   ```
+
+### "Pointer" Management
+
+The term "pointer" in the context of secondary indexes refers to the **primary key values** embedded in the secondary index tuple. These are not physical pointers but logical references.
+
+When primary index data changes:
+
+- **UPDATE with same primary key** - If the secondary index key doesn't change, no update needed in secondary index
+- **UPDATE with different primary key** - Old secondary index entry is deleted, new one is inserted (this is rare as primary keys are typically immutable)
+- **UPDATE with changed indexed column** - Old secondary index entry deleted, new entry inserted with updated indexed value but same primary key
+- **DELETE** - Corresponding secondary index entry is deleted using the primary key to locate it
+
+### Transaction Consistency
+
+All secondary index updates happen in the same transaction as the primary index update:
+- If the transaction commits, all changes (primary + secondary indexes) become visible together
+- If the transaction aborts, all changes are rolled back (but remember: only primary index has undo records)
+
+## Recovery and Checkpoint Ordering
+
+During recovery, OrioleDB processes trees in a specific order to maintain consistency:
+
+1. **TOAST trees** - Checkpointed and recovered first
+2. **Primary key trees** - Checkpointed and recovered second  
+3. **Secondary index trees** - Checkpointed and recovered last
+
+This ordering is critical because:
+
+- Before the "toast consistency point" in WAL, secondary indexes already contain all necessary changes (from the checkpoint)
+- After the toast consistency point, secondary indexes are rebuilt/updated based on primary index changes
+- This ensures secondary indexes can always be derived from primary index state
+
+From `doc/architecture/recovery.mdx`:
+> "We only apply WAL records to TOAST and primary key trees during recovery before the toast consistency point. We cannot 'lose' any secondary index changes in that period because secondary index trees were checkpointer later."
+
+## Performance Implications
+
+### Advantages
+
+1. **Simpler MVCC** - No need to maintain version chains in multiple indexes
+2. **Smaller secondary indexes** - No transaction metadata stored
+3. **Faster updates** - Secondary indexes don't need undo records
+4. **Consistency** - Single source of truth for tuple visibility
+
+### Trade-offs
+
+1. **Index-only scans are not truly "index-only"** - Must access primary index for visibility
+2. **Additional I/O for secondary index scans** - Two index lookups instead of one
+3. **Recovery rebuilding** - Secondary indexes must be updated during recovery based on primary index changes
+
+However, this design choice is fundamental to OrioleDB's approach of using undo logs for MVCC, which eliminates bloat and reduces the need for vacuum.
+
+## Summary
+
+| Question | Answer |
+|----------|--------|
+| **Where is MVCC kept?** | Only in the primary index. Secondary indexes have no MVCC information. |
+| **Where are undo logs kept?** | Only in the primary index. Secondary indexes have no undo logs. |
+| **Do index-only scans on secondary indexes need to scan primary index?** | Yes, to check tuple visibility and MVCC state. |
+| **What happens to secondary index entries when primary data changes?** | They are updated (delete old + insert new) based on whether the indexed columns changed. The "pointer" is the logical primary key value, not a physical pointer. |
+| **How are secondary indexes recovered?** | They are rebuilt/updated based on changes to primary index and TOAST trees during WAL replay. |
+
+## References
+
+- `src/tableam/tree.c` - Secondary index operations
+- `src/tableam/operations.c` - Secondary index update logic  
+- `src/tableam/index_scan.c` - Index scanning logic
+- `include/tableam/descr.h` - Index descriptor structures
+- `doc/architecture/overview.mdx` - High-level architecture
+- `doc/architecture/recovery.mdx` - Recovery and checkpoint ordering
