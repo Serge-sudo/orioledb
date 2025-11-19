@@ -52,10 +52,25 @@ typedef struct OBitmapScan
 	int			page_ntuples;
 	uint64		current_bitmap_value;
 	bool		bitmap_exhausted;
+	BTreeIterator *range_iterator;	/* For dense ranges */
+	uint64		range_end_value;	/* End of current dense range */
+	bool		using_range_scan;	/* True when scanning a dense range */
 	BitmapSeqScanArg arg;
 } OBitmapScan;
 
 /* Removed callback functions - no longer using seq scan with callbacks */
+
+/*
+ * Adaptive bitmap scan strategy:
+ * - For sparse bitmaps: use direct tuple lookups (efficient for scattered tuples)
+ * - For dense bitmaps: use range iteration (efficient for clustered tuples)
+ * 
+ * We detect density by checking how many consecutive values exist in the bitmap.
+ * If we find DENSE_BITMAP_THRESHOLD or more consecutive values, we switch to
+ * range iteration mode.
+ */
+#define DENSE_BITMAP_THRESHOLD 10  /* Min consecutive tuples to use range scan */
+#define DENSE_BITMAP_LOOKAHEAD 50  /* How far ahead to check for density */
 
 #define UINT64_HIGH_BIT (UINT64CONST(1) << 63)
 
@@ -698,6 +713,9 @@ o_make_bitmap_scan(OBitmapHeapPlanState *bitmap_state, ScanState *ss,
 	scan->arg.tbl_desc = relation_get_descr(rel);
 	scan->current_bitmap_value = 0;
 	scan->bitmap_exhausted = false;
+	scan->range_iterator = NULL;
+	scan->range_end_value = 0;
+	scan->using_range_scan = false;
 	bitmap_state->scan = scan;
 	o_exec_bitmapqual(bitmap_state, bitmapqualplanstate,
 					  &scan->arg.bitmap,
@@ -840,6 +858,56 @@ o_tbmiterator_next_page(OBitmapScan *scan, OBitmapHeapPlanState *bitmap_state)
 	}
 }
 
+/*
+ * Check if we should use range iteration for the next set of tuples.
+ * Returns true if we find a dense region, and sets *range_start and *range_end.
+ */
+static bool
+should_use_range_iteration(RBTree *bitmap, uint64 current_value,
+						   uint64 *range_start, uint64 *range_end)
+{
+	uint64		next_value;
+	bool		found;
+	int			consecutive_count = 0;
+	uint64		check_value = current_value;
+	uint64		first_value = 0;
+	uint64		last_value = 0;
+	
+	/* Look ahead to see if there's a dense region */
+	for (int i = 0; i < DENSE_BITMAP_LOOKAHEAD; i++)
+	{
+		next_value = o_keybitmap_get_next(bitmap, check_value, &found);
+		
+		if (!found)
+			break;
+			
+		if (i == 0)
+			first_value = next_value;
+			
+		last_value = next_value;
+		
+		/* Check if values are close together (within reasonable range for same page) */
+		if (consecutive_count > 0 && (next_value - check_value) > 100)
+		{
+			/* Gap too large, not a dense region */
+			break;
+		}
+		
+		consecutive_count++;
+		check_value = next_value + 1;
+		
+		/* If we found enough consecutive values, use range iteration */
+		if (consecutive_count >= DENSE_BITMAP_THRESHOLD)
+		{
+			*range_start = first_value;
+			*range_end = last_value;
+			return true;
+		}
+	}
+	
+	return false;
+}
+
 TupleTableSlot *
 o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 {
@@ -874,94 +942,149 @@ o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 
 		if (!fetched)
 		{
-			/* Direct lookup from bitmap using o_keybitmap_get_next */
+			/* Adaptive bitmap scan strategy */
 			if (scan->arg.bitmap && !scan->bitmap_exhausted)
 			{
 				OIndexDescr *primary = GET_PRIMARY(scan->arg.tbl_desc);
-				OBTreeKeyBound bound;
-				char		key_buf[sizeof(OTupleHeader) + 64];
-				OTuple		key_tuple;
-				uint64		next_value;
-				bool		found;
-
-				/* Get next value from bitmap */
-				next_value = o_keybitmap_get_next(scan->arg.bitmap,
-												  scan->current_bitmap_value,
-												  &found);
-
-				if (!found)
+				
+				/* Check if we should use range iteration for dense regions */
+				if (!scan->using_range_scan)
 				{
-					/* No more entries in bitmap */
-					scan->bitmap_exhausted = true;
-					slot = ExecClearTuple(node->ss.ss_ScanTupleSlot);
-					fetched = true;
-				}
-				else
-				{
-					/* Update current position for next iteration */
-					scan->current_bitmap_value = next_value + 1;
-
-					/* Build key bound for lookup */
-					key_tuple.data = key_buf;
-					key_tuple.formatFlags = 0;
+					uint64 range_start, range_end;
 					
-					/* Create a tuple with the primary key value */
-					OTupleHeader tuphdr = (OTupleHeader) key_buf;
+					if (should_use_range_iteration(scan->arg.bitmap, 
+												   scan->current_bitmap_value,
+												   &range_start, &range_end))
+					{
+						/* Start range iteration for dense region */
+						OBTreeKeyBound start_bound, end_bound;
+						char start_key_buf[sizeof(OTupleHeader) + 64];
+						char end_key_buf[sizeof(OTupleHeader) + 64];
+						OTuple start_key_tuple, end_key_tuple;
+						
+						/* Build start bound */
+						start_key_tuple.data = start_key_buf;
+						start_key_tuple.formatFlags = 0;
+						OTupleHeader start_tuphdr = (OTupleHeader) start_key_buf;
+						FormData_pg_attribute *attr = TupleDescAttr(primary->nonLeafTupdesc, 0);
+						
+						Assert(primary->nFields == 1);
+						start_tuphdr->hasnulls = false;
+						start_tuphdr->natts = 1;
+						start_tuphdr->len = SizeOfOTupleHeader + attr->attlen;
+						uint64_get_val(range_start, attr->atttypid, &start_key_buf[SizeOfOTupleHeader]);
+						
+						o_btree_key_bound_from_tuple(&start_bound, &primary->desc, &start_key_tuple,
+													 BTreeKeyNonLeafKey, ForwardScanDirection, 
+													 primary->nonLeafTupdesc);
+						
+						/* Build end bound */
+						end_key_tuple.data = end_key_buf;
+						end_key_tuple.formatFlags = 0;
+						OTupleHeader end_tuphdr = (OTupleHeader) end_key_buf;
+						
+						end_tuphdr->hasnulls = false;
+						end_tuphdr->natts = 1;
+						end_tuphdr->len = SizeOfOTupleHeader + attr->attlen;
+						uint64_get_val(range_end, attr->atttypid, &end_key_buf[SizeOfOTupleHeader]);
+						
+						o_btree_key_bound_from_tuple(&end_bound, &primary->desc, &end_key_tuple,
+													 BTreeKeyNonLeafKey, ForwardScanDirection, 
+													 primary->nonLeafTupdesc);
+						
+						/* Create iterator for range */
+						o_btree_load_shmem(&primary->desc);
+						scan->range_iterator = o_btree_iterator_create(&primary->desc,
+																	   (Pointer) &start_bound,
+																	   BTreeKeyBound,
+																	   &scan->oSnapshot,
+																	   ForwardScanDirection);
+						scan->range_end_value = range_end;
+						scan->using_range_scan = true;
+						scan->current_bitmap_value = range_start;
+					}
+				}
+				
+				/* If using range iteration, fetch from iterator */
+				if (scan->using_range_scan)
+				{
+					OBTreeKeyBound end_bound;
+					char end_key_buf[sizeof(OTupleHeader) + 64];
+					OTuple end_key_tuple;
+					
+					/* Build end bound for iterator */
+					end_key_tuple.data = end_key_buf;
+					end_key_tuple.formatFlags = 0;
+					OTupleHeader end_tuphdr = (OTupleHeader) end_key_buf;
 					FormData_pg_attribute *attr = TupleDescAttr(primary->nonLeafTupdesc, 0);
 					
-					Assert(primary->nFields == 1);
-					tuphdr->hasnulls = false;
-					tuphdr->natts = 1;
-					tuphdr->len = SizeOfOTupleHeader + attr->attlen;
-					uint64_get_val(next_value, attr->atttypid, &key_buf[SizeOfOTupleHeader]);
-
-					/* Fill bound structure */
-					o_btree_key_bound_from_tuple(&bound, &primary->desc, &key_tuple,
+					end_tuphdr->hasnulls = false;
+					end_tuphdr->natts = 1;
+					end_tuphdr->len = SizeOfOTupleHeader + attr->attlen;
+					uint64_get_val(scan->range_end_value, attr->atttypid, &end_key_buf[SizeOfOTupleHeader]);
+					
+					o_btree_key_bound_from_tuple(&end_bound, &primary->desc, &end_key_tuple,
 												 BTreeKeyNonLeafKey, ForwardScanDirection, 
 												 primary->nonLeafTupdesc);
-
-					/* Lookup the tuple directly */
-					o_btree_load_shmem(&primary->desc);
-					tuple = o_btree_find_tuple_by_key(&primary->desc,
-													 (Pointer) &bound, BTreeKeyBound,
-													 &scan->oSnapshot, &tupleCsn,
-													 tupleCxt, &hint);
-
+					
+					/* Fetch next tuple from iterator */
+					tuple = o_btree_iterator_fetch(scan->range_iterator, &tupleCsn,
+												   (Pointer) &end_bound, BTreeKeyBound,
+												   true, &hint);
+					
 					if (O_TUPLE_IS_NULL(tuple))
 					{
-						/* Tuple not found, skip to next */
+						/* End of range, switch back to direct lookup */
+						btree_iterator_free(scan->range_iterator);
+						scan->range_iterator = NULL;
+						scan->using_range_scan = false;
+						scan->current_bitmap_value = scan->range_end_value + 1;
 						continue;
 					}
 					else
 					{
-						OTableDescr *descr;
-						TupleTableSlot *scan_slot;
-						MemoryContext oldcxt;
-
-						descr = relation_get_descr(node->ss.ss_currentRelation);
-						slot = node->ss.ss_ScanTupleSlot;
-						oldcxt = MemoryContextSwitchTo(slot->tts_mcxt);
-						scan_slot = MakeSingleTupleTableSlot(descr->tupdesc,
-															 &TTSOpsOrioleDB);
-						MemoryContextSwitchTo(oldcxt);
-						tts_orioledb_store_tuple(scan_slot, tuple,
-												 descr, tupleCsn,
-												 PrimaryIndexNumber,
-												 true, &hint);
-						if (scan->tbmres && scan->tbmres->recheck)
+						uint64 tuple_value = primary_tuple_get_data(tuple, primary, false);
+						
+						/* Check if this tuple is in the bitmap */
+						if (o_keybitmap_test(scan->arg.bitmap, tuple_value))
 						{
-							ExprContext *tup_econtext = bitmap_state->scan->ss->ps.ps_ExprContext;
-							ExprState  *bitmapqualorig_state;
-
-							bitmapqualorig_state = ExecInitQual(bitmap_state->bitmapqualorig, NULL);
-
-							slot_getallattrs(scan_slot);
-							tup_econtext->ecxt_scantuple = scan_slot;
-
-							if (!ExecQual((ExprState *) bitmapqualorig_state, tup_econtext))
+							OTableDescr *descr;
+							TupleTableSlot *scan_slot;
+							MemoryContext oldcxt;
+							
+							scan->current_bitmap_value = tuple_value + 1;
+							
+							descr = relation_get_descr(node->ss.ss_currentRelation);
+							slot = node->ss.ss_ScanTupleSlot;
+							oldcxt = MemoryContextSwitchTo(slot->tts_mcxt);
+							scan_slot = MakeSingleTupleTableSlot(descr->tupdesc,
+																 &TTSOpsOrioleDB);
+							MemoryContextSwitchTo(oldcxt);
+							tts_orioledb_store_tuple(scan_slot, tuple,
+													 descr, tupleCsn,
+													 PrimaryIndexNumber,
+													 true, &hint);
+							
+							if (scan->tbmres && scan->tbmres->recheck)
 							{
-								pfree(tuple.data);
-								slot = ExecClearTuple(node->ss.ss_ScanTupleSlot);
+								ExprContext *tup_econtext = bitmap_state->scan->ss->ps.ps_ExprContext;
+								ExprState  *bitmapqualorig_state;
+
+								bitmapqualorig_state = ExecInitQual(bitmap_state->bitmapqualorig, NULL);
+
+								slot_getallattrs(scan_slot);
+								tup_econtext->ecxt_scantuple = scan_slot;
+
+								if (!ExecQual((ExprState *) bitmapqualorig_state, tup_econtext))
+								{
+									pfree(tuple.data);
+									slot = ExecClearTuple(node->ss.ss_ScanTupleSlot);
+								}
+								else
+								{
+									slot = scan_slot;
+									fetched = true;
+								}
 							}
 							else
 							{
@@ -971,16 +1094,118 @@ o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 						}
 						else
 						{
-							slot = scan_slot;
-							fetched = true;
+							/* Tuple not in bitmap, continue */
+							pfree(tuple.data);
 						}
 					}
+				}
+				else
+				{
+					/* Use direct lookup for sparse regions */
+					OBTreeKeyBound bound;
+					char		key_buf[sizeof(OTupleHeader) + 64];
+					OTuple		key_tuple;
+					uint64		next_value;
+					bool		found;
 
-					if (scan->tbmres)
+					/* Get next value from bitmap */
+					next_value = o_keybitmap_get_next(scan->arg.bitmap,
+													  scan->current_bitmap_value,
+													  &found);
+
+					if (!found)
 					{
-						scan->cur_tuple++;
-						if (scan->cur_tuple >= scan->page_ntuples)
-							scan->tbmres = NULL;
+						/* No more entries in bitmap */
+						scan->bitmap_exhausted = true;
+						slot = ExecClearTuple(node->ss.ss_ScanTupleSlot);
+						fetched = true;
+					}
+					else
+					{
+						/* Update current position for next iteration */
+						scan->current_bitmap_value = next_value + 1;
+
+						/* Build key bound for lookup */
+						key_tuple.data = key_buf;
+						key_tuple.formatFlags = 0;
+						
+						/* Create a tuple with the primary key value */
+						OTupleHeader tuphdr = (OTupleHeader) key_buf;
+						FormData_pg_attribute *attr = TupleDescAttr(primary->nonLeafTupdesc, 0);
+						
+						Assert(primary->nFields == 1);
+						tuphdr->hasnulls = false;
+						tuphdr->natts = 1;
+						tuphdr->len = SizeOfOTupleHeader + attr->attlen;
+						uint64_get_val(next_value, attr->atttypid, &key_buf[SizeOfOTupleHeader]);
+
+						/* Fill bound structure */
+						o_btree_key_bound_from_tuple(&bound, &primary->desc, &key_tuple,
+													 BTreeKeyNonLeafKey, ForwardScanDirection, 
+													 primary->nonLeafTupdesc);
+
+						/* Lookup the tuple directly */
+						o_btree_load_shmem(&primary->desc);
+						tuple = o_btree_find_tuple_by_key(&primary->desc,
+														 (Pointer) &bound, BTreeKeyBound,
+														 &scan->oSnapshot, &tupleCsn,
+														 tupleCxt, &hint);
+
+						if (O_TUPLE_IS_NULL(tuple))
+						{
+							/* Tuple not found, skip to next */
+							continue;
+						}
+						else
+						{
+							OTableDescr *descr;
+							TupleTableSlot *scan_slot;
+							MemoryContext oldcxt;
+
+							descr = relation_get_descr(node->ss.ss_currentRelation);
+							slot = node->ss.ss_ScanTupleSlot;
+							oldcxt = MemoryContextSwitchTo(slot->tts_mcxt);
+							scan_slot = MakeSingleTupleTableSlot(descr->tupdesc,
+																 &TTSOpsOrioleDB);
+							MemoryContextSwitchTo(oldcxt);
+							tts_orioledb_store_tuple(scan_slot, tuple,
+													 descr, tupleCsn,
+													 PrimaryIndexNumber,
+													 true, &hint);
+							if (scan->tbmres && scan->tbmres->recheck)
+							{
+								ExprContext *tup_econtext = bitmap_state->scan->ss->ps.ps_ExprContext;
+								ExprState  *bitmapqualorig_state;
+
+								bitmapqualorig_state = ExecInitQual(bitmap_state->bitmapqualorig, NULL);
+
+								slot_getallattrs(scan_slot);
+								tup_econtext->ecxt_scantuple = scan_slot;
+
+								if (!ExecQual((ExprState *) bitmapqualorig_state, tup_econtext))
+								{
+									pfree(tuple.data);
+									slot = ExecClearTuple(node->ss.ss_ScanTupleSlot);
+								}
+								else
+								{
+									slot = scan_slot;
+									fetched = true;
+								}
+							}
+							else
+							{
+								slot = scan_slot;
+								fetched = true;
+							}
+						}
+
+						if (scan->tbmres)
+						{
+							scan->cur_tuple++;
+							if (scan->cur_tuple >= scan->page_ntuples)
+								scan->tbmres = NULL;
+						}
 					}
 				}
 			}
@@ -1007,6 +1232,8 @@ o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 void
 o_free_bitmap_scan(OBitmapScan *scan)
 {
+	if (scan->range_iterator)
+		btree_iterator_free(scan->range_iterator);
 	if (scan->arg.bitmap)
 		o_keybitmap_free(scan->arg.bitmap);
 	if (scan->tbmiterator)
