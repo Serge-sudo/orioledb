@@ -611,8 +611,7 @@ orioledb_aminsert(Relation rel, Datum *values, bool *isnull,
 
 			idx_attr = &index_descr->leafTupdesc->attrs[copy_from - skipped];
 
-			/* Use memcmp for faster fixed-size Name comparison */
-			if (memcmp(&orig_attr->attname, &idx_attr->attname, NAMEDATALEN) == 0)
+			if (strncmp(orig_attr->attname.data, idx_attr->attname.data, NAMEDATALEN) == 0)
 			{
 				if (skipped > 0)
 					values[copy_from - skipped] = values[copy_from];
@@ -1542,191 +1541,66 @@ fill_hitup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
 	scan->xs_hitup = ExecCopySlotHeapTuple(slot);
 }
 
+/* TODO: Rewrite */
 static void
 fill_itup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
 		  CommitSeqNo tupleCsn, BTreeLocationHint *hint)
 {
 	OScanState *o_scan = (OScanState *) scan;
 	TupleTableSlot *slot;
-	bytea	   *rowid;
 	OIndexDescr *index_descr = descr->indices[o_scan->ixNum];
-	TupleDesc	pk_tupdesc;
-	OTupleFixedFormatSpec *pk_spec;
-	int			result_size,
-				tuple_size = 0;
-	Pointer		ptr;
 
 	slot = index_descr->index_slot;
 	tts_orioledb_store_tuple(slot, tuple, descr, tupleCsn, o_scan->ixNum, false, hint);
 	slot_getallattrs(slot);
 
 	/*
-	 * Moving values from duplicate field places that will be filled during
-	 * index_form_tuple. Process forward to improve cache locality and enable
-	 * early termination.
+	 * moving values from duplicate field places that will be filled during
+	 * index_form_tuple
 	 */
 	if (index_descr->itupdesc->natts > index_descr->leafTupdesc->natts)
 	{
-		int			natts_itup = index_descr->itupdesc->natts;
-		int			natts_leaf = index_descr->leafTupdesc->natts;
-		int			attr_diff = natts_itup - natts_leaf;
-		int			skipped = 0;
+		int			skipped = index_descr->itupdesc->natts - index_descr->leafTupdesc->natts;
 
-		for (int i = 0; i < natts_itup; i++)
+		for (int copy_to = index_descr->itupdesc->natts - 1; copy_to >= 0; copy_to--)
 		{
-			int			leaf_idx = i - skipped;
-			Form_pg_attribute idx_attr = &index_descr->itupdesc->attrs[i];
+			Form_pg_attribute idx_attr = &index_descr->itupdesc->attrs[copy_to];
+			Form_pg_attribute slot_attr = &index_descr->leafTupdesc->attrs[copy_to - skipped];
 
-			if (leaf_idx < natts_leaf)
+			if (strncmp(slot_attr->attname.data, idx_attr->attname.data, NAMEDATALEN) == 0)
 			{
-				Form_pg_attribute slot_attr = &index_descr->leafTupdesc->attrs[leaf_idx];
-
-				/* Use memcmp for faster fixed-size Name comparison */
-				if (memcmp(&slot_attr->attname, &idx_attr->attname, NAMEDATALEN) == 0)
-				{
-					/* Matching attribute - copy if positions differ */
-					if (i != leaf_idx)
-					{
-						slot->tts_values[i] = slot->tts_values[leaf_idx];
-						slot->tts_isnull[i] = slot->tts_isnull[leaf_idx];
-					}
-					continue;
-				}
+				if (skipped == 0)
+					break;
+				slot->tts_values[copy_to] = slot->tts_values[copy_to - skipped];
+				slot->tts_isnull[copy_to] = slot->tts_isnull[copy_to - skipped];
 			}
-			/* Non-matching or out of bounds attribute */
-			slot->tts_values[i] = 0;
-			slot->tts_isnull[i] = true;
-			skipped++;
-
-			/* Early exit when all gaps are filled */
-			if (skipped >= attr_diff)
-				break;
-		}
-	}
-
-	if (o_scan->ixNum == PrimaryIndexNumber)
-	{
-		OIndexDescr *primary = descr->indices[o_scan->ixNum];
-
-		pk_tupdesc = primary->nonLeafTupdesc;
-		pk_spec = &primary->nonLeafSpec;
-	}
-	else
-	{
-		pk_tupdesc = GET_PRIMARY(descr)->nonLeafTupdesc;
-		pk_spec = &GET_PRIMARY(descr)->nonLeafSpec;
-	}
-
-	if (index_descr->primaryIsCtid)
-	{
-		OTableSlot *oslot = (OTableSlot *) slot;
-		ORowIdAddendumCtid addCtid;
-		size_t		addCtid_aligned = MAXALIGN(sizeof(ORowIdAddendumCtid));
-		size_t		itemptr_aligned = MAXALIGN(sizeof(ItemPointerData));
-
-		/* Initialize addCtid structure */
-		addCtid.hint = *hint;
-		addCtid.csn = tupleCsn;
-		addCtid.version = oslot->version;
-
-		/* Calculate total size: Ctid primary key: hint + tid + optional bridge_ctid */
-		result_size = MAXALIGN(VARHDRSZ) + addCtid_aligned + itemptr_aligned;
-		if (index_descr->bridging)
-			result_size += itemptr_aligned;
-
-		rowid = (bytea *) palloc(result_size);
-		SET_VARSIZE(rowid, result_size);
-		ptr = (Pointer) rowid + MAXALIGN(VARHDRSZ);
-
-		/* Copy structures sequentially */
-		memcpy(ptr, &addCtid, sizeof(ORowIdAddendumCtid));
-		ptr += addCtid_aligned;
-		memcpy(ptr, &slot->tts_tid, sizeof(ItemPointerData));
-
-		if (index_descr->bridging)
-		{
-			ptr += itemptr_aligned;
-			memcpy(ptr, &oslot->bridge_ctid, sizeof(ItemPointerData));
-		}
-	}
-	else
-	{
-		ORowIdAddendumNonCtid addNonCtid;
-		Datum	   *rowid_values;
-		bool	   *rowid_isnull;
-		Datum		temp_rowid_values[2 * INDEX_MAX_KEYS];
-		bool		temp_rowid_isnull[2 * INDEX_MAX_KEYS];
-		OTableSlot *oslot = (OTableSlot *) slot;
-		size_t		addNonCtid_aligned = MAXALIGN(sizeof(ORowIdAddendumNonCtid));
-
-		/* Determine which values to use based on index type */
-		if (o_scan->ixNum == PrimaryIndexNumber)
-		{
-			rowid_values = slot->tts_values;
-			rowid_isnull = slot->tts_isnull;
-		}
-		else
-		{
-			/*
-			 * Copy primary key fields from slot to temp arrays
-			 * Amount of index fields checked in o_define_index_validate
-			 */
-			for (int i = 0; i < index_descr->nPrimaryFields; i++)
+			else
 			{
-				AttrNumber	attnum = index_descr->primaryFieldsAttnums[i] - 1;
-
-				temp_rowid_values[i] = slot->tts_values[attnum];
-				temp_rowid_isnull[i] = slot->tts_isnull[attnum];
+				slot->tts_values[copy_to] = 0;
+				slot->tts_isnull[copy_to] = true;
+				skipped--;
 			}
-			rowid_values = temp_rowid_values;
-			rowid_isnull = temp_rowid_isnull;
 		}
-
-		/* Calculate result size */
-		result_size = MAXALIGN(VARHDRSZ) + addNonCtid_aligned;
-		if (index_descr->bridging)
-			result_size += MAXALIGN(sizeof(ItemPointerData));
-		else
-		{
-			tuple_size = o_new_tuple_size(pk_tupdesc, pk_spec, NULL, NULL, 0, rowid_values, rowid_isnull, NULL);
-			result_size += MAXALIGN(tuple_size);
-		}
-
-		rowid = (bytea *) palloc(result_size);
-		SET_VARSIZE(rowid, result_size);
-		ptr = (Pointer) rowid + MAXALIGN(VARHDRSZ);
-
-		/* Initialize addNonCtid structure */
-		addNonCtid.hint = *hint;
-		addNonCtid.csn = tupleCsn;
-
-		if (index_descr->bridging)
-		{
-			memcpy(ptr + addNonCtid_aligned, &oslot->bridge_ctid, sizeof(ItemPointerData));
-			addNonCtid.flags = 0;
-		}
-		else
-		{
-			tuple.data = ptr + addNonCtid_aligned;
-			o_tuple_fill(pk_tupdesc, pk_spec, &tuple, tuple_size, NULL, NULL,
-						 0, rowid_values, rowid_isnull, NULL);
-			addNonCtid.flags = tuple.formatFlags;
-		}
-
-		memcpy(ptr, &addNonCtid, sizeof(ORowIdAddendumNonCtid));
 	}
 
-	/* Free previously returned rowid if present */
+	/*
+	 * For index-only scans, we don't need to create rowid data.
+	 * Just set xs_rowid.isnull to false to indicate it's valid.
+	 */
 	if (!scan->xs_rowid.isnull)
+	{
+		/* free previously returned rowid */
 		pfree(DatumGetPointer(scan->xs_rowid.value));
-
+		scan->xs_rowid.isnull = true;
+	}
 	scan->xs_rowid.isnull = false;
-	scan->xs_rowid.value = PointerGetDatum(rowid);
 
-	/* Free previously returned tuple if present */
 	if (scan->xs_itup)
+	{
+		/* free previously returned tuple */
 		pfree(scan->xs_itup);
-
+		scan->xs_itup = NULL;
+	}
 	scan->xs_itupdesc = index_descr->itupdesc;
 	scan->xs_itup = index_form_tuple(index_descr->itupdesc, slot->tts_values, slot->tts_isnull);
 
