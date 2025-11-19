@@ -1,15 +1,16 @@
 /*-------------------------------------------------------------------------
  *
  * visibility_map.h
- *		Segment-tree-based visibility map for OrioleDB tables.
+ *		Buffer-based visibility map for OrioleDB tables.
  *
  * Unlike traditional block-based visibility maps, OrioleDB's VM uses a
  * segment tree structure with bounds from primary index leaf pages.
  * Each segment node stores the AND of all-visible bits from its children,
  * with lazy propagation for efficient updates.
  *
- * The segment tree enables O(log n) lookup and update operations, with
- * persistent storage on disk for durability.
+ * The VM uses a dedicated buffer pool with LRU eviction, similar to
+ * OrioleDB's main page pool. VM pages are loaded on access, not during
+ * ANALYZE/VACUUM.
  *
  * Copyright (c) 2021-2025, Oriole DB Inc.
  * Copyright (c) 2025, Supabase Inc.
@@ -24,12 +25,16 @@
 
 #include "btree/btree.h"
 #include "tableam/descr.h"
-#include "storage/fd.h"
+
+/* Size of a VM page in nodes */
+#define VMAP_NODES_PER_PAGE 64
+
+/* VM buffer pool size (number of pages) */
+#define VMAP_BUFFER_POOL_SIZE 128
 
 /*
  * Segment tree node for visibility map.
- * Each node represents a range of primary keys and stores whether
- * all tuples in that range are visible.
+ * Each node represents a range of primary index leaf pages.
  */
 typedef struct OVMapSegmentNode
 {
@@ -42,51 +47,92 @@ typedef struct OVMapSegmentNode
 } OVMapSegmentNode;
 
 /*
- * Persistent segment tree structure for visibility map.
- * Stored on disk with memory-mapped access for efficiency.
+ * VM page structure - holds VMAP_NODES_PER_PAGE nodes
  */
-typedef struct OVMapSegmentTree
+typedef struct OVMapPage
 {
+	uint32		page_num;		/* Page number in the VM file */
+	OVMapSegmentNode nodes[VMAP_NODES_PER_PAGE];
+} OVMapPage;
+
+/*
+ * VM buffer descriptor - tracks a buffered VM page
+ */
+typedef struct OVMapBufferDesc
+{
+	ORelOids	oids;			/* Table identifier */
+	uint32		page_num;		/* VM page number */
+	bool		dirty;			/* True if page needs write-back */
+	bool		valid;			/* True if buffer contains valid data */
+	int			usage_count;	/* For LRU eviction */
+	OVMapPage  *page;			/* Pointer to actual page data */
+} OVMapBufferDesc;
+
+/*
+ * VM buffer pool - manages VM page buffers with LRU eviction
+ */
+typedef struct OVMapBufferPool
+{
+	OVMapBufferDesc *buffers;	/* Array of buffer descriptors */
+	OVMapPage  *pages;			/* Array of page data */
+	int			num_buffers;	/* Size of buffer pool */
+	int			clock_hand;		/* For clock-sweep eviction */
+	LWLock	   *buffer_locks;	/* Locks for each buffer */
+} OVMapBufferPool;
+
+/*
+ * VM metadata stored at the beginning of VM file
+ */
+typedef struct OVMapMetadata
+{
+	uint32		magic;			/* Magic number for validation */
+	uint32		version;		/* File format version */
 	uint32		num_nodes;		/* Total number of nodes in tree */
 	uint32		num_leaves;		/* Number of leaf nodes (primary index pages) */
 	uint32		tree_height;	/* Height of the segment tree */
-	OVMapSegmentNode *nodes;	/* Array of segment tree nodes */
-	bool		dirty;			/* True if tree needs to be flushed to disk */
-} OVMapSegmentTree;
+	uint32		num_pages;		/* Number of VM pages */
+} OVMapMetadata;
 
 /*
- * Visibility map for a table, using segment tree.
+ * Visibility map handle for a table
  */
 typedef struct OVisibilityMap
 {
 	ORelOids	oids;			/* Table OIDs for identification */
-	OIndexDescr *primary_idx;	/* Primary index descriptor for comparisons */
-	OVMapSegmentTree *tree;		/* Segment tree structure */
-	File		vmap_file;		/* File descriptor for persistent storage */
-	MemoryContext mctx;			/* Memory context for allocations */
-	bool		loaded;			/* True if loaded from disk */
+	OIndexDescr *primary_idx;	/* Primary index descriptor */
+	OVMapMetadata metadata;		/* VM metadata */
+	bool		initialized;	/* True if VM file exists and is valid */
 } OVisibilityMap;
 
-/* VM file operations */
+/* Global VM buffer pool */
+extern OVMapBufferPool *vmap_buffer_pool;
+
+/* VM buffer pool initialization */
+extern Size o_vmap_buffer_pool_shmem_needs(void);
+extern void o_vmap_buffer_pool_shmem_init(void *ptr, bool found);
+
+/* VM buffer operations */
+extern OVMapPage *o_vmap_get_page(ORelOids oids, uint32 page_num, bool *found);
+extern void o_vmap_release_page(OVMapPage *page, bool dirty);
+extern void o_vmap_flush_dirty_pages(ORelOids oids);
+extern void o_vmap_evict_pages(ORelOids oids);
+
+/* VM operations */
 extern OVisibilityMap *o_visibility_map_create(OIndexDescr *primary_idx, ORelOids oids);
 extern void o_visibility_map_free(OVisibilityMap *vmap);
-extern void o_visibility_map_load(OVisibilityMap *vmap);
-extern void o_visibility_map_flush(OVisibilityMap *vmap);
+extern void o_visibility_map_init_file(OVisibilityMap *vmap, OTableDescr *descr);
 
-/* Segment tree operations */
-extern void o_visibility_map_build_tree(OVisibilityMap *vmap, OTableDescr *descr);
+/* Segment tree operations - load pages on demand */
 extern bool o_visibility_map_check_page(OVisibilityMap *vmap, uint64 page_num);
-extern void o_visibility_map_mark_page_range(OVisibilityMap *vmap, 
+extern void o_visibility_map_set_all_visible(OVisibilityMap *vmap, 
 											 uint64 left_page, 
-											 uint64 right_page,
-											 bool all_visible);
+											 uint64 right_page);
+extern void o_visibility_map_set_not_visible(OVisibilityMap *vmap,
+											  uint64 left_page,
+											  uint64 right_page);
 
-/* Lazy propagation helpers */
-extern void o_visibility_map_push_lazy(OVisibilityMap *vmap, int32 node_idx);
-extern void o_visibility_map_update_node(OVisibilityMap *vmap, int32 node_idx);
-
-/* Build VM by scanning the primary index */
-extern void o_visibility_map_build(OVisibilityMap *vmap, OTableDescr *descr);
+/* ANALYZE helper - only sets all_visible if not already set */
+extern void o_visibility_map_try_set_visible(OVisibilityMap *vmap, OTableDescr *descr);
 
 /* Get statistics about the VM for pg_class.relallvisible */
 extern BlockNumber o_visibility_map_get_visible_pages(OVisibilityMap *vmap, 

@@ -1909,15 +1909,14 @@ orioledb_analyze_table(Relation relation,
 
 	o_btree_load_shmem(&pk->desc);
 
-	/* Build or rebuild the visibility map */
+	/* VM operations - lazy loading on access */
 	if (!descr->vmap)
 	{
 		descr->vmap = o_visibility_map_create(pk, descr->oids);
 	}
-	o_visibility_map_build(descr->vmap, descr);
 	
-	/* Flush VM to disk for persistence */
-	o_visibility_map_flush(descr->vmap);
+	/* During ANALYZE, only try to set all_visible if not already set */
+	o_visibility_map_try_set_visible(descr->vmap, descr);
 
 	*func = orioledb_acquire_sample_rows;
 	*totalpages = TREE_NUM_LEAF_PAGES(&pk->desc);

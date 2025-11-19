@@ -37,6 +37,7 @@
 #include "tableam/handler.h"
 #include "tableam/scan.h"
 #include "tableam/toast.h"
+#include "tableam/visibility_map.h"
 #include "transam/oxid.h"
 #include "transam/undo.h"
 #include "tuple/toast.h"
@@ -207,7 +208,8 @@ static ShmemItem shmemItems[] = {
 	{s3_queue_shmem_needs, s3_queue_init_shmem},
 	{s3_workers_shmem_needs, s3_workers_init_shmem},
 	{s3_headers_shmem_needs, s3_headers_shmem_init},
-	{rewind_shmem_needs, rewind_init_shmem}
+	{rewind_shmem_needs, rewind_init_shmem},
+	{o_vmap_buffer_pool_shmem_needs, o_vmap_buffer_pool_shmem_init}
 };
 
 

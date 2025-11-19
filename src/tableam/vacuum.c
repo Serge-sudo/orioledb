@@ -1379,15 +1379,17 @@ orioledb_vacuum_bridged_indexes(Relation rel, OTableDescr *descr,
 		o_btree_load_shmem(&primary->desc);
 		primary_pages = pg_atomic_read_u32(&BTREE_GET_META(&primary->desc)->leafPagesNum);
 		
-		/* Build or rebuild the visibility map */
+		/* VM operations - lazy loading on access */
 		if (!vacrel->descr->vmap)
 		{
 			vacrel->descr->vmap = o_visibility_map_create(primary, vacrel->descr->oids);
 		}
-		o_visibility_map_build(vacrel->descr->vmap, vacrel->descr);
 		
-		/* Flush VM to disk for persistence */
-		o_visibility_map_flush(vacrel->descr->vmap);
+		/* During VACUUM, try to set visible if not already set */
+		o_visibility_map_try_set_visible(vacrel->descr->vmap, vacrel->descr);
+		
+		/* Flush any dirty VM pages */
+		o_vmap_flush_dirty_pages(vacrel->descr->oids);
 		
 		/* Get the count of visible pages from VM */
 		visible_pages = o_visibility_map_get_visible_pages(vacrel->descr->vmap, 
