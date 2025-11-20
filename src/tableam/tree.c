@@ -29,6 +29,7 @@
 #include "utils/stopevent.h"
 
 #include "access/nbtree.h"
+#include "catalog/pg_opclass_d.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "parser/parse_coerce.h"
@@ -576,13 +577,17 @@ cmp_inclusive2(uint8 f1, uint8 f2)
  * Perform a trivial comparison for types where comparison is simple arithmetic.
  * Returns true if the comparison was performed, false otherwise.
  * Result is stored in *cmp.
+ * 
+ * Only applies to standard btree opclasses to ensure correct comparison semantics.
  */
 static inline bool
-o_try_trivial_cmp(Oid typeid, Datum left, Datum right, int *cmp)
+o_try_trivial_cmp(Oid typeid, Oid opclass, Datum left, Datum right, int *cmp)
 {
 	switch (typeid)
 	{
 		case INT2OID:
+			if (opclass != INT2_BTREE_OPS_OID)
+				return false;
 			{
 				int16		val1 = DatumGetInt16(left);
 				int16		val2 = DatumGetInt16(right);
@@ -596,7 +601,8 @@ o_try_trivial_cmp(Oid typeid, Datum left, Datum right, int *cmp)
 				return true;
 			}
 		case INT4OID:
-		case OIDOID:
+			if (opclass != INT4_BTREE_OPS_OID)
+				return false;
 			{
 				int32		val1 = DatumGetInt32(left);
 				int32		val2 = DatumGetInt32(right);
@@ -609,7 +615,24 @@ o_try_trivial_cmp(Oid typeid, Datum left, Datum right, int *cmp)
 					*cmp = 0;
 				return true;
 			}
+		case OIDOID:
+			if (opclass != OID_BTREE_OPS_OID)
+				return false;
+			{
+				Oid			val1 = DatumGetObjectId(left);
+				Oid			val2 = DatumGetObjectId(right);
+
+				if (val1 > val2)
+					*cmp = 1;
+				else if (val1 < val2)
+					*cmp = -1;
+				else
+					*cmp = 0;
+				return true;
+			}
 		case INT8OID:
+			if (opclass != INT8_BTREE_OPS_OID)
+				return false;
 			{
 				int64		val1 = DatumGetInt64(left);
 				int64		val2 = DatumGetInt64(right);
@@ -623,6 +646,8 @@ o_try_trivial_cmp(Oid typeid, Datum left, Datum right, int *cmp)
 				return true;
 			}
 		case FLOAT4OID:
+			if (opclass != FLOAT4_BTREE_OPS_OID)
+				return false;
 			{
 				float4		val1 = DatumGetFloat4(left);
 				float4		val2 = DatumGetFloat4(right);
@@ -654,6 +679,8 @@ o_try_trivial_cmp(Oid typeid, Datum left, Datum right, int *cmp)
 				return true;
 			}
 		case FLOAT8OID:
+			if (opclass != FLOAT8_BTREE_OPS_OID)
+				return false;
 			{
 				float8		val1 = DatumGetFloat8(left);
 				float8		val2 = DatumGetFloat8(right);
@@ -703,21 +730,18 @@ o_idx_cmp_range_key_to_value(OBTreeValueBound *bound1, OIndexField *field,
 		else if (o_bound_is_coercible(bound1, field))
 		{
 			/* Try trivial comparison first for better performance */
-			if (!o_try_trivial_cmp(field->inputtype, bound1->value, value, &cmp))
+			if (!o_try_trivial_cmp(field->inputtype, field->opclass,
+								   bound1->value, value, &cmp))
 				cmp = o_call_comparator(field->comparator, bound1->value, value);
 		}
 		else
 		{
-			/* Use bound's comparator - check type from bound if possible */
-			OComparator *comparator = bound1->comparator;
-
-			if (comparator && comparator->key.lefttype == comparator->key.righttype)
-			{
-				if (!o_try_trivial_cmp(comparator->key.lefttype, bound1->value, value, &cmp))
-					cmp = o_call_comparator(comparator, bound1->value, value);
-			}
-			else
-				cmp = o_call_comparator(comparator, bound1->value, value);
+			/*
+			 * Use bound's comparator. We don't apply trivial comparison here
+			 * because we don't have the opclass information for the bound's
+			 * comparator.
+			 */
+			cmp = o_call_comparator(bound1->comparator, bound1->value, value);
 		}
 
 		if (!field->ascending)
