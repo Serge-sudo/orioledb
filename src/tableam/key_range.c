@@ -376,7 +376,6 @@ o_fill_key_bounds(Datum v, Oid type,
 	bool		coercible = false;
 	OComparator *comparator = NULL;
 	Datum		converted_value = v;
-	Oid			converted_type = type;
 
 	if (!low && !high)
 		return;
