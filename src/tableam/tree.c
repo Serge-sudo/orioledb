@@ -572,6 +572,123 @@ cmp_inclusive2(uint8 f1, uint8 f2)
 	return cmp1 - cmp2;
 }
 
+/*
+ * Perform a trivial comparison for types where comparison is simple arithmetic.
+ * Returns true if the comparison was performed, false otherwise.
+ * Result is stored in *cmp.
+ */
+static inline bool
+o_try_trivial_cmp(Oid typeid, Datum left, Datum right, int *cmp)
+{
+	switch (typeid)
+	{
+		case INT2OID:
+			{
+				int16		val1 = DatumGetInt16(left);
+				int16		val2 = DatumGetInt16(right);
+
+				if (val1 > val2)
+					*cmp = 1;
+				else if (val1 < val2)
+					*cmp = -1;
+				else
+					*cmp = 0;
+				return true;
+			}
+		case INT4OID:
+		case OIDOID:
+			{
+				int32		val1 = DatumGetInt32(left);
+				int32		val2 = DatumGetInt32(right);
+
+				if (val1 > val2)
+					*cmp = 1;
+				else if (val1 < val2)
+					*cmp = -1;
+				else
+					*cmp = 0;
+				return true;
+			}
+		case INT8OID:
+			{
+				int64		val1 = DatumGetInt64(left);
+				int64		val2 = DatumGetInt64(right);
+
+				if (val1 > val2)
+					*cmp = 1;
+				else if (val1 < val2)
+					*cmp = -1;
+				else
+					*cmp = 0;
+				return true;
+			}
+		case FLOAT4OID:
+			{
+				float4		val1 = DatumGetFloat4(left);
+				float4		val2 = DatumGetFloat4(right);
+
+				/*
+				 * We consider NaN values equal and greater than any other
+				 * float value, per SQL standard.
+				 */
+				if (isnan(val1))
+				{
+					if (isnan(val2))
+						*cmp = 0;	/* NaN = NaN */
+					else
+						*cmp = 1;	/* NaN > non-NaN */
+				}
+				else if (isnan(val2))
+				{
+					*cmp = -1;		/* non-NaN < NaN */
+				}
+				else
+				{
+					if (val1 > val2)
+						*cmp = 1;
+					else if (val1 < val2)
+						*cmp = -1;
+					else
+						*cmp = 0;
+				}
+				return true;
+			}
+		case FLOAT8OID:
+			{
+				float8		val1 = DatumGetFloat8(left);
+				float8		val2 = DatumGetFloat8(right);
+
+				/*
+				 * We consider NaN values equal and greater than any other
+				 * float value, per SQL standard.
+				 */
+				if (isnan(val1))
+				{
+					if (isnan(val2))
+						*cmp = 0;	/* NaN = NaN */
+					else
+						*cmp = 1;	/* NaN > non-NaN */
+				}
+				else if (isnan(val2))
+				{
+					*cmp = -1;		/* non-NaN < NaN */
+				}
+				else
+				{
+					if (val1 > val2)
+						*cmp = 1;
+					else if (val1 < val2)
+						*cmp = -1;
+					else
+						*cmp = 0;
+				}
+				return true;
+			}
+		default:
+			return false;
+	}
+}
+
 int
 o_idx_cmp_range_key_to_value(OBTreeValueBound *bound1, OIndexField *field,
 							 Datum value, bool isnull)
@@ -584,9 +701,24 @@ o_idx_cmp_range_key_to_value(OBTreeValueBound *bound1, OIndexField *field,
 		if ((bound1->flags & O_VALUE_BOUND_COERCIBLE) && bound1->value == value)
 			cmp = 0;
 		else if (o_bound_is_coercible(bound1, field))
-			cmp = o_call_comparator(field->comparator, bound1->value, value);
+		{
+			/* Try trivial comparison first for better performance */
+			if (!o_try_trivial_cmp(field->inputtype, bound1->value, value, &cmp))
+				cmp = o_call_comparator(field->comparator, bound1->value, value);
+		}
 		else
-			cmp = o_call_comparator(bound1->comparator, bound1->value, value);
+		{
+			/* Use bound's comparator - check type from bound if possible */
+			OComparator *comparator = bound1->comparator;
+
+			if (comparator && comparator->key.lefttype == comparator->key.righttype)
+			{
+				if (!o_try_trivial_cmp(comparator->key.lefttype, bound1->value, value, &cmp))
+					cmp = o_call_comparator(comparator, bound1->value, value);
+			}
+			else
+				cmp = o_call_comparator(comparator, bound1->value, value);
+		}
 
 		if (!field->ascending)
 			cmp = -cmp;
