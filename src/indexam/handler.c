@@ -1575,8 +1575,24 @@ fill_itup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
 	 * Optimization: Only materialize attributes up to what we actually need
 	 * for the index tuple, rather than all attributes. This significantly
 	 * reduces overhead in index-only scans where we only need index columns.
+	 * 
+	 * For secondary indexes, we also need primary key attributes for the
+	 * rowid, so we need to make sure we materialize enough attributes.
 	 */
 	natts_needed = index_descr->itupdesc->natts;
+	if (o_scan->ixNum != PrimaryIndexNumber && !index_descr->primaryIsCtid)
+	{
+		/*
+		 * For secondary indexes with non-CTID primary keys, ensure we have
+		 * enough attributes materialized for the primary key fields.
+		 */
+		for (int i = 0; i < index_descr->nPrimaryFields; i++)
+		{
+			AttrNumber	attnum = index_descr->primaryFieldsAttnums[i];
+			if (attnum > natts_needed)
+				natts_needed = attnum;
+		}
+	}
 	slot_getsomeattrs(slot, natts_needed);
 
 	/*
@@ -1587,6 +1603,10 @@ fill_itup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
 	 * 
 	 * Optimization: We now iterate backwards and can break early when
 	 * skipped reaches 0, avoiding unnecessary iterations.
+	 * 
+	 * Note: The string comparisons here could be pre-computed and cached
+	 * in the index descriptor for further optimization, but this requires
+	 * changes to the OIndexDescr structure.
 	 */
 	if (index_descr->itupdesc->natts > index_descr->leafTupdesc->natts)
 	{
@@ -1597,7 +1617,11 @@ fill_itup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
 			Form_pg_attribute idx_attr = &index_descr->itupdesc->attrs[copy_to];
 			Form_pg_attribute slot_attr = &index_descr->leafTupdesc->attrs[copy_to - skipped];
 
-			if (strncmp(slot_attr->attname.data, idx_attr->attname.data, NAMEDATALEN) == 0)
+			/*
+			 * Use direct pointer comparison for NameData when possible,
+			 * falling back to strncmp only when needed.
+			 */
+			if (namestrcmp(&slot_attr->attname, &idx_attr->attname) == 0)
 			{
 				slot->tts_values[copy_to] = slot->tts_values[copy_to - skipped];
 				slot->tts_isnull[copy_to] = slot->tts_isnull[copy_to - skipped];
