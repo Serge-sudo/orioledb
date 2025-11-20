@@ -28,12 +28,18 @@
 #include "parser/parse_coerce.h"
 #include "utils/array.h"
 #include "utils/arrayaccess.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
+
+#include <float.h>
+#include <limits.h>
+#include <math.h>
 
 static bool o_key_range_is_unbounded(OBTreeKeyRange *range, int attnum);
 static void o_fill_key_bounds(Datum v, Oid type,
 							  OBTreeValueBound *low, OBTreeValueBound *high,
 							  OIndexField *field);
+static bool o_try_convert_trivial_type(Datum *value, Oid fromType, Oid toType);
 
 static OBTreeValueBound *
 o_fill_row_key_bound(OBTreeKeyBound *bound,
@@ -287,6 +293,81 @@ o_key_data_to_key_range(OBTreeKeyRange *res, ScanKeyData *keyData,
 	return exact;
 }
 
+/*
+ * Try to convert a value from one trivial type to another.
+ * Returns true if conversion is successful without overflow.
+ * For integer types: int8 -> int4 -> int2
+ * For floating point types: float8 -> float4
+ */
+static bool
+o_try_convert_trivial_type(Datum *value, Oid fromType, Oid toType)
+{
+	/* No conversion needed if types are the same */
+	if (fromType == toType)
+		return true;
+
+	/* Handle integer type conversions */
+	if (fromType == INT8OID && toType == INT4OID)
+	{
+		int64		val64 = DatumGetInt64(*value);
+
+		/* Check for overflow */
+		if (val64 < INT_MIN || val64 > INT_MAX)
+			return false;
+
+		*value = Int32GetDatum((int32) val64);
+		return true;
+	}
+	else if (fromType == INT8OID && toType == INT2OID)
+	{
+		int64		val64 = DatumGetInt64(*value);
+
+		/* Check for overflow */
+		if (val64 < SHRT_MIN || val64 > SHRT_MAX)
+			return false;
+
+		*value = Int16GetDatum((int16) val64);
+		return true;
+	}
+	else if (fromType == INT4OID && toType == INT2OID)
+	{
+		int32		val32 = DatumGetInt32(*value);
+
+		/* Check for overflow */
+		if (val32 < SHRT_MIN || val32 > SHRT_MAX)
+			return false;
+
+		*value = Int16GetDatum((int16) val32);
+		return true;
+	}
+	/* Handle floating point type conversions */
+	else if (fromType == FLOAT8OID && toType == FLOAT4OID)
+	{
+		float8		val8 = DatumGetFloat8(*value);
+
+		/*
+		 * Check if the value can be represented as float4 without significant
+		 * loss. We allow conversion if the value is within float4 range or is
+		 * infinity/NaN.
+		 */
+		if (isnan(val8) || isinf(val8))
+		{
+			*value = Float4GetDatum((float4) val8);
+			return true;
+		}
+
+		/* Check for overflow to infinity */
+		if (val8 < -FLT_MAX || val8 > FLT_MAX)
+			return false;
+
+		*value = Float4GetDatum((float4) val8);
+		return true;
+	}
+
+	/* Conversion not supported for this type pair */
+	return false;
+}
+
 static void
 o_fill_key_bounds(Datum v, Oid type,
 				  OBTreeValueBound *low, OBTreeValueBound *high,
@@ -294,9 +375,27 @@ o_fill_key_bounds(Datum v, Oid type,
 {
 	bool		coercible = false;
 	OComparator *comparator = NULL;
+	Datum		converted_value = v;
+	Oid			converted_type = type;
 
 	if (!low && !high)
 		return;
+
+	/*
+	 * Try to convert the value to the index field type for trivial types.
+	 * This optimization allows queries like "SELECT ... WHERE int4_col BETWEEN
+	 * 1 AND 10" to use optimized comparisons, even though PostgreSQL uses
+	 * int8 for the literal values.
+	 */
+	if (type != field->inputtype)
+	{
+		if (o_try_convert_trivial_type(&converted_value, type, field->inputtype))
+		{
+			/* Conversion successful, use the converted value and type */
+			type = field->inputtype;
+			v = converted_value;
+		}
+	}
 
 	if (type == field->opclass || type == field->inputtype ||
 		IsBinaryCoercible(type, field->inputtype))
