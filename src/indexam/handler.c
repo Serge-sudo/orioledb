@@ -1542,16 +1542,84 @@ fill_hitup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
 }
 
 /*
- * Optimized fill_itup for index-only scans.
- * 
- * This function fills the IndexScanDesc with index tuple data for index-only
- * scans. The original implementation was inefficient because it materialized
- * all attributes through a slot, even though for index-only scans we only need
- * the specific index attributes.
- * 
- * Optimization: We now only materialize the attributes that are actually needed
- * for the index tuple descriptor, avoiding the overhead of slot_getallattrs()
- * and reducing time spent in tts_orioledb_store_tuple and index_form_tuple.
+ * Convert OTuple directly to IndexTuple without going through a slot.
+ * This is a performance optimization for index-only scans where we can
+ * avoid the overhead of slot materialization.
+ */
+static IndexTuple
+o_form_index_tuple(OTuple otuple, OIndexDescr *index_descr, 
+				   OTableDescr *descr, ItemPointerData *tid)
+{
+	TupleDesc	itupdesc = index_descr->itupdesc;
+	TupleDesc	leafTupdesc = index_descr->leafTupdesc;
+	OTupleFixedFormatSpec *leaf_spec = &index_descr->leafSpec;
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	IndexTuple	result;
+	int			natts = itupdesc->natts;
+	int			leaf_natts = leafTupdesc->natts;
+	
+	/*
+	 * Extract attributes directly from OTuple using o_fastgetattr.
+	 * This bypasses the slot materialization overhead.
+	 */
+	for (int i = 0; i < natts; i++)
+	{
+		if (i < leaf_natts)
+		{
+			/*
+			 * Attribute is present in the leaf tuple, extract it directly
+			 * from the OTuple.
+			 */
+			values[i] = o_fastgetattr(otuple, i + 1, leafTupdesc, leaf_spec, &isnull[i]);
+		}
+		else
+		{
+			/*
+			 * Attribute is an included column not present in the leaf tuple.
+			 * Check if it matches an earlier attribute (for secondary indexes
+			 * that duplicate primary key columns).
+			 */
+			Form_pg_attribute idx_attr = TupleDescAttr(itupdesc, i);
+			bool		found = false;
+			
+			for (int j = 0; j < leaf_natts; j++)
+			{
+				Form_pg_attribute leaf_attr = TupleDescAttr(leafTupdesc, j);
+				
+				if (namestrcmp(&leaf_attr->attname, &idx_attr->attname) == 0)
+				{
+					/* Found matching attribute, reuse the value */
+					values[i] = values[j];
+					isnull[i] = isnull[j];
+					found = true;
+					break;
+				}
+			}
+			
+			if (!found)
+			{
+				/* Attribute not found, set to NULL */
+				values[i] = (Datum) 0;
+				isnull[i] = true;
+			}
+		}
+	}
+	
+	/* Form the index tuple using the extracted values */
+	result = index_form_tuple(itupdesc, values, isnull);
+	
+	/* Copy the TID */
+	if (tid)
+		ItemPointerCopy(tid, &result->t_tid);
+	
+	return result;
+}
+
+/*
+ * Fill IndexScanDesc with index tuple data for index-only scans.
+ * Optimized version that converts OTuple directly to IndexTuple without
+ * going through a slot, avoiding unnecessary attribute materialization.
  */
 static void
 fill_itup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
@@ -1563,76 +1631,21 @@ fill_itup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
 	OIndexDescr *index_descr = descr->indices[o_scan->ixNum];
 	TupleDesc	pk_tupdesc;
 	OTupleFixedFormatSpec *pk_spec;
+	TupleDesc	leafTupdesc = index_descr->leafTupdesc;
+	OTupleFixedFormatSpec *leaf_spec = &index_descr->leafSpec;
 	int			result_size,
 				tuple_size = 0;
 	Pointer		ptr;
-	int			natts_needed;
-
-	slot = index_descr->index_slot;
-	tts_orioledb_store_tuple(slot, tuple, descr, tupleCsn, o_scan->ixNum, false, hint);
+	OTableSlot *oslot;
 	
 	/*
-	 * Optimization: Only materialize attributes up to what we actually need
-	 * for the index tuple, rather than all attributes. This significantly
-	 * reduces overhead in index-only scans where we only need index columns.
-	 * 
-	 * For secondary indexes, we also need primary key attributes for the
-	 * rowid, so we need to make sure we materialize enough attributes.
+	 * We still need a slot for rowid construction metadata (tid, version, 
+	 * bridge_ctid) but we avoid materializing all attributes. We only 
+	 * store the tuple without extracting attributes.
 	 */
-	natts_needed = index_descr->itupdesc->natts;
-	if (o_scan->ixNum != PrimaryIndexNumber && !index_descr->primaryIsCtid)
-	{
-		/*
-		 * For secondary indexes with non-CTID primary keys, ensure we have
-		 * enough attributes materialized for the primary key fields.
-		 */
-		for (int i = 0; i < index_descr->nPrimaryFields; i++)
-		{
-			AttrNumber	attnum = index_descr->primaryFieldsAttnums[i];
-			if (attnum > natts_needed)
-				natts_needed = attnum;
-		}
-	}
-	slot_getsomeattrs(slot, natts_needed);
-
-	/*
-	 * Moving values from duplicate field places that will be filled during
-	 * index_form_tuple. This handles cases where the index tuple descriptor
-	 * has more attributes than the leaf tuple descriptor (e.g., included
-	 * columns in secondary indexes).
-	 * 
-	 * Optimization: We now iterate backwards and can break early when
-	 * skipped reaches 0, avoiding unnecessary iterations.
-	 * 
-	 * Note: The string comparisons here could be pre-computed and cached
-	 * in the index descriptor for further optimization, but this requires
-	 * changes to the OIndexDescr structure.
-	 */
-	if (index_descr->itupdesc->natts > index_descr->leafTupdesc->natts)
-	{
-		int			skipped = index_descr->itupdesc->natts - index_descr->leafTupdesc->natts;
-
-		for (int copy_to = index_descr->itupdesc->natts - 1; copy_to >= 0 && skipped > 0; copy_to--)
-		{
-			Form_pg_attribute idx_attr = &index_descr->itupdesc->attrs[copy_to];
-			Form_pg_attribute slot_attr = &index_descr->leafTupdesc->attrs[copy_to - skipped];
-
-			/*
-			 * Use PostgreSQL's optimized namestrcmp for comparing NameData.
-			 */
-			if (namestrcmp(&slot_attr->attname, &idx_attr->attname) == 0)
-			{
-				slot->tts_values[copy_to] = slot->tts_values[copy_to - skipped];
-				slot->tts_isnull[copy_to] = slot->tts_isnull[copy_to - skipped];
-			}
-			else
-			{
-				slot->tts_values[copy_to] = 0;
-				slot->tts_isnull[copy_to] = true;
-				skipped--;
-			}
-		}
-	}
+	slot = index_descr->index_slot;
+	tts_orioledb_store_tuple(slot, tuple, descr, tupleCsn, o_scan->ixNum, false, hint);
+	oslot = (OTableSlot *) slot;
 
 	if (o_scan->ixNum == PrimaryIndexNumber)
 	{
@@ -1647,9 +1660,12 @@ fill_itup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
 		pk_spec = &GET_PRIMARY(descr)->nonLeafSpec;
 	}
 
+	/*
+	 * Build rowid structure. For non-CTID primary keys, we need to extract
+	 * primary key attributes from the OTuple.
+	 */
 	if (index_descr->primaryIsCtid)
 	{
-		OTableSlot *oslot = (OTableSlot *) slot;
 		ORowIdAddendumCtid addCtid;
 
 		addCtid.hint = *hint;
@@ -1677,31 +1693,41 @@ fill_itup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
 	else
 	{
 		ORowIdAddendumNonCtid addNonCtid;
-		Datum	   *rowid_values;
-		bool	   *rowid_isnull;
 		Datum		temp_rowid_values[2 * INDEX_MAX_KEYS];
 		bool		temp_rowid_isnull[2 * INDEX_MAX_KEYS];
+		Datum	   *rowid_values;
+		bool	   *rowid_isnull;
 		int			i;
-		OTableSlot *oslot = (OTableSlot *) slot;
 
 		/*
-		 * Amount of index fields checked in o_define_index_validate
+		 * Extract primary key attributes directly from OTuple for rowid.
+		 * This avoids materializing all attributes via slot_getallattrs.
 		 */
-		for (i = 0; i < index_descr->nPrimaryFields; i++)
-		{
-			AttrNumber	attnum = index_descr->primaryFieldsAttnums[i] - 1;
-
-			temp_rowid_values[i] = slot->tts_values[attnum];
-			temp_rowid_isnull[i] = slot->tts_isnull[attnum];
-		}
-
 		if (o_scan->ixNum == PrimaryIndexNumber)
 		{
-			rowid_values = slot->tts_values;
-			rowid_isnull = slot->tts_isnull;
+			/*
+			 * For primary index, extract all attributes for rowid.
+			 */
+			int natts = index_descr->itupdesc->natts;
+			for (i = 0; i < natts; i++)
+			{
+				temp_rowid_values[i] = o_fastgetattr(tuple, i + 1, leafTupdesc, 
+													 leaf_spec, &temp_rowid_isnull[i]);
+			}
+			rowid_values = temp_rowid_values;
+			rowid_isnull = temp_rowid_isnull;
 		}
 		else
 		{
+			/*
+			 * For secondary index, extract only primary key attributes.
+			 */
+			for (i = 0; i < index_descr->nPrimaryFields; i++)
+			{
+				AttrNumber	attnum = index_descr->primaryFieldsAttnums[i];
+				temp_rowid_values[i] = o_fastgetattr(tuple, attnum, leafTupdesc,
+													 leaf_spec, &temp_rowid_isnull[i]);
+			}
 			rowid_values = temp_rowid_values;
 			rowid_isnull = temp_rowid_isnull;
 		}
@@ -1752,9 +1778,12 @@ fill_itup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
 		scan->xs_itup = NULL;
 	}
 	scan->xs_itupdesc = index_descr->itupdesc;
-	scan->xs_itup = index_form_tuple(index_descr->itupdesc, slot->tts_values, slot->tts_isnull);
-
-	ItemPointerCopy(&slot->tts_tid, &scan->xs_itup->t_tid);
+	
+	/*
+	 * Use the optimized path to form IndexTuple directly from OTuple,
+	 * bypassing the expensive slot_getallattrs and attribute shuffling.
+	 */
+	scan->xs_itup = o_form_index_tuple(tuple, index_descr, descr, &slot->tts_tid);
 }
 
 bool
