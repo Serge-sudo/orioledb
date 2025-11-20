@@ -179,6 +179,8 @@ struct OIndexDescr
 	Size		itup_hoff_no_nulls;		/* header offset when no nulls */
 	Size		itup_hoff_with_nulls;	/* header offset when nulls present */
 	bool		itup_has_varwidth;		/* true if index has variable-width attrs */
+	bool		itup_fixed_size;		/* true if all attrs are fixed-length and NOT NULL */
+	Size		itup_fixed_data_size;	/* pre-computed data size for fixed-size indexes */
 };
 
 /*

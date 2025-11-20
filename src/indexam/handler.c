@@ -1622,7 +1622,7 @@ o_form_index_tuple(OTuple otuple, OIndexDescr *index_descr,
 	}
 	
 	/*
-	 * Calculate tuple size using cached header offsets to avoid recalculation.
+	 * Calculate tuple size using cached values to avoid recalculation.
 	 * Layout: IndexTupleData header + optional null bitmap + attribute data
 	 */
 	
@@ -1632,20 +1632,32 @@ o_form_index_tuple(OTuple otuple, OIndexDescr *index_descr,
 	else
 		hoff = index_descr->itup_hoff_no_nulls;
 	
-	/* Calculate data size for all attributes */
-	data_size = 0;
-	for (i = 0; i < natts; i++)
+	/*
+	 * For indexes with all fixed-length NOT NULL attributes, use cached data size.
+	 * This is common for simple indexes on integer columns (e.g., INT, BIGINT).
+	 */
+	if (index_descr->itup_fixed_size)
 	{
-		if (!isnull[i])
+		/* All attributes are fixed-length and NOT NULL, use pre-computed size */
+		data_size = index_descr->itup_fixed_data_size;
+	}
+	else
+	{
+		/* Calculate data size dynamically for variable-length or nullable attributes */
+		data_size = 0;
+		for (i = 0; i < natts; i++)
 		{
-			Form_pg_attribute attr = TupleDescAttr(itupdesc, i);
-			Size		data_length;
-			
-			data_length = att_align_datum(data_size, attr->attalign,
-										  attr->attlen, values[i]);
-			data_length = att_addlength_datum(data_length, attr->attlen,
-											  values[i]);
-			data_size = data_length;
+			if (!isnull[i])
+			{
+				Form_pg_attribute attr = TupleDescAttr(itupdesc, i);
+				Size		data_length;
+				
+				data_length = att_align_datum(data_size, attr->attalign,
+											  attr->attlen, values[i]);
+				data_length = att_addlength_datum(data_length, attr->attlen,
+												  values[i]);
+				data_size = data_length;
+			}
 		}
 	}
 	

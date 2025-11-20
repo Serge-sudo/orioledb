@@ -868,6 +868,9 @@ cache_scan_tupdesc_and_slot(OIndexDescr *index_descr, OIndex *oIndex)
 	{
 		TupleDesc	itupdesc = index_descr->itupdesc;
 		int			natts = itupdesc->natts;
+		bool		all_fixed_length = true;
+		bool		all_not_null = true;
+		Size		data_size;
 		
 		/* Calculate base header offset without nulls */
 		index_descr->itup_hoff_no_nulls = sizeof(IndexTupleData);
@@ -876,7 +879,7 @@ cache_scan_tupdesc_and_slot(OIndexDescr *index_descr, OIndex *oIndex)
 		index_descr->itup_hoff_with_nulls = sizeof(IndexTupleData) + BITMAPLEN(natts);
 		index_descr->itup_hoff_with_nulls = MAXALIGN(index_descr->itup_hoff_with_nulls);
 		
-		/* Check if index has variable-width attributes */
+		/* Check if index has variable-width attributes and if all are NOT NULL */
 		index_descr->itup_has_varwidth = false;
 		for (i = 0; i < natts; i++)
 		{
@@ -884,8 +887,38 @@ cache_scan_tupdesc_and_slot(OIndexDescr *index_descr, OIndex *oIndex)
 			if (attr->attlen < 0)
 			{
 				index_descr->itup_has_varwidth = true;
-				break;
+				all_fixed_length = false;
 			}
+			if (!attr->attnotnull)
+			{
+				all_not_null = false;
+			}
+		}
+		
+		/*
+		 * If all attributes are fixed-length and NOT NULL, we can pre-compute
+		 * the total data size. This is common for simple indexes on integer columns.
+		 */
+		if (all_fixed_length && all_not_null)
+		{
+			data_size = 0;
+			for (i = 0; i < natts; i++)
+			{
+				Form_pg_attribute attr = TupleDescAttr(itupdesc, i);
+				
+				/* Align to the attribute's alignment requirement */
+				data_size = att_align_nominal(data_size, attr->attalign);
+				/* Add the attribute's length */
+				data_size += attr->attlen;
+			}
+			
+			index_descr->itup_fixed_size = true;
+			index_descr->itup_fixed_data_size = data_size;
+		}
+		else
+		{
+			index_descr->itup_fixed_size = false;
+			index_descr->itup_fixed_data_size = 0;
 		}
 	}
 }
