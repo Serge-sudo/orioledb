@@ -1622,19 +1622,15 @@ o_form_index_tuple(OTuple otuple, OIndexDescr *index_descr,
 	}
 	
 	/*
-	 * Calculate tuple size manually to avoid index_form_tuple overhead.
+	 * Calculate tuple size using cached header offsets to avoid recalculation.
 	 * Layout: IndexTupleData header + optional null bitmap + attribute data
 	 */
 	
-	/* Start with header size */
-	hoff = sizeof(IndexTupleData);
-	
-	/* Add null bitmap size if needed */
+	/* Use cached header offset based on whether we have nulls */
 	if (hasnull)
-	{
-		hoff += BITMAPLEN(natts);
-		hoff = MAXALIGN(hoff);
-	}
+		hoff = index_descr->itup_hoff_with_nulls;
+	else
+		hoff = index_descr->itup_hoff_no_nulls;
 	
 	/* Calculate data size for all attributes */
 	data_size = 0;
@@ -1663,16 +1659,9 @@ o_form_index_tuple(OTuple otuple, OIndexDescr *index_descr,
 	if (hasnull)
 		result->t_info |= INDEX_NULL_MASK;
 	
-	/* Check for variable-width attributes */
-	for (i = 0; i < natts; i++)
-	{
-		Form_pg_attribute attr = TupleDescAttr(itupdesc, i);
-		if (attr->attlen < 0)
-		{
-			result->t_info |= INDEX_VAR_MASK;
-			break;
-		}
-	}
+	/* Use cached variable-width check */
+	if (index_descr->itup_has_varwidth)
+		result->t_info |= INDEX_VAR_MASK;
 	
 	/* Copy TID */
 	if (tid)

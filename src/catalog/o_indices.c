@@ -28,6 +28,8 @@
 #include "tuple/toast.h"
 
 #include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/itup.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/pg_opclass_d.h"
@@ -857,6 +859,35 @@ cache_scan_tupdesc_and_slot(OIndexDescr *index_descr, OIndex *oIndex)
 	}
 
 	index_descr->index_slot = MakeSingleTupleTableSlot(index_descr->itupdesc, &TTSOpsOrioleDB);
+	
+	/*
+	 * Pre-compute cached values for index tuple formation optimization.
+	 * These values are used by o_form_index_tuple to avoid recalculating
+	 * them on every tuple.
+	 */
+	{
+		TupleDesc	itupdesc = index_descr->itupdesc;
+		int			natts = itupdesc->natts;
+		
+		/* Calculate base header offset without nulls */
+		index_descr->itup_hoff_no_nulls = sizeof(IndexTupleData);
+		
+		/* Calculate base header offset with nulls (includes null bitmap) */
+		index_descr->itup_hoff_with_nulls = sizeof(IndexTupleData) + BITMAPLEN(natts);
+		index_descr->itup_hoff_with_nulls = MAXALIGN(index_descr->itup_hoff_with_nulls);
+		
+		/* Check if index has variable-width attributes */
+		index_descr->itup_has_varwidth = false;
+		for (i = 0; i < natts; i++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(itupdesc, i);
+			if (attr->attlen < 0)
+			{
+				index_descr->itup_has_varwidth = true;
+				break;
+			}
+		}
+	}
 }
 
 void
