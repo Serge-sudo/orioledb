@@ -1618,8 +1618,7 @@ fill_itup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
 			Form_pg_attribute slot_attr = &index_descr->leafTupdesc->attrs[copy_to - skipped];
 
 			/*
-			 * Use direct pointer comparison for NameData when possible,
-			 * falling back to strncmp only when needed.
+			 * Use PostgreSQL's optimized namestrcmp for comparing NameData.
 			 */
 			if (namestrcmp(&slot_attr->attname, &idx_attr->attname) == 0)
 			{
