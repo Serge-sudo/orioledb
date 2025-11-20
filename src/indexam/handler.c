@@ -32,6 +32,8 @@
 
 #include "access/amapi.h"
 #include "access/relation.h"
+#include "access/htup_details.h"
+#include "access/itup.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "nodes/pathnodes.h"
@@ -1544,7 +1546,10 @@ fill_hitup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
 /*
  * Convert OTuple directly to IndexTuple without going through a slot.
  * This is a performance optimization for index-only scans where we can
- * avoid the overhead of slot materialization.
+ * avoid the overhead of slot materialization and index_form_tuple().
+ * 
+ * This function manually constructs the IndexTuple, avoiding the overhead
+ * of index_form_tuple() by directly calculating sizes and copying data.
  */
 static IndexTuple
 o_form_index_tuple(OTuple otuple, OIndexDescr *index_descr, 
@@ -1558,12 +1563,19 @@ o_form_index_tuple(OTuple otuple, OIndexDescr *index_descr,
 	IndexTuple	result;
 	int			natts = itupdesc->natts;
 	int			leaf_natts = leafTupdesc->natts;
+	Size		tuple_size;
+	Size		data_size;
+	Size		hoff;
+	bool		hasnull = false;
+	char	   *tp;				/* tuple data pointer */
+	bits8	   *bp;				/* null bitmap pointer */
+	int			i;
 	
 	/*
 	 * Extract attributes directly from OTuple using o_fastgetattr.
 	 * This bypasses the slot materialization overhead.
 	 */
-	for (int i = 0; i < natts; i++)
+	for (i = 0; i < natts; i++)
 	{
 		if (i < leaf_natts)
 		{
@@ -1604,14 +1616,114 @@ o_form_index_tuple(OTuple otuple, OIndexDescr *index_descr,
 				isnull[i] = true;
 			}
 		}
+		
+		if (isnull[i])
+			hasnull = true;
 	}
 	
-	/* Form the index tuple using the extracted values */
-	result = index_form_tuple(itupdesc, values, isnull);
+	/*
+	 * Calculate tuple size manually to avoid index_form_tuple overhead.
+	 * Layout: IndexTupleData header + optional null bitmap + attribute data
+	 */
 	
-	/* Copy the TID */
+	/* Start with header size */
+	hoff = sizeof(IndexTupleData);
+	
+	/* Add null bitmap size if needed */
+	if (hasnull)
+	{
+		hoff += BITMAPLEN(natts);
+		hoff = MAXALIGN(hoff);
+	}
+	
+	/* Calculate data size for all attributes */
+	data_size = 0;
+	for (i = 0; i < natts; i++)
+	{
+		if (!isnull[i])
+		{
+			Form_pg_attribute attr = TupleDescAttr(itupdesc, i);
+			Size		data_length;
+			
+			data_length = att_align_datum(data_size, attr->attalign,
+										  attr->attlen, values[i]);
+			data_length = att_addlength_datum(data_length, attr->attlen,
+											  values[i]);
+			data_size = data_length;
+		}
+	}
+	
+	tuple_size = hoff + data_size;
+	
+	/* Allocate and zero the tuple */
+	result = (IndexTuple) palloc0(tuple_size);
+	result->t_info = tuple_size;
+	
+	/* Set null bitmap flag if needed */
+	if (hasnull)
+		result->t_info |= INDEX_NULL_MASK;
+	
+	/* Check for variable-width attributes */
+	for (i = 0; i < natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(itupdesc, i);
+		if (attr->attlen < 0)
+		{
+			result->t_info |= INDEX_VAR_MASK;
+			break;
+		}
+	}
+	
+	/* Copy TID */
 	if (tid)
 		ItemPointerCopy(tid, &result->t_tid);
+	
+	/* Set up null bitmap if needed */
+	if (hasnull)
+	{
+		bp = (bits8 *) ((char *) result + sizeof(IndexTupleData));
+		memset(bp, 0, BITMAPLEN(natts));
+	}
+	else
+		bp = NULL;
+	
+	/* Copy attribute data */
+	tp = (char *) result + hoff;
+	
+	for (i = 0; i < natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(itupdesc, i);
+		
+		if (isnull[i])
+		{
+			/* Set null bit */
+			if (bp)
+				bp[i >> 3] |= (1 << (i & 0x07));
+		}
+		else
+		{
+			Size		data_length;
+			
+			/* Align data pointer */
+			tp = (char *) att_align_nominal(tp, attr->attalign);
+			
+			/* Copy the attribute data */
+			if (attr->attlen > 0)
+			{
+				/* Fixed-length attribute */
+				store_att_byval(tp, values[i], attr->attlen);
+				data_length = attr->attlen;
+			}
+			else
+			{
+				/* Variable-length attribute */
+				data_length = VARSIZE_ANY(DatumGetPointer(values[i]));
+				memcpy(tp, DatumGetPointer(values[i]), data_length);
+			}
+			
+			tp += data_length;
+		}
+	}
 	
 	return result;
 }
