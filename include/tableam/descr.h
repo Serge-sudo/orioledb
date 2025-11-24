@@ -181,6 +181,7 @@ struct OIndexDescr
 	bool		itup_has_varwidth;		/* true if index has variable-width attrs */
 	bool		itup_fixed_size;		/* true if all attrs are fixed-length and NOT NULL */
 	Size		itup_fixed_data_size;	/* pre-computed data size for fixed-size indexes */
+	bool		itup_can_zero_copy;		/* true if IndexTuple and OTuple formats are identical */
 };
 
 /*

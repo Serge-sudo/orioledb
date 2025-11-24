@@ -1548,81 +1548,124 @@ fill_hitup(IndexScanDesc scan, OTuple tuple, OTableDescr *descr,
  * This is a performance optimization for index-only scans where we can
  * avoid the overhead of slot materialization and index_form_tuple().
  * 
- * This function manually constructs the IndexTuple, avoiding the overhead
- * of index_form_tuple() by directly calculating sizes and copying data.
+ * For indexes where the format is identical (fixed-length, NOT NULL, same order),
+ * we use a zero-copy approach that just wraps the OTuple data with an IndexTuple header.
+ * Otherwise, we manually construct the IndexTuple.
  */
 static IndexTuple
 o_form_index_tuple(OTuple otuple, OIndexDescr *index_descr, 
 				   OTableDescr *descr, ItemPointerData *tid)
 {
-	TupleDesc	itupdesc = index_descr->itupdesc;
-	TupleDesc	leafTupdesc = index_descr->leafTupdesc;
-	OTupleFixedFormatSpec *leaf_spec = &index_descr->leafSpec;
-	Datum		values[INDEX_MAX_KEYS];
-	bool		isnull[INDEX_MAX_KEYS];
 	IndexTuple	result;
-	int			natts = itupdesc->natts;
-	int			leaf_natts = leafTupdesc->natts;
-	Size		tuple_size;
-	Size		data_size;
-	Size		hoff;
-	bool		hasnull = false;
-	char	   *tp;				/* tuple data pointer */
-	bits8	   *bp;				/* null bitmap pointer */
-	int			i;
 	
 	/*
-	 * Extract attributes directly from OTuple using o_fastgetattr.
-	 * This bypasses the slot materialization overhead.
+	 * Fast path: zero-copy for compatible formats.
+	 * When IndexTuple and OTuple formats are identical (same attributes, fixed-length,
+	 * NOT NULL, same order), we can create a minimal IndexTuple wrapper that points
+	 * directly to the OTuple data without copying anything.
 	 */
-	for (i = 0; i < natts; i++)
+	if (index_descr->itup_can_zero_copy && (otuple.formatFlags & O_TUPLE_FLAGS_FIXED_FORMAT))
 	{
-		if (i < leaf_natts)
-		{
-			/*
-			 * Attribute is present in the leaf tuple, extract it directly
-			 * from the OTuple.
-			 */
-			values[i] = o_fastgetattr(otuple, i + 1, leafTupdesc, leaf_spec, &isnull[i]);
-		}
-		else
-		{
-			/*
-			 * Attribute is an included column not present in the leaf tuple.
-			 * Check if it matches an earlier attribute (for secondary indexes
-			 * that duplicate primary key columns).
-			 */
-			Form_pg_attribute idx_attr = TupleDescAttr(itupdesc, i);
-			bool		found = false;
-			
-			for (int j = 0; j < leaf_natts; j++)
-			{
-				Form_pg_attribute leaf_attr = TupleDescAttr(leafTupdesc, j);
-				
-				if (namestrcmp(&leaf_attr->attname, &idx_attr->attname) == 0)
-				{
-					/* Found matching attribute, reuse the value */
-					values[i] = values[j];
-					isnull[i] = isnull[j];
-					found = true;
-					break;
-				}
-			}
-			
-			if (!found)
-			{
-				/* Attribute not found, set to NULL */
-				values[i] = (Datum) 0;
-				isnull[i] = true;
-			}
-		}
+		Size	tuple_size;
 		
-		if (isnull[i])
-			hasnull = true;
+		/* Total size = IndexTuple header + pre-computed data size */
+		tuple_size = sizeof(IndexTupleData) + index_descr->itup_fixed_data_size;
+		
+		/* Allocate IndexTuple */
+		result = (IndexTuple) palloc(tuple_size);
+		
+		/* Set size in t_info */
+		result->t_info = tuple_size;
+		
+		/* Copy TID */
+		if (tid)
+			ItemPointerCopy(tid, &result->t_tid);
+		
+		/*
+		 * Zero-copy: directly memcpy the data portion from OTuple.
+		 * OTuple fixed format stores data right after the header, which matches
+		 * IndexTuple layout for fixed-length NOT NULL attributes.
+		 */
+		memcpy((char *) result + sizeof(IndexTupleData),
+			   (char *) otuple.data,
+			   index_descr->itup_fixed_data_size);
+		
+		return result;
 	}
 	
 	/*
-	 * Calculate tuple size using cached values to avoid recalculation.
+	 * Slow path: manual construction for complex formats.
+	 * This path handles variable-length attributes, NULLs, included columns,
+	 * and attribute reordering.
+	 */
+	{
+		TupleDesc	itupdesc = index_descr->itupdesc;
+		TupleDesc	leafTupdesc = index_descr->leafTupdesc;
+		OTupleFixedFormatSpec *leaf_spec = &index_descr->leafSpec;
+		Datum		values[INDEX_MAX_KEYS];
+		bool		isnull[INDEX_MAX_KEYS];
+		int			natts = itupdesc->natts;
+		int			leaf_natts = leafTupdesc->natts;
+		Size		tuple_size;
+		Size		data_size;
+		Size		hoff;
+		bool		hasnull = false;
+		char	   *tp;				/* tuple data pointer */
+		bits8	   *bp;				/* null bitmap pointer */
+		int			i;
+		
+		/*
+		 * Extract attributes directly from OTuple using o_fastgetattr.
+		 * This bypasses the slot materialization overhead.
+		 */
+		for (i = 0; i < natts; i++)
+		{
+			if (i < leaf_natts)
+			{
+				/*
+				 * Attribute is present in the leaf tuple, extract it directly
+				 * from the OTuple.
+				 */
+				values[i] = o_fastgetattr(otuple, i + 1, leafTupdesc, leaf_spec, &isnull[i]);
+			}
+			else
+			{
+				/*
+				 * Attribute is an included column not present in the leaf tuple.
+				 * Check if it matches an earlier attribute (for secondary indexes
+				 * that duplicate primary key columns).
+				 */
+				Form_pg_attribute idx_attr = TupleDescAttr(itupdesc, i);
+				bool		found = false;
+				
+				for (int j = 0; j < leaf_natts; j++)
+				{
+					Form_pg_attribute leaf_attr = TupleDescAttr(leafTupdesc, j);
+					
+					if (namestrcmp(&leaf_attr->attname, &idx_attr->attname) == 0)
+					{
+						/* Found matching attribute, reuse the value */
+						values[i] = values[j];
+						isnull[i] = isnull[j];
+						found = true;
+						break;
+					}
+				}
+				
+				if (!found)
+				{
+					/* Attribute not found, set to NULL */
+					values[i] = (Datum) 0;
+					isnull[i] = true;
+				}
+			}
+			
+			if (isnull[i])
+				hasnull = true;
+		}
+		
+		/*
+		 * Calculate tuple size using cached values to avoid recalculation.
 	 * Layout: IndexTupleData header + optional null bitmap + attribute data
 	 */
 	
@@ -1726,7 +1769,8 @@ o_form_index_tuple(OTuple otuple, OIndexDescr *index_descr,
 		}
 	}
 	
-	return result;
+		return result;
+	}
 }
 
 /*

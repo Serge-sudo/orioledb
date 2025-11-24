@@ -867,9 +867,12 @@ cache_scan_tupdesc_and_slot(OIndexDescr *index_descr, OIndex *oIndex)
 	 */
 	{
 		TupleDesc	itupdesc = index_descr->itupdesc;
+		TupleDesc	leafTupdesc = index_descr->leafTupdesc;
 		int			natts = itupdesc->natts;
+		int			leaf_natts = leafTupdesc->natts;
 		bool		all_fixed_length = true;
 		bool		all_not_null = true;
+		bool		can_zero_copy = true;
 		Size		data_size;
 		
 		/* Calculate base header offset without nulls */
@@ -894,6 +897,36 @@ cache_scan_tupdesc_and_slot(OIndexDescr *index_descr, OIndex *oIndex)
 				all_not_null = false;
 			}
 		}
+		
+		/*
+		 * Check if zero-copy is possible: IndexTuple and OTuple formats must be identical.
+		 * This means:
+		 * 1. Same number of attributes (no included columns or duplicates)
+		 * 2. Attributes in same order
+		 * 3. All attributes are fixed-length and NOT NULL (OTuple fixed format)
+		 */
+		if (natts == leaf_natts && all_fixed_length && all_not_null)
+		{
+			/* Check if attributes are in the same order */
+			for (i = 0; i < natts; i++)
+			{
+				Form_pg_attribute itup_attr = TupleDescAttr(itupdesc, i);
+				Form_pg_attribute leaf_attr = TupleDescAttr(leafTupdesc, i);
+				
+				if (itup_attr->attlen != leaf_attr->attlen ||
+					itup_attr->attalign != leaf_attr->attalign)
+				{
+					can_zero_copy = false;
+					break;
+				}
+			}
+		}
+		else
+		{
+			can_zero_copy = false;
+		}
+		
+		index_descr->itup_can_zero_copy = can_zero_copy;
 		
 		/*
 		 * If all attributes are fixed-length and NOT NULL, we can pre-compute
