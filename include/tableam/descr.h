@@ -174,6 +174,14 @@ struct OIndexDescr
 	TupleTableSlot *index_slot;
 	TupleTableSlot *old_leaf_slot;
 	TupleTableSlot *new_leaf_slot;
+	
+	/* Cached values for index tuple formation optimization */
+	Size		itup_hoff_no_nulls;		/* header offset when no nulls */
+	Size		itup_hoff_with_nulls;	/* header offset when nulls present */
+	bool		itup_has_varwidth;		/* true if index has variable-width attrs */
+	bool		itup_fixed_size;		/* true if all attrs are fixed-length and NOT NULL */
+	Size		itup_fixed_data_size;	/* pre-computed data size for fixed-size indexes */
+	bool		itup_can_zero_copy;		/* true if IndexTuple and OTuple formats are identical */
 };
 
 /*

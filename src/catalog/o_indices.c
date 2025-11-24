@@ -28,6 +28,8 @@
 #include "tuple/toast.h"
 
 #include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/itup.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/pg_opclass_d.h"
@@ -857,6 +859,101 @@ cache_scan_tupdesc_and_slot(OIndexDescr *index_descr, OIndex *oIndex)
 	}
 
 	index_descr->index_slot = MakeSingleTupleTableSlot(index_descr->itupdesc, &TTSOpsOrioleDB);
+	
+	/*
+	 * Pre-compute cached values for index tuple formation optimization.
+	 * These values are used by o_form_index_tuple to avoid recalculating
+	 * them on every tuple.
+	 */
+	{
+		TupleDesc	itupdesc = index_descr->itupdesc;
+		TupleDesc	leafTupdesc = index_descr->leafTupdesc;
+		int			natts = itupdesc->natts;
+		int			leaf_natts = leafTupdesc->natts;
+		bool		all_fixed_length = true;
+		bool		all_not_null = true;
+		bool		can_zero_copy = true;
+		Size		data_size;
+		
+		/* Calculate base header offset without nulls */
+		index_descr->itup_hoff_no_nulls = sizeof(IndexTupleData);
+		
+		/* Calculate base header offset with nulls (includes null bitmap) */
+		index_descr->itup_hoff_with_nulls = sizeof(IndexTupleData) + BITMAPLEN(natts);
+		index_descr->itup_hoff_with_nulls = MAXALIGN(index_descr->itup_hoff_with_nulls);
+		
+		/* Check if index has variable-width attributes and if all are NOT NULL */
+		index_descr->itup_has_varwidth = false;
+		for (i = 0; i < natts; i++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(itupdesc, i);
+			if (attr->attlen < 0)
+			{
+				index_descr->itup_has_varwidth = true;
+				all_fixed_length = false;
+			}
+			if (!attr->attnotnull)
+			{
+				all_not_null = false;
+			}
+		}
+		
+		/*
+		 * Check if zero-copy is possible: IndexTuple and OTuple formats must be identical.
+		 * This means:
+		 * 1. Same number of attributes (no included columns or duplicates)
+		 * 2. Attributes in same order
+		 * 3. All attributes are fixed-length and NOT NULL (OTuple fixed format)
+		 */
+		if (natts == leaf_natts && all_fixed_length && all_not_null)
+		{
+			/* Check if attributes are in the same order */
+			for (i = 0; i < natts; i++)
+			{
+				Form_pg_attribute itup_attr = TupleDescAttr(itupdesc, i);
+				Form_pg_attribute leaf_attr = TupleDescAttr(leafTupdesc, i);
+				
+				if (itup_attr->attlen != leaf_attr->attlen ||
+					itup_attr->attalign != leaf_attr->attalign)
+				{
+					can_zero_copy = false;
+					break;
+				}
+			}
+		}
+		else
+		{
+			can_zero_copy = false;
+		}
+		
+		index_descr->itup_can_zero_copy = can_zero_copy;
+		
+		/*
+		 * If all attributes are fixed-length and NOT NULL, we can pre-compute
+		 * the total data size. This is common for simple indexes on integer columns.
+		 */
+		if (all_fixed_length && all_not_null)
+		{
+			data_size = 0;
+			for (i = 0; i < natts; i++)
+			{
+				Form_pg_attribute attr = TupleDescAttr(itupdesc, i);
+				
+				/* Align to the attribute's alignment requirement */
+				data_size = att_align_nominal(data_size, attr->attalign);
+				/* Add the attribute's length */
+				data_size += attr->attlen;
+			}
+			
+			index_descr->itup_fixed_size = true;
+			index_descr->itup_fixed_data_size = data_size;
+		}
+		else
+		{
+			index_descr->itup_fixed_size = false;
+			index_descr->itup_fixed_data_size = 0;
+		}
+	}
 }
 
 void
