@@ -133,6 +133,14 @@ struct BTreeSeqScan
 				keyRangeHigh;
 	bool		firstPageIsLoaded;
 
+	/*
+	 * When true, disk pages encountered during internal page iteration will
+	 * be loaded into memory using load_page() instead of being collected for
+	 * later disk scan. This properly integrates the pages into the B-tree
+	 * with parent downlink updates, enabling caching for bitmap scans.
+	 */
+	bool		cachePages;
+
 	/* Private parallel worker info in a backend */
 	ParallelOScanDesc poscan;
 	bool		isLeader;
@@ -894,7 +902,22 @@ iterate_internal_page(BTreeSeqScan *scan)
 		{
 			if (DOWNLINK_IS_ON_DISK(downlink))
 			{
-				add_on_disk_downlink(scan, downlink, scan->context.imgReadCsn);
+				/*
+				 * When cachePages is enabled, use an iterator to fetch this
+				 * key range. The iterator will use load_page() which properly
+				 * loads disk pages into memory with parent downlink updates,
+				 * enabling caching for subsequent accesses.
+				 */
+				if (scan->cachePages)
+				{
+					scan_make_iterator(scan, scan->keyRangeLow.tuple, scan->keyRangeHigh.tuple);
+					Assert(scan->iter);
+					return true;
+				}
+				else
+				{
+					add_on_disk_downlink(scan, downlink, scan->context.imgReadCsn);
+				}
 			}
 			else if (DOWNLINK_IS_IN_MEMORY(downlink))
 			{
@@ -1150,7 +1173,8 @@ init_btree_seq_scan(BTreeSeqScan *scan)
 static BTreeSeqScan *
 make_btree_seq_scan_internal(BTreeDescr *desc, OSnapshot *oSnapshot,
 							 BTreeSeqScanCallbacks *cb, void *arg,
-							 BlockSampler sampler, ParallelOScanDesc poscan)
+							 BlockSampler sampler, ParallelOScanDesc poscan,
+							 bool cachePages)
 {
 	BTreeSeqScan *scan = (BTreeSeqScan *) MemoryContextAlloc(btree_seqscan_context,
 															 sizeof(BTreeSeqScan));
@@ -1175,6 +1199,7 @@ make_btree_seq_scan_internal(BTreeDescr *desc, OSnapshot *oSnapshot,
 	scan->initialized = false;
 	scan->checkpointNumberSet = false;
 	scan->haveHistImg = false;
+	scan->cachePages = cachePages;
 	BTREE_PAGE_LOCATOR_SET_INVALID(&scan->leafLoc);
 
 	dlist_push_tail(&listOfScans, &scan->listNode);
@@ -1186,7 +1211,7 @@ BTreeSeqScan *
 make_btree_seq_scan(BTreeDescr *desc, OSnapshot *oSnapshot, void *poscan)
 {
 	o_btree_load_shmem(desc);
-	return make_btree_seq_scan_internal(desc, oSnapshot, NULL, NULL, NULL, poscan);
+	return make_btree_seq_scan_internal(desc, oSnapshot, NULL, NULL, NULL, poscan, false);
 }
 
 BTreeSeqScan *
@@ -1194,14 +1219,22 @@ make_btree_seq_scan_cb(BTreeDescr *desc, OSnapshot *oSnapshot,
 					   BTreeSeqScanCallbacks *cb, void *arg)
 {
 	o_btree_load_shmem(desc);
-	return make_btree_seq_scan_internal(desc, oSnapshot, cb, arg, NULL, NULL);
+	return make_btree_seq_scan_internal(desc, oSnapshot, cb, arg, NULL, NULL, false);
+}
+
+BTreeSeqScan *
+make_btree_seq_scan_cb_caching(BTreeDescr *desc, OSnapshot *oSnapshot,
+							   BTreeSeqScanCallbacks *cb, void *arg)
+{
+	o_btree_load_shmem(desc);
+	return make_btree_seq_scan_internal(desc, oSnapshot, cb, arg, NULL, NULL, true);
 }
 
 BTreeSeqScan *
 make_btree_sampling_scan(BTreeDescr *desc, BlockSampler sampler)
 {
 	return make_btree_seq_scan_internal(desc, &o_in_progress_snapshot,
-										NULL, NULL, sampler, NULL);
+										NULL, NULL, sampler, NULL, false);
 }
 
 static OTuple
