@@ -180,6 +180,54 @@ primary_tuple_get_data(OTuple tuple, OIndexDescr *primary, bool onlyPkey)
 	return val_get_uint64(val, attr->atttypid);
 }
 
+/*
+ * Fill OBTreeKeyBound from a uint64 bitmap value for primary key lookup.
+ * This is used for direct tuple lookups based on bitmap entries.
+ */
+static void
+fill_key_bound_from_uint64(OBTreeKeyBound *bound, OIndexDescr *primary, uint64 value)
+{
+	FormData_pg_attribute *attr;
+	Datum		datum_value;
+	int32		int32_val;
+	int64		int64_val;
+	ItemPointerData iptr;
+
+	Assert(primary->nFields == 1);
+	attr = TupleDescAttr(primary->nonLeafTupdesc, 0);
+
+	/* Convert uint64 value to datum of appropriate type */
+	switch (attr->atttypid)
+	{
+		case INT4OID:
+			int32_val = uint64_to_int64(value);
+			datum_value = Int32GetDatum(int32_val);
+			break;
+		case INT8OID:
+			int64_val = uint64_to_int64(value);
+			datum_value = Int64GetDatum(int64_val);
+			break;
+		case TIDOID:
+			ItemPointerSetBlockNumber(&iptr, value >> 16);
+			ItemPointerSetOffsetNumber(&iptr, value & 0xFFFF);
+			datum_value = ItemPointerGetDatum(&iptr);
+			break;
+		default:
+			elog(ERROR, "Unsupported keybitmap type");
+			datum_value = 0;	/* silence compiler warning */
+			break;
+	}
+
+	/* Fill the bound structure */
+	bound->nkeys = 1;
+	bound->keys[0].value = datum_value;
+	bound->keys[0].type = attr->atttypid;
+	bound->keys[0].flags = O_VALUE_BOUND_PLAIN_VALUE;
+	bound->keys[0].comparator = primary->fields[0].comparator;
+	bound->n_row_keys = 0;
+	bound->row_keys = NULL;
+}
+
 static double
 o_index_getbitmap(OBitmapHeapPlanState *bitmap_state,
 				  BitmapIndexScanState *node,
@@ -433,8 +481,6 @@ add_rbt_to_tbm(OBitmapHeapPlanState *bitmap_state, TIDBitmap *tbm, RBTree *rbt)
 	OKeyBitmapRBTNode *node;
 	OIndexDescr *primary = GET_PRIMARY(bitmap_state->scan->arg.tbl_desc);
 	OBTreeKeyBound bound;
-	char		key_buf[sizeof(OTupleHeader) + 64];
-	OTuple		key_tuple;
 
 	/* Iterate through all entries in the bitmap */
 	rbt_begin_iterate(rbt, LeftRightWalk, &iter);
@@ -482,24 +528,8 @@ add_rbt_to_tbm(OBitmapHeapPlanState *bitmap_state, TIDBitmap *tbm, RBTree *rbt)
 				continue;
 			}
 
-			/* Build key bound for lookup */
-			key_tuple.data = key_buf;
-			key_tuple.formatFlags = 0;
-			
-			/* Create a tuple with the primary key value */
-			OTupleHeader tuphdr = (OTupleHeader) key_buf;
-			FormData_pg_attribute *attr = TupleDescAttr(primary->nonLeafTupdesc, 0);
-			
-			Assert(primary->nFields == 1);
-			tuphdr->hasnulls = false;
-			tuphdr->natts = 1;
-			tuphdr->len = SizeOfOTupleHeader + attr->attlen;
-			uint64_get_val(cur_value, attr->atttypid, &key_buf[SizeOfOTupleHeader]);
-
-			/* Fill bound structure */
-			o_btree_key_bound_from_tuple(&bound, &primary->desc, &key_tuple,
-										 BTreeKeyNonLeafKey, ForwardScanDirection, 
-										 primary->nonLeafTupdesc);
+			/* Fill bound structure from uint64 value */
+			fill_key_bound_from_uint64(&bound, primary, cur_value);
 
 			/* Lookup the tuple directly */
 			o_btree_load_shmem(&primary->desc);
@@ -957,40 +987,10 @@ o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 												   &range_start, &range_end))
 					{
 						/* Start range iteration for dense region */
-						OBTreeKeyBound start_bound, end_bound;
-						char start_key_buf[sizeof(OTupleHeader) + 64];
-						char end_key_buf[sizeof(OTupleHeader) + 64];
-						OTuple start_key_tuple, end_key_tuple;
+						OBTreeKeyBound start_bound;
 						
-						/* Build start bound */
-						start_key_tuple.data = start_key_buf;
-						start_key_tuple.formatFlags = 0;
-						OTupleHeader start_tuphdr = (OTupleHeader) start_key_buf;
-						FormData_pg_attribute *attr = TupleDescAttr(primary->nonLeafTupdesc, 0);
-						
-						Assert(primary->nFields == 1);
-						start_tuphdr->hasnulls = false;
-						start_tuphdr->natts = 1;
-						start_tuphdr->len = SizeOfOTupleHeader + attr->attlen;
-						uint64_get_val(range_start, attr->atttypid, &start_key_buf[SizeOfOTupleHeader]);
-						
-						o_btree_key_bound_from_tuple(&start_bound, &primary->desc, &start_key_tuple,
-													 BTreeKeyNonLeafKey, ForwardScanDirection, 
-													 primary->nonLeafTupdesc);
-						
-						/* Build end bound */
-						end_key_tuple.data = end_key_buf;
-						end_key_tuple.formatFlags = 0;
-						OTupleHeader end_tuphdr = (OTupleHeader) end_key_buf;
-						
-						end_tuphdr->hasnulls = false;
-						end_tuphdr->natts = 1;
-						end_tuphdr->len = SizeOfOTupleHeader + attr->attlen;
-						uint64_get_val(range_end, attr->atttypid, &end_key_buf[SizeOfOTupleHeader]);
-						
-						o_btree_key_bound_from_tuple(&end_bound, &primary->desc, &end_key_tuple,
-													 BTreeKeyNonLeafKey, ForwardScanDirection, 
-													 primary->nonLeafTupdesc);
+						/* Build start bound from range_start */
+						fill_key_bound_from_uint64(&start_bound, primary, range_start);
 						
 						/* Create iterator for range */
 						o_btree_load_shmem(&primary->desc);
@@ -1009,23 +1009,9 @@ o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 				if (scan->using_range_scan)
 				{
 					OBTreeKeyBound end_bound;
-					char end_key_buf[sizeof(OTupleHeader) + 64];
-					OTuple end_key_tuple;
 					
 					/* Build end bound for iterator */
-					end_key_tuple.data = end_key_buf;
-					end_key_tuple.formatFlags = 0;
-					OTupleHeader end_tuphdr = (OTupleHeader) end_key_buf;
-					FormData_pg_attribute *attr = TupleDescAttr(primary->nonLeafTupdesc, 0);
-					
-					end_tuphdr->hasnulls = false;
-					end_tuphdr->natts = 1;
-					end_tuphdr->len = SizeOfOTupleHeader + attr->attlen;
-					uint64_get_val(scan->range_end_value, attr->atttypid, &end_key_buf[SizeOfOTupleHeader]);
-					
-					o_btree_key_bound_from_tuple(&end_bound, &primary->desc, &end_key_tuple,
-												 BTreeKeyNonLeafKey, ForwardScanDirection, 
-												 primary->nonLeafTupdesc);
+					fill_key_bound_from_uint64(&end_bound, primary, scan->range_end_value);
 					
 					/* Fetch next tuple from iterator */
 					tuple = o_btree_iterator_fetch(scan->range_iterator, &tupleCsn,
@@ -1103,8 +1089,6 @@ o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 				{
 					/* Use direct lookup for sparse regions */
 					OBTreeKeyBound bound;
-					char		key_buf[sizeof(OTupleHeader) + 64];
-					OTuple		key_tuple;
 					uint64		next_value;
 					bool		found;
 
@@ -1125,24 +1109,8 @@ o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 						/* Update current position for next iteration */
 						scan->current_bitmap_value = next_value + 1;
 
-						/* Build key bound for lookup */
-						key_tuple.data = key_buf;
-						key_tuple.formatFlags = 0;
-						
-						/* Create a tuple with the primary key value */
-						OTupleHeader tuphdr = (OTupleHeader) key_buf;
-						FormData_pg_attribute *attr = TupleDescAttr(primary->nonLeafTupdesc, 0);
-						
-						Assert(primary->nFields == 1);
-						tuphdr->hasnulls = false;
-						tuphdr->natts = 1;
-						tuphdr->len = SizeOfOTupleHeader + attr->attlen;
-						uint64_get_val(next_value, attr->atttypid, &key_buf[SizeOfOTupleHeader]);
-
-						/* Fill bound structure */
-						o_btree_key_bound_from_tuple(&bound, &primary->desc, &key_tuple,
-													 BTreeKeyNonLeafKey, ForwardScanDirection, 
-													 primary->nonLeafTupdesc);
+						/* Fill bound structure from uint64 value */
+						fill_key_bound_from_uint64(&bound, primary, next_value);
 
 						/* Lookup the tuple directly */
 						o_btree_load_shmem(&primary->desc);
