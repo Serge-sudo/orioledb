@@ -14,7 +14,6 @@
 #ifndef __TABLEAM_BITMAP_SCAN_H__
 #define __TABLEAM_BITMAP_SCAN_H__
 
-#include "btree/iterator.h"
 #include "btree/scan.h"
 #include "tableam/handler.h"
 #include "tableam/scan.h"
