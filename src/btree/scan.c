@@ -52,6 +52,7 @@
 #include "btree/undo.h"
 #include "transam/oxid.h"
 #include "tuple/slot.h"
+#include "utils/page_pool.h"
 #include "utils/sampling.h"
 #include "utils/stopevent.h"
 
@@ -132,6 +133,14 @@ struct BTreeSeqScan
 	OFixedKey	keyRangeLow,
 				keyRangeHigh;
 	bool		firstPageIsLoaded;
+
+	/*
+	 * When true, pages read from disk will be loaded into the page pool
+	 * (shared memory buffer), so subsequent scans can benefit from caching.
+	 * This is useful for bitmap scans where the same pages may be accessed
+	 * multiple times.
+	 */
+	bool		cachePages;
 
 	/* Private parallel worker info in a backend */
 	ParallelOScanDesc poscan;
@@ -991,26 +1000,82 @@ load_next_disk_leaf_page(BTreeSeqScan *scan)
 		downlink = ((BTreeSeqScanDiskDownlink *) dsm_segment_address(scan->dsmSeg))[index];
 	}
 
-	success = read_page_from_disk(scan->desc,
-								  scan->leafImg,
-								  downlink.downlink,
-								  &extent);
-	header = (BTreePageHeader *) scan->leafImg;
-	if (header->csn >= downlink.csn)
-		read_page_from_undo(scan->desc, scan->leafImg, header->undoLocation,
-							downlink.csn, NULL, BTreeKeyNone, NULL);
+	/*
+	 * When cachePages is true, load the page into the page pool so it can be
+	 * cached for future reads. This is useful for bitmap scans where the same
+	 * pages may be accessed multiple times.
+	 */
+	if (scan->cachePages)
+	{
+		OInMemoryBlkno blkno;
+		Page		page;
+		OrioleDBPageDesc *page_desc;
+		char		buf[ORIOLEDB_BLCKSZ];
+
+		/* Reserve and get a page from the pool */
+		ppool_reserve_pages(scan->desc->ppool, PPOOL_RESERVE_FIND, 1);
+		blkno = ppool_get_page(scan->desc->ppool, PPOOL_RESERVE_FIND);
+		lock_page(blkno);
+		page_block_reads(blkno);
+
+		page = O_GET_IN_MEMORY_PAGE(blkno);
+		page_desc = O_GET_IN_MEMORY_PAGEDESC(blkno);
+		page_desc->flags = 0;
+
+		/* Read page from disk into temporary buffer */
+		success = read_page_from_disk(scan->desc, buf, downlink.downlink, &page_desc->fileExtent);
+
+		if (!success)
+		{
+			unlock_page(blkno);
+			elog(ERROR, "can not read leaf page from disk");
+		}
+
+		/* Put the page image into the pool page */
+		put_page_image(blkno, buf);
+		page_change_usage_count(&scan->desc->ppool->ucm, blkno,
+								(pg_atomic_read_u32(scan->desc->ppool->ucm.epoch) + 2) % UCM_USAGE_LEVELS);
+		page_desc->type = scan->desc->type;
+		page_desc->oids = scan->desc->oids;
+
+		/* Copy page image to scan's local buffer and apply undo if needed */
+		memcpy(scan->leafImg, page, ORIOLEDB_BLCKSZ);
+		header = (BTreePageHeader *) scan->leafImg;
+		if (header->csn >= downlink.csn)
+			read_page_from_undo(scan->desc, scan->leafImg, header->undoLocation,
+								downlink.csn, NULL, BTreeKeyNone, NULL);
+
+		unlock_page(blkno);
+
+		/* Update hint to point to cached page */
+		scan->hint.blkno = blkno;
+		scan->hint.pageChangeCount = O_PAGE_GET_CHANGE_COUNT(page);
+	}
+	else
+	{
+		success = read_page_from_disk(scan->desc,
+									  scan->leafImg,
+									  downlink.downlink,
+									  &extent);
+
+		if (!success)
+			elog(ERROR, "can not read leaf page from disk");
+
+		header = (BTreePageHeader *) scan->leafImg;
+		if (header->csn >= downlink.csn)
+			read_page_from_undo(scan->desc, scan->leafImg, header->undoLocation,
+								downlink.csn, NULL, BTreeKeyNone, NULL);
+
+		scan->hint.blkno = OInvalidInMemoryBlkno;
+		scan->hint.pageChangeCount = InvalidOPageChangeCount;
+	}
 
 	STOPEVENT(STOPEVENT_SCAN_DISK_PAGE,
 			  btree_page_stopevent_params(scan->desc,
 										  scan->leafImg));
 
-	if (!success)
-		elog(ERROR, "can not read leaf page from disk");
-
 	BTREE_PAGE_LOCATOR_FIRST(scan->leafImg, &scan->leafLoc);
 	scan->downlinkIndex++;
-	scan->hint.blkno = OInvalidInMemoryBlkno;
-	scan->hint.pageChangeCount = InvalidOPageChangeCount;
 	O_TUPLE_SET_NULL(scan->nextKey.tuple);
 	load_first_historical_page(scan);
 	return true;
@@ -1150,7 +1215,8 @@ init_btree_seq_scan(BTreeSeqScan *scan)
 static BTreeSeqScan *
 make_btree_seq_scan_internal(BTreeDescr *desc, OSnapshot *oSnapshot,
 							 BTreeSeqScanCallbacks *cb, void *arg,
-							 BlockSampler sampler, ParallelOScanDesc poscan)
+							 BlockSampler sampler, ParallelOScanDesc poscan,
+							 bool cachePages)
 {
 	BTreeSeqScan *scan = (BTreeSeqScan *) MemoryContextAlloc(btree_seqscan_context,
 															 sizeof(BTreeSeqScan));
@@ -1175,6 +1241,7 @@ make_btree_seq_scan_internal(BTreeDescr *desc, OSnapshot *oSnapshot,
 	scan->initialized = false;
 	scan->checkpointNumberSet = false;
 	scan->haveHistImg = false;
+	scan->cachePages = cachePages;
 	BTREE_PAGE_LOCATOR_SET_INVALID(&scan->leafLoc);
 
 	dlist_push_tail(&listOfScans, &scan->listNode);
@@ -1186,7 +1253,7 @@ BTreeSeqScan *
 make_btree_seq_scan(BTreeDescr *desc, OSnapshot *oSnapshot, void *poscan)
 {
 	o_btree_load_shmem(desc);
-	return make_btree_seq_scan_internal(desc, oSnapshot, NULL, NULL, NULL, poscan);
+	return make_btree_seq_scan_internal(desc, oSnapshot, NULL, NULL, NULL, poscan, false);
 }
 
 BTreeSeqScan *
@@ -1194,14 +1261,22 @@ make_btree_seq_scan_cb(BTreeDescr *desc, OSnapshot *oSnapshot,
 					   BTreeSeqScanCallbacks *cb, void *arg)
 {
 	o_btree_load_shmem(desc);
-	return make_btree_seq_scan_internal(desc, oSnapshot, cb, arg, NULL, NULL);
+	return make_btree_seq_scan_internal(desc, oSnapshot, cb, arg, NULL, NULL, false);
+}
+
+BTreeSeqScan *
+make_btree_seq_scan_cb_caching(BTreeDescr *desc, OSnapshot *oSnapshot,
+							   BTreeSeqScanCallbacks *cb, void *arg)
+{
+	o_btree_load_shmem(desc);
+	return make_btree_seq_scan_internal(desc, oSnapshot, cb, arg, NULL, NULL, true);
 }
 
 BTreeSeqScan *
 make_btree_sampling_scan(BTreeDescr *desc, BlockSampler sampler)
 {
 	return make_btree_seq_scan_internal(desc, &o_in_progress_snapshot,
-										NULL, NULL, sampler, NULL);
+										NULL, NULL, sampler, NULL, false);
 }
 
 static OTuple
