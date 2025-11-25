@@ -1714,6 +1714,8 @@ free_btree_seq_scan(BTreeSeqScan *scan)
 	}
 	END_CRIT_SECTION();
 
+	if (scan->iter)
+		btree_iterator_free(scan->iter);
 	if (scan->dsmSeg)
 	{
 		Assert(pg_atomic_read_u32(&scan->poscan->dsmSegNumAttached) == 0);	/* All workers should
@@ -1746,6 +1748,8 @@ seq_scans_cleanup(void)
 			(void) pg_atomic_fetch_sub_u32(&metaPage->numSeqScans[scan->checkpointNumber % NUM_SEQ_SCANS_ARRAY_SIZE], 1);
 		}
 		dlist_delete(&scan->listNode);
+		if (scan->iter)
+			btree_iterator_free(scan->iter);
 		if (scan->dsmSeg)
 			dsm_detach(scan->dsmSeg);
 
