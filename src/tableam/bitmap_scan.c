@@ -426,9 +426,9 @@ add_rbt_to_tbm(OBitmapHeapPlanState *bitmap_state, TIDBitmap *tbm, RBTree *rbt)
 	arg.tbl_desc = bitmap_state->scan->arg.tbl_desc;
 	arg.bitmap = rbt;
 
-	seq_scan = make_btree_seq_scan_cb_caching(&primary->desc,
-											  &bitmap_state->scan->oSnapshot,
-											  &bitmap_seq_scan_callbacks, &arg);
+	seq_scan = make_btree_seq_scan_cb(&primary->desc,
+									  &bitmap_state->scan->oSnapshot,
+									  &bitmap_seq_scan_callbacks, &arg);
 
 	while (true)
 	{
@@ -661,9 +661,9 @@ o_make_bitmap_scan(OBitmapHeapPlanState *bitmap_state, ScanState *ss,
 
 	if (scan->arg.bitmap)
 	{
-		scan->seq_scan = make_btree_seq_scan_cb_caching(&GET_PRIMARY(scan->arg.tbl_desc)->desc,
-														&scan->oSnapshot,
-														&bitmap_seq_scan_callbacks, &scan->arg);
+		scan->seq_scan = make_btree_seq_scan_cb(&GET_PRIMARY(scan->arg.tbl_desc)->desc,
+												&scan->oSnapshot,
+												&bitmap_seq_scan_callbacks, &scan->arg);
 	}
 	else
 	{
@@ -687,9 +687,9 @@ o_tbmiterator_next_page(OBitmapScan *scan, OBitmapHeapPlanState *bitmap_state)
 	scan->arg.bitmap = o_keybitmap_create();
 	if (scan->seq_scan)
 		free_btree_seq_scan(scan->seq_scan);
-	scan->seq_scan = make_btree_seq_scan_cb_caching(&GET_PRIMARY(scan->arg.tbl_desc)->desc,
-													&scan->oSnapshot,
-													&bitmap_seq_scan_callbacks, &scan->arg);
+	scan->seq_scan = make_btree_seq_scan_cb(&GET_PRIMARY(scan->arg.tbl_desc)->desc,
+											&scan->oSnapshot,
+											&bitmap_seq_scan_callbacks, &scan->arg);
 	if (scan->tbmres->ntuples >= 0)
 	{
 		/*
