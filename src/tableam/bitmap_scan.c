@@ -183,34 +183,37 @@ primary_tuple_get_data(OTuple tuple, OIndexDescr *primary, bool onlyPkey)
 /*
  * Fill OBTreeKeyBound from a uint64 bitmap value for primary key lookup.
  * This is used for direct tuple lookups based on bitmap entries.
+ * The uint64 value is the encoded form returned by o_keybitmap_get_next().
  */
 static void
 fill_key_bound_from_uint64(OBTreeKeyBound *bound, OIndexDescr *primary, uint64 value)
 {
 	FormData_pg_attribute *attr;
 	Datum		datum_value;
-	int32		int32_val;
-	int64		int64_val;
-	ItemPointerData iptr;
+	union
+	{
+		int32		i32;
+		int64		i64;
+		ItemPointerData iptr;
+	} val_storage;
 
 	Assert(primary->nFields == 1);
 	attr = TupleDescAttr(primary->nonLeafTupdesc, 0);
 
-	/* Convert uint64 value to datum of appropriate type */
+	/* Convert encoded uint64 value to datum using uint64_get_val */
+	uint64_get_val(value, attr->atttypid, (Pointer) &val_storage);
+
+	/* Create datum from the decoded value */
 	switch (attr->atttypid)
 	{
 		case INT4OID:
-			int32_val = uint64_to_int64(value);
-			datum_value = Int32GetDatum(int32_val);
+			datum_value = Int32GetDatum(val_storage.i32);
 			break;
 		case INT8OID:
-			int64_val = uint64_to_int64(value);
-			datum_value = Int64GetDatum(int64_val);
+			datum_value = Int64GetDatum(val_storage.i64);
 			break;
 		case TIDOID:
-			ItemPointerSetBlockNumber(&iptr, value >> 16);
-			ItemPointerSetOffsetNumber(&iptr, value & 0xFFFF);
-			datum_value = ItemPointerGetDatum(&iptr);
+			datum_value = ItemPointerGetDatum(&val_storage.iptr);
 			break;
 		default:
 			elog(ERROR, "Unsupported keybitmap type");
