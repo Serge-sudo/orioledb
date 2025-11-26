@@ -909,31 +909,53 @@ o_tbmiterator_next_page(OBitmapScan *scan, OBitmapHeapPlanState *bitmap_state)
  * Count the number of set bits in a bitmap node and determine if range iteration
  * should be used. Returns true if the node is dense enough to benefit from
  * range iteration, false otherwise.
+ * 
+ * If range iteration is recommended, sets *range_start to the first set bit value
+ * and *range_end to the last set bit value.
  */
 static bool
-should_use_range_iteration(OKeyBitmapRBTNode *node)
+should_use_range_iteration(OKeyBitmapRBTNode *node, uint64 *range_start, uint64 *range_end)
 {
 	int			set_bits = 0;
 	int			i;
+	int			first_set_bit = -1;
+	int			last_set_bit = -1;
 
 	/* Single value nodes should use direct lookup */
 	if (node->bitmap == NULL)
 		return false;
 
-	/* Count set bits in the bitmap */
+	/* Count set bits in the bitmap and find first/last set bit positions */
 	for (i = 0; i < BITMAP_SIZE; i++)
 	{
 		uint8 byte = node->bitmap[i];
-		/* Count bits in byte using Brian Kernighan's algorithm */
-		while (byte)
+		if (byte != 0)
 		{
-			byte &= (byte - 1);	/* Clear the least significant bit set */
-			set_bits++;
+			int bit_offset = i * 8;
+			/* Check each bit in the byte */
+			for (int bit = 0; bit < 8; bit++)
+			{
+				if (byte & (1 << bit))
+				{
+					int pos = bit_offset + bit;
+					if (first_set_bit == -1)
+						first_set_bit = pos;
+					last_set_bit = pos;
+					set_bits++;
+				}
+			}
 		}
 	}
 
 	/* Use range iteration if we have enough set bits */
-	return (set_bits >= DENSE_BITMAP_THRESHOLD);
+	if (set_bits >= DENSE_BITMAP_THRESHOLD)
+	{
+		*range_start = node->key + first_set_bit;
+		*range_end = node->key + last_set_bit;
+		return true;
+	}
+
+	return false;
 }
 
 TupleTableSlot *
@@ -992,26 +1014,29 @@ o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 				}
 				
 				/* Decide strategy based on node density using should_use_range_iteration */
-				if (!scan->using_range_scan && should_use_range_iteration(scan->current_node))
+				if (!scan->using_range_scan)
 				{
-					/* Dense node - use range iteration for entire node */
-					OBTreeKeyBound start_bound;
-					ItemPointerData iptr_storage;
-					uint64 range_start = scan->current_node->key;
-					uint64 range_end = scan->current_node->key + (1L << 10) - 1; /* 1024 values */
+					uint64 range_start, range_end;
 					
-					/* Build start bound */
-					fill_key_bound_from_uint64(&start_bound, primary, range_start, &iptr_storage);
-					
-					/* Create iterator for range */
-					o_btree_load_shmem(&primary->desc);
-					scan->range_iterator = o_btree_iterator_create(&primary->desc,
-																   (Pointer) &start_bound,
-																   BTreeKeyBound,
-																   &scan->oSnapshot,
-																   ForwardScanDirection);
-					scan->range_end_value = range_end;
-					scan->using_range_scan = true;
+					if (should_use_range_iteration(scan->current_node, &range_start, &range_end))
+					{
+						/* Dense node - use range iteration for range determined by set bits */
+						OBTreeKeyBound start_bound;
+						ItemPointerData iptr_storage;
+						
+						/* Build start bound */
+						fill_key_bound_from_uint64(&start_bound, primary, range_start, &iptr_storage);
+						
+						/* Create iterator for range */
+						o_btree_load_shmem(&primary->desc);
+						scan->range_iterator = o_btree_iterator_create(&primary->desc,
+																	   (Pointer) &start_bound,
+																	   BTreeKeyBound,
+																	   &scan->oSnapshot,
+																	   ForwardScanDirection);
+						scan->range_end_value = range_end;
+						scan->using_range_scan = true;
+					}
 				}
 				
 				if (scan->using_range_scan)
