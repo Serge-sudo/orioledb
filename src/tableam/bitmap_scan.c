@@ -65,12 +65,20 @@ typedef struct OBitmapScan
 /*
  * Adaptive bitmap scan strategy:
  * - For sparse nodes (single value): use direct tuple lookups
- * - For dense nodes (with bitmap): use range iteration for the entire node range
+ * - For dense nodes (with enough set bits): use range iteration
  * 
- * Decision is based on the OKeyBitmapRBTNode structure:
+ * Decision is based on the OKeyBitmapRBTNode structure and bit density:
  * - If node->bitmap is NULL: single value, use direct lookup
- * - If node->bitmap is allocated: dense range (1024 values), use range iteration
+ * - If node->bitmap is allocated but sparse: use direct lookups for each set bit
+ * - If node->bitmap is allocated and dense: use range iteration
  */
+
+/* Bitmap constants from key_bitmap.c */
+#define LOW_PART_MASK	(0x00000000000003FF)
+#define BITMAP_SIZE		0x80
+
+/* Threshold for using range iteration: minimum number of set bits in a bitmap node */
+#define DENSE_BITMAP_THRESHOLD 100
 
 #define UINT64_HIGH_BIT (UINT64CONST(1) << 63)
 
@@ -897,6 +905,37 @@ o_tbmiterator_next_page(OBitmapScan *scan, OBitmapHeapPlanState *bitmap_state)
 	}
 }
 
+/*
+ * Count the number of set bits in a bitmap node and determine if range iteration
+ * should be used. Returns true if the node is dense enough to benefit from
+ * range iteration, false otherwise.
+ */
+static bool
+should_use_range_iteration(OKeyBitmapRBTNode *node)
+{
+	int			set_bits = 0;
+	int			i;
+
+	/* Single value nodes should use direct lookup */
+	if (node->bitmap == NULL)
+		return false;
+
+	/* Count set bits in the bitmap */
+	for (i = 0; i < BITMAP_SIZE; i++)
+	{
+		uint8 byte = node->bitmap[i];
+		/* Count bits in byte using Brian Kernighan's algorithm */
+		while (byte)
+		{
+			byte &= (byte - 1);	/* Clear the least significant bit set */
+			set_bits++;
+		}
+	}
+
+	/* Use range iteration if we have enough set bits */
+	return (set_bits >= DENSE_BITMAP_THRESHOLD);
+}
+
 TupleTableSlot *
 o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 {
@@ -952,8 +991,8 @@ o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 					}
 				}
 				
-				/* Decide strategy based on node type */
-				if (scan->current_node->bitmap != NULL && !scan->using_range_scan)
+				/* Decide strategy based on node density using should_use_range_iteration */
+				if (!scan->using_range_scan && should_use_range_iteration(scan->current_node))
 				{
 					/* Dense node - use range iteration for entire node */
 					OBTreeKeyBound start_bound;
@@ -1054,23 +1093,49 @@ o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 				}
 				else
 				{
-					/* Sparse node - direct lookup for single value */
+					/* Sparse node - direct lookup for values */
 					OBTreeKeyBound bound;
 					ItemPointerData iptr_storage;
 					uint64 lookup_value;
+					bool found = false;
 					
 					if (scan->current_node->bitmap == NULL)
 					{
 						/* Single value node */
 						lookup_value = scan->current_node->key;
 						scan->current_node = NULL; /* Move to next node after this */
+						found = true;
 					}
 					else
 					{
-						/* Should not happen - bitmap nodes should use range scan */
-						elog(ERROR, "Unexpected bitmap node in sparse path");
-						lookup_value = 0;
+						/* Sparse bitmap node - iterate through set bits */
+						while (scan->current_offset < (1L << 10))
+						{
+							uint64 test_value = scan->current_node->key + scan->current_offset;
+							int offset = scan->current_offset;
+							
+							scan->current_offset++;
+							
+							/* Check if this bit is set in the bitmap */
+							if (scan->current_node->bitmap[offset >> 3] & (1 << (offset & 7)))
+							{
+								lookup_value = test_value;
+								found = true;
+								break;
+							}
+						}
+						
+						/* If we've exhausted this node, move to next */
+						if (!found)
+						{
+							scan->current_node = NULL;
+							scan->current_offset = 0;
+							continue;
+						}
 					}
+					
+					if (!found)
+						continue;
 					
 					/* Fill bound structure from uint64 value */
 					fill_key_bound_from_uint64(&bound, primary, lookup_value, &iptr_storage);
