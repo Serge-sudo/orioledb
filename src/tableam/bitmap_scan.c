@@ -184,9 +184,13 @@ primary_tuple_get_data(OTuple tuple, OIndexDescr *primary, bool onlyPkey)
  * Fill OBTreeKeyBound from a uint64 bitmap value for primary key lookup.
  * This is used for direct tuple lookups based on bitmap entries.
  * The uint64 value is the encoded form returned by o_keybitmap_get_next().
+ * 
+ * For TIDOID type, caller must provide iptr_storage which will be used to
+ * store the ItemPointerData. The datum will point to this storage.
  */
 static void
-fill_key_bound_from_uint64(OBTreeKeyBound *bound, OIndexDescr *primary, uint64 value)
+fill_key_bound_from_uint64(OBTreeKeyBound *bound, OIndexDescr *primary, uint64 value,
+						   ItemPointerData *iptr_storage)
 {
 	FormData_pg_attribute *attr;
 	Datum		datum_value;
@@ -194,26 +198,27 @@ fill_key_bound_from_uint64(OBTreeKeyBound *bound, OIndexDescr *primary, uint64 v
 	{
 		int32		i32;
 		int64		i64;
-		ItemPointerData iptr;
 	} val_storage;
 
 	Assert(primary->nFields == 1);
 	attr = TupleDescAttr(primary->nonLeafTupdesc, 0);
 
 	/* Convert encoded uint64 value to datum using uint64_get_val */
-	uint64_get_val(value, attr->atttypid, (Pointer) &val_storage);
-
-	/* Create datum from the decoded value */
 	switch (attr->atttypid)
 	{
 		case INT4OID:
+			uint64_get_val(value, attr->atttypid, (Pointer) &val_storage.i32);
 			datum_value = Int32GetDatum(val_storage.i32);
 			break;
 		case INT8OID:
+			uint64_get_val(value, attr->atttypid, (Pointer) &val_storage.i64);
 			datum_value = Int64GetDatum(val_storage.i64);
 			break;
 		case TIDOID:
-			datum_value = ItemPointerGetDatum(&val_storage.iptr);
+			/* Store ItemPointer in caller-provided storage */
+			Assert(iptr_storage != NULL);
+			uint64_get_val(value, attr->atttypid, (Pointer) iptr_storage);
+			datum_value = ItemPointerGetDatum(iptr_storage);
 			break;
 		default:
 			elog(ERROR, "Unsupported keybitmap type");
@@ -494,6 +499,7 @@ add_rbt_to_tbm(OBitmapHeapPlanState *bitmap_state, TIDBitmap *tbm, RBTree *rbt)
 		int			i;
 		uint64		start_value,
 					end_value;
+		ItemPointerData iptr_storage;
 		
 		/* Determine the range of values for this node */
 		if (node->bitmap)
@@ -532,7 +538,7 @@ add_rbt_to_tbm(OBitmapHeapPlanState *bitmap_state, TIDBitmap *tbm, RBTree *rbt)
 			}
 
 			/* Fill bound structure from uint64 value */
-			fill_key_bound_from_uint64(&bound, primary, cur_value);
+			fill_key_bound_from_uint64(&bound, primary, cur_value, &iptr_storage);
 
 			/* Lookup the tuple directly */
 			o_btree_load_shmem(&primary->desc);
@@ -951,11 +957,12 @@ o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 				{
 					/* Dense node - use range iteration for entire node */
 					OBTreeKeyBound start_bound;
+					ItemPointerData iptr_storage;
 					uint64 range_start = scan->current_node->key;
 					uint64 range_end = scan->current_node->key + (1L << 10) - 1; /* 1024 values */
 					
 					/* Build start bound */
-					fill_key_bound_from_uint64(&start_bound, primary, range_start);
+					fill_key_bound_from_uint64(&start_bound, primary, range_start, &iptr_storage);
 					
 					/* Create iterator for range */
 					o_btree_load_shmem(&primary->desc);
@@ -972,8 +979,9 @@ o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 				{
 					/* Fetch from range iterator for dense node */
 					OBTreeKeyBound end_bound;
+					ItemPointerData iptr_storage;
 					
-					fill_key_bound_from_uint64(&end_bound, primary, scan->range_end_value);
+					fill_key_bound_from_uint64(&end_bound, primary, scan->range_end_value, &iptr_storage);
 					
 					tuple = o_btree_iterator_fetch(scan->range_iterator, &tupleCsn,
 												   (Pointer) &end_bound, BTreeKeyBound,
@@ -1048,6 +1056,7 @@ o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 				{
 					/* Sparse node - direct lookup for single value */
 					OBTreeKeyBound bound;
+					ItemPointerData iptr_storage;
 					uint64 lookup_value;
 					
 					if (scan->current_node->bitmap == NULL)
@@ -1064,7 +1073,7 @@ o_exec_bitmap_fetch(OBitmapScan *scan, CustomScanState *node)
 					}
 					
 					/* Fill bound structure from uint64 value */
-					fill_key_bound_from_uint64(&bound, primary, lookup_value);
+					fill_key_bound_from_uint64(&bound, primary, lookup_value, &iptr_storage);
 
 					/* Lookup the tuple directly */
 					o_btree_load_shmem(&primary->desc);
