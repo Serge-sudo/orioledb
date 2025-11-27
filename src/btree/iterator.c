@@ -21,8 +21,10 @@
 #include "btree/page_chunks.h"
 #include "btree/undo.h"
 #include "catalog/sys_trees.h"
+#include "tableam/descr.h"
 #include "transam/oxid.h"
 #include "transam/undo.h"
+#include "tuple/format.h"
 #include "utils/page_pool.h"
 
 #include "access/transam.h"
@@ -314,8 +316,22 @@ o_find_tuple_version(BTreeDescr *desc, Page p, BTreePageItemLocator *loc,
 				}
 			}
 
-			result_size = o_btree_len(desc, curTuple, OTupleLength);
-			result.data = (Pointer) MemoryContextAlloc(mcxt, result_size);
+			/*
+			 * Use o_tuple_size directly for table indices to avoid virtual
+			 * function call overhead. For system trees, fall back to
+			 * o_btree_len.
+			 */
+			if (!IS_SYS_TREE_OIDS(desc->oids))
+			{
+				OIndexDescr *id = (OIndexDescr *) desc->arg;
+
+				result_size = o_tuple_size(curTuple, &id->leafSpec);
+			}
+			else
+			{
+				result_size = o_btree_len(desc, curTuple, OTupleLength);
+			}
+			result.data = (Pointer) palloc(result_size);
 			memcpy(result.data, curTuple.data, result_size);
 			result.formatFlags = curTuple.formatFlags;
 			MemoryContextSwitchTo(prevMctx);
