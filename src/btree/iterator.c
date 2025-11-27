@@ -268,26 +268,50 @@ o_find_tuple_version(BTreeDescr *desc, Page p, BTreePageItemLocator *loc,
 	{
 		CommitSeqNo tupcsn;
 		XLogRecPtr	tupptr;
+		bool		is_visible;
 
 		oxid_match_snapshot(XACT_INFO_GET_OXID(tupHdr.xactInfo), oSnapshot,
 							&tupcsn, &tupptr);
 
 		/*
-		 * If the tuple CSN indicates visibility (frozen or committed before
-		 * our snapshot), we can return immediately.
+		 * Check if the tuple is visible to our snapshot. A tuple is visible if:
+		 * - It's frozen (committed long ago), OR
+		 * - It's committed (has a normal CSN) AND either:
+		 *   - We're using an in-progress snapshot, OR
+		 *   - The tuple committed before our snapshot CSN (using CSN comparison), OR
+		 *   - The tuple committed before our snapshot xlogptr (using xlog comparison)
 		 */
-		if (COMMITSEQNO_IS_FROZEN(tupcsn) ||
-			(COMMITSEQNO_IS_NORMAL(tupcsn) &&
-			 (COMMITSEQNO_IS_INPROGRESS(oSnapshot->csn) ||
-			  (XLogRecPtrIsInvalid(oSnapshot->xlogptr) && tupcsn < oSnapshot->csn) ||
-			  (!XLogRecPtrIsInvalid(oSnapshot->xlogptr) && tupptr <= oSnapshot->xlogptr))))
+		is_visible = COMMITSEQNO_IS_FROZEN(tupcsn);
+		if (!is_visible && COMMITSEQNO_IS_NORMAL(tupcsn))
 		{
+			if (COMMITSEQNO_IS_INPROGRESS(oSnapshot->csn))
+				is_visible = true;
+			else if (XLogRecPtrIsInvalid(oSnapshot->xlogptr))
+				is_visible = (tupcsn < oSnapshot->csn);
+			else
+				is_visible = (tupptr <= oSnapshot->xlogptr);
+		}
+
+		if (is_visible)
+		{
+			/* Compute tupleCsn if requested */
 			if (tupleCsn)
 			{
 				if (COMMITSEQNO_IS_NORMAL(tupcsn))
-					*tupleCsn = COMMITSEQNO_IS_NORMAL(oSnapshot->csn) ? Max(oSnapshot->csn, tupcsn + 1) : COMMITSEQNO_MAX_NORMAL - 1;
+				{
+					if (COMMITSEQNO_IS_NORMAL(oSnapshot->csn))
+						*tupleCsn = Max(oSnapshot->csn, tupcsn + 1);
+					else
+						*tupleCsn = COMMITSEQNO_MAX_NORMAL - 1;
+				}
 				else
-					*tupleCsn = COMMITSEQNO_IS_NORMAL(oSnapshot->csn) ? oSnapshot->csn : COMMITSEQNO_MAX_NORMAL - 1;
+				{
+					/* tupcsn is frozen */
+					if (COMMITSEQNO_IS_NORMAL(oSnapshot->csn))
+						*tupleCsn = oSnapshot->csn;
+					else
+						*tupleCsn = COMMITSEQNO_MAX_NORMAL - 1;
+				}
 			}
 
 			result_size = o_btree_len(desc, curTuple, OTupleLength);

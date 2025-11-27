@@ -908,28 +908,25 @@ o_idx_cmp(BTreeDescr *desc,
 
 	o_set_sys_cache_search_datoid(desc->oids.datoid);
 
-	if (!IS_BOUND_KEY_TYPE(keyType1) || !IS_BOUND_KEY_TYPE(keyType2))
+	/* At least one of the key types is a bound key type at this point */
+	if (IS_BOUND_KEY_TYPE(keyType1) && !IS_BOUND_KEY_TYPE(keyType2))
 	{
-		if (IS_BOUND_KEY_TYPE(keyType1))
-			return o_idx_cmp_key_bound_to_tuple(id,
-												(OBTreeKeyBound *) p1,
-												keyType1,
-												(OTuple *) p2,
-												keyType2);
-		if (IS_BOUND_KEY_TYPE(keyType2))
-			return -o_idx_cmp_key_bound_to_tuple(id,
-												 (OBTreeKeyBound *) p2,
-												 keyType2,
-												 (OTuple *) p1,
-												 keyType1);
-		/* This branch is now unreachable due to the fastpath above */
-		return o_idx_cmp_tuples(id,
-								(OTuple *) p1,
-								keyType1,
-								(OTuple *) p2,
-								keyType2);
+		return o_idx_cmp_key_bound_to_tuple(id,
+											(OBTreeKeyBound *) p1,
+											keyType1,
+											(OTuple *) p2,
+											keyType2);
+	}
+	if (!IS_BOUND_KEY_TYPE(keyType1) && IS_BOUND_KEY_TYPE(keyType2))
+	{
+		return -o_idx_cmp_key_bound_to_tuple(id,
+											 (OBTreeKeyBound *) p2,
+											 keyType2,
+											 (OTuple *) p1,
+											 keyType1);
 	}
 
+	/* Both key types are bound key types */
 	key1 = (OBTreeKeyBound *) p1;
 	key2 = (OBTreeKeyBound *) p2;
 
