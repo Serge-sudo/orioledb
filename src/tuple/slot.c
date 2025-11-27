@@ -18,6 +18,7 @@
 
 #include "btree/btree.h"
 #include "tableam/toast.h"
+#include "tuple/format.h"
 #include "tuple/toast.h"
 #include "tuple/slot.h"
 
@@ -252,6 +253,43 @@ tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 	if (oslot->ixnum == PrimaryIndexNumber)
 		index_order = index_order &&
 			slot->tts_tupleDescriptor->natts == idx->nFields;
+
+	/*
+	 * Fastpath: For primary index with fixed format tuples and cached
+	 * attribute offsets, we can directly fetch attributes using o_fastgetattr
+	 * without going through the reader state. This is beneficial for simple
+	 * single-column fetches which are very common.
+	 */
+	if (oslot->ixnum == PrimaryIndexNumber &&
+		!index_order &&
+		oslot->leafTuple &&
+		(oslot->tuple.formatFlags & O_TUPLE_FLAGS_FIXED_FORMAT))
+	{
+		TupleDesc	tupdesc = idx->leafTupdesc;
+		OTupleFixedFormatSpec *spec = &idx->leafSpec;
+		int			maxAttr = Min(__natts, descr->tupdesc->natts);
+		bool		can_fastpath = true;
+
+		/* Check if all requested attributes have cached offsets */
+		for (attnum = slot->tts_nvalid; attnum < maxAttr && can_fastpath; attnum++)
+		{
+			Form_pg_attribute att = TupleDescAttr(tupdesc, attnum);
+
+			if (att->attcacheoff < 0)
+				can_fastpath = false;
+		}
+
+		if (can_fastpath)
+		{
+			for (attnum = slot->tts_nvalid; attnum < maxAttr; attnum++)
+			{
+				values[attnum] = o_fastgetattr(oslot->tuple, attnum + 1,
+											   tupdesc, spec, &isnull[attnum]);
+			}
+			slot->tts_nvalid = maxAttr;
+			return;
+		}
+	}
 
 	/*
 	 * Ensure that if there are valid attributes, the slot is for the primary
@@ -871,7 +909,24 @@ tts_orioledb_store_tuple_internal(TupleTableSlot *slot, OTuple tuple,
 	Assert(COMMITSEQNO_IS_NORMAL(csn) || COMMITSEQNO_IS_INPROGRESS(csn));
 	Assert(slot->tts_ops == &TTSOpsOrioleDB);
 
-	tts_orioledb_clear(slot);
+	/*
+	 * Fastpath: If the slot is already empty and doesn't need freeing, skip
+	 * the expensive tts_orioledb_clear call. This is the common case when
+	 * iterating through tuples.
+	 */
+	if (likely(TTS_EMPTY(slot) && !TTS_SHOULDFREE(slot) && !oslot->to_toast))
+	{
+		/* Slot is already clean, just reset minimal state */
+		oslot->data = NULL;
+		O_TUPLE_SET_NULL(oslot->tuple);
+		oslot->descr = NULL;
+		oslot->hint.blkno = OInvalidInMemoryBlkno;
+		oslot->hint.pageChangeCount = 0;
+	}
+	else
+	{
+		tts_orioledb_clear(slot);
+	}
 
 	Assert(!TTS_SHOULDFREE(slot));
 	Assert(TTS_EMPTY(slot));

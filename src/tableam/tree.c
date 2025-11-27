@@ -627,6 +627,40 @@ o_idx_cmp_tuples(OIndexDescr *id,
 				isnull2;
 
 	Assert(keyType1 == BTreeKeyLeafTuple || keyType1 == BTreeKeyNonLeafKey);
+	Assert(keyType2 == BTreeKeyLeafTuple || keyType2 == BTreeKeyNonLeafKey);
+
+	/*
+	 * Fastpath: For the common case of comparing two NonLeafKeys with a
+	 * single key field (e.g., primary key on single column), we can directly
+	 * compare without iterating through all fields.
+	 */
+	if (keyType1 == BTreeKeyNonLeafKey && keyType2 == BTreeKeyNonLeafKey &&
+		id->nKeyFields == 1 && id->nIncludedFields == 0 &&
+		id->desc.type != oIndexToast && id->desc.type != oIndexBridge)
+	{
+		OIndexField *field = &id->fields[0];
+		/* Attribute number 1 corresponds to the first field in the nonLeafTupdesc */
+		AttrNumber	firstFieldAttnum = 1;
+
+		value1 = o_fastgetattr(*tuple1, firstFieldAttnum, id->nonLeafTupdesc, &id->nonLeafSpec, &isnull1);
+		value2 = o_fastgetattr(*tuple2, firstFieldAttnum, id->nonLeafTupdesc, &id->nonLeafSpec, &isnull2);
+
+		if (!isnull1 && !isnull2)
+		{
+			int			cmp = o_call_comparator(field->comparator, value1, value2);
+
+			if (!field->ascending)
+				cmp = -cmp;
+			return cmp;
+		}
+		else if (isnull1 && isnull2)
+			return 0;
+		else if (isnull1)
+			return field->nullfirst ? -1 : 1;
+		else
+			return field->nullfirst ? 1 : -1;
+	}
+
 	if (keyType1 == BTreeKeyLeafTuple)
 	{
 		tupdesc1 = id->leafTupdesc;
@@ -638,7 +672,6 @@ o_idx_cmp_tuples(OIndexDescr *id,
 		spec1 = &id->nonLeafSpec;
 	}
 
-	Assert(keyType2 == BTreeKeyLeafTuple || keyType2 == BTreeKeyNonLeafKey);
 	if (keyType2 == BTreeKeyLeafTuple)
 	{
 		tupdesc2 = id->leafTupdesc;
@@ -697,6 +730,32 @@ o_idx_cmp_key_bound_to_tuple(OIndexDescr *id,
 	bool		isnull;
 
 	Assert(keyType2 == BTreeKeyLeafTuple || keyType2 == BTreeKeyNonLeafKey);
+
+	/*
+	 * Fastpath: For single-key indexes comparing a bound to a NonLeafKey,
+	 * we can avoid the loop overhead and directly compare the first field.
+	 */
+	if (keyType2 == BTreeKeyNonLeafKey &&
+		id->nKeyFields == 1 && id->nIncludedFields == 0 &&
+		id->desc.type != oIndexToast && id->desc.type != oIndexBridge &&
+		!(key1->keys[0].flags & O_VALUE_BOUND_UNBOUNDED))
+	{
+		OIndexField *field = &id->fields[0];
+		AttrNumber	firstFieldAttnum = 1;
+		int			cmp;
+
+		value = o_fastgetattr(*tuple2, firstFieldAttnum, id->nonLeafTupdesc, &id->nonLeafSpec, &isnull);
+		cmp = o_idx_cmp_range_key_to_value(&key1->keys[0], field, value, isnull);
+
+		if (cmp != 0)
+			return cmp;
+
+		if (keyType1 == BTreeKeyUniqueLowerBound)
+			return -1;
+		else if (keyType1 == BTreeKeyUniqueUpperBound)
+			return 1;
+		return 0;
+	}
 
 	if (keyType2 == BTreeKeyLeafTuple)
 	{
