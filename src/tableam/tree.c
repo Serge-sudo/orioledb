@@ -731,6 +731,32 @@ o_idx_cmp_key_bound_to_tuple(OIndexDescr *id,
 
 	Assert(keyType2 == BTreeKeyLeafTuple || keyType2 == BTreeKeyNonLeafKey);
 
+	/*
+	 * Fastpath: For single-key indexes comparing a bound to a NonLeafKey,
+	 * we can avoid the loop overhead and directly compare the first field.
+	 */
+	if (keyType2 == BTreeKeyNonLeafKey &&
+		id->nKeyFields == 1 && id->nIncludedFields == 0 &&
+		id->desc.type != oIndexToast && id->desc.type != oIndexBridge &&
+		!(key1->keys[0].flags & O_VALUE_BOUND_UNBOUNDED))
+	{
+		OIndexField *field = &id->fields[0];
+		AttrNumber	firstFieldAttnum = 1;
+		int			cmp;
+
+		value = o_fastgetattr(*tuple2, firstFieldAttnum, id->nonLeafTupdesc, &id->nonLeafSpec, &isnull);
+		cmp = o_idx_cmp_range_key_to_value(&key1->keys[0], field, value, isnull);
+
+		if (cmp != 0)
+			return cmp;
+
+		if (keyType1 == BTreeKeyUniqueLowerBound)
+			return -1;
+		else if (keyType1 == BTreeKeyUniqueUpperBound)
+			return 1;
+		return 0;
+	}
+
 	if (keyType2 == BTreeKeyLeafTuple)
 	{
 		tupdesc = id->leafTupdesc;
