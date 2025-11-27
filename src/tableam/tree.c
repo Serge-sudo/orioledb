@@ -639,17 +639,19 @@ o_idx_cmp_tuples(OIndexDescr *id,
 		id->desc.type != oIndexToast && id->desc.type != oIndexBridge)
 	{
 		OIndexField *field = &id->fields[0];
+		/* Attribute number 1 corresponds to the first field in the nonLeafTupdesc */
+		AttrNumber	firstFieldAttnum = 1;
 
-		value1 = o_fastgetattr(*tuple1, 1, id->nonLeafTupdesc, &id->nonLeafSpec, &isnull1);
-		value2 = o_fastgetattr(*tuple2, 1, id->nonLeafTupdesc, &id->nonLeafSpec, &isnull2);
+		value1 = o_fastgetattr(*tuple1, firstFieldAttnum, id->nonLeafTupdesc, &id->nonLeafSpec, &isnull1);
+		value2 = o_fastgetattr(*tuple2, firstFieldAttnum, id->nonLeafTupdesc, &id->nonLeafSpec, &isnull2);
 
 		if (!isnull1 && !isnull2)
 		{
 			int			cmp = o_call_comparator(field->comparator, value1, value2);
 
-			if (cmp != 0)
-				return field->ascending ? cmp : -cmp;
-			return 0;
+			if (!field->ascending)
+				cmp = -cmp;
+			return cmp;
 		}
 		else if (isnull1 && isnull2)
 			return 0;
