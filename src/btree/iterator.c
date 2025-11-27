@@ -254,6 +254,51 @@ o_find_tuple_version(BTreeDescr *desc, Page p, BTreePageItemLocator *loc,
 
 	BTREE_PAGE_READ_LEAF_ITEM(tupHdrPtr, curTuple, p, loc);
 	tupHdr = *tupHdrPtr;
+
+	/*
+	 * Fastpath: If the tuple is not deleted, transaction is finished, and
+	 * there's no callback, check if we can return the current tuple directly
+	 * without traversing the undo chain. This is the common case for
+	 * committed transactions.
+	 */
+	if (cb == NULL &&
+		tupHdr.deleted == BTreeLeafTupleNonDeleted &&
+		!XACT_INFO_IS_LOCK_ONLY(tupHdr.xactInfo) &&
+		XACT_INFO_IS_FINISHED(tupHdr.xactInfo))
+	{
+		CommitSeqNo tupcsn;
+		XLogRecPtr	tupptr;
+
+		oxid_match_snapshot(XACT_INFO_GET_OXID(tupHdr.xactInfo), oSnapshot,
+							&tupcsn, &tupptr);
+
+		/*
+		 * If the tuple CSN indicates visibility (frozen or committed before
+		 * our snapshot), we can return immediately.
+		 */
+		if (COMMITSEQNO_IS_FROZEN(tupcsn) ||
+			(COMMITSEQNO_IS_NORMAL(tupcsn) &&
+			 (COMMITSEQNO_IS_INPROGRESS(oSnapshot->csn) ||
+			  (XLogRecPtrIsInvalid(oSnapshot->xlogptr) && tupcsn < oSnapshot->csn) ||
+			  (!XLogRecPtrIsInvalid(oSnapshot->xlogptr) && tupptr <= oSnapshot->xlogptr))))
+		{
+			if (tupleCsn)
+			{
+				if (COMMITSEQNO_IS_NORMAL(tupcsn))
+					*tupleCsn = COMMITSEQNO_IS_NORMAL(oSnapshot->csn) ? Max(oSnapshot->csn, tupcsn + 1) : COMMITSEQNO_MAX_NORMAL - 1;
+				else
+					*tupleCsn = COMMITSEQNO_IS_NORMAL(oSnapshot->csn) ? oSnapshot->csn : COMMITSEQNO_MAX_NORMAL - 1;
+			}
+
+			result_size = o_btree_len(desc, curTuple, OTupleLength);
+			result.data = (Pointer) MemoryContextAlloc(mcxt, result_size);
+			memcpy(result.data, curTuple.data, result_size);
+			result.formatFlags = curTuple.formatFlags;
+			MemoryContextSwitchTo(prevMctx);
+			return result;
+		}
+	}
+
 	(void) find_non_lock_only_undo_record(desc->undoType, &tupHdr);
 
 	Assert(COMMITSEQNO_IS_NORMAL(oSnapshot->csn) ||

@@ -627,6 +627,38 @@ o_idx_cmp_tuples(OIndexDescr *id,
 				isnull2;
 
 	Assert(keyType1 == BTreeKeyLeafTuple || keyType1 == BTreeKeyNonLeafKey);
+	Assert(keyType2 == BTreeKeyLeafTuple || keyType2 == BTreeKeyNonLeafKey);
+
+	/*
+	 * Fastpath: For the common case of comparing two NonLeafKeys with a
+	 * single key field (e.g., primary key on single column), we can directly
+	 * compare without iterating through all fields.
+	 */
+	if (keyType1 == BTreeKeyNonLeafKey && keyType2 == BTreeKeyNonLeafKey &&
+		id->nKeyFields == 1 && id->nIncludedFields == 0 &&
+		id->desc.type != oIndexToast && id->desc.type != oIndexBridge)
+	{
+		OIndexField *field = &id->fields[0];
+
+		value1 = o_fastgetattr(*tuple1, 1, id->nonLeafTupdesc, &id->nonLeafSpec, &isnull1);
+		value2 = o_fastgetattr(*tuple2, 1, id->nonLeafTupdesc, &id->nonLeafSpec, &isnull2);
+
+		if (!isnull1 && !isnull2)
+		{
+			int			cmp = o_call_comparator(field->comparator, value1, value2);
+
+			if (cmp != 0)
+				return field->ascending ? cmp : -cmp;
+			return 0;
+		}
+		else if (isnull1 && isnull2)
+			return 0;
+		else if (isnull1)
+			return field->nullfirst ? -1 : 1;
+		else
+			return field->nullfirst ? 1 : -1;
+	}
+
 	if (keyType1 == BTreeKeyLeafTuple)
 	{
 		tupdesc1 = id->leafTupdesc;
@@ -638,7 +670,6 @@ o_idx_cmp_tuples(OIndexDescr *id,
 		spec1 = &id->nonLeafSpec;
 	}
 
-	Assert(keyType2 == BTreeKeyLeafTuple || keyType2 == BTreeKeyNonLeafKey);
 	if (keyType2 == BTreeKeyLeafTuple)
 	{
 		tupdesc2 = id->leafTupdesc;
@@ -861,6 +892,20 @@ o_idx_cmp(BTreeDescr *desc,
 				n;
 	int			cmp;
 
+	/*
+	 * Fastpath: For the common case of comparing two tuples (not bounds),
+	 * we can skip setting the sys cache search datoid because o_idx_cmp_tuples
+	 * doesn't need it when comparing tuples with pre-cached comparators.
+	 */
+	if (!IS_BOUND_KEY_TYPE(keyType1) && !IS_BOUND_KEY_TYPE(keyType2))
+	{
+		return o_idx_cmp_tuples(id,
+								(OTuple *) p1,
+								keyType1,
+								(OTuple *) p2,
+								keyType2);
+	}
+
 	o_set_sys_cache_search_datoid(desc->oids.datoid);
 
 	if (!IS_BOUND_KEY_TYPE(keyType1) || !IS_BOUND_KEY_TYPE(keyType2))
@@ -877,6 +922,7 @@ o_idx_cmp(BTreeDescr *desc,
 												 keyType2,
 												 (OTuple *) p1,
 												 keyType1);
+		/* This branch is now unreachable due to the fastpath above */
 		return o_idx_cmp_tuples(id,
 								(OTuple *) p1,
 								keyType1,
