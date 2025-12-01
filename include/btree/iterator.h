@@ -84,19 +84,4 @@ extern OTuple o_find_tuple_version(BTreeDescr *desc, Page p,
 								   TupleFetchCallback cb,
 								   void *arg);
 
-/*
- * Version with recyclable buffer to avoid repeated allocations
- * during iteration. When recycleBuf is provided and has sufficient
- * space, it will be reused instead of allocating new memory.
- */
-extern OTuple o_find_tuple_version_with_recycle(BTreeDescr *desc, Page p,
-												BTreePageItemLocator *loc,
-												OSnapshot *oSnapshot,
-												CommitSeqNo *tupleCsn,
-												MemoryContext mcxt,
-												TupleFetchCallback cb,
-												void *arg,
-												Pointer *recycleBuf,
-												int *recycleBufSize);
-
 #endif							/* __BTREE_ITERATOR_H__ */

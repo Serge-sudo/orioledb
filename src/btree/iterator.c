@@ -67,9 +67,6 @@ struct BTreeIterator
 	/* callback for fetching tuple version */
 	TupleFetchCallback fetchCallback;
 	void	   *fetchCallbackArg;
-	/* recyclable buffer to avoid repeated allocations */
-	Pointer		recycleBuf;
-	int			recycleBufSize;
 #ifdef USE_ASSERT_CHECKING
 	/* additional check for iteration order */
 	OFixedTuple prevTuple;
@@ -238,16 +235,13 @@ o_btree_find_tuple_by_key(BTreeDescr *desc, void *key, BTreeKeyType kind,
 
 
 /*
- * Internal version of o_find_tuple_version with optional recyclable buffer.
- * When recycleBuf is provided and has sufficient space, it will be reused
- * instead of allocating new memory. This reduces allocation overhead during
- * iteration.
+ * Finds appropriate tuple version in the undo chain.
  */
-static OTuple
-o_find_tuple_version_internal(BTreeDescr *desc, Page p, BTreePageItemLocator *loc,
-							  OSnapshot *oSnapshot, CommitSeqNo *tupleCsn,
-							  MemoryContext mcxt, TupleFetchCallback cb,
-							  void *arg, Pointer *recycleBuf, int *recycleBufSize)
+OTuple
+o_find_tuple_version(BTreeDescr *desc, Page p, BTreePageItemLocator *loc,
+					 OSnapshot *oSnapshot, CommitSeqNo *tupleCsn,
+					 MemoryContext mcxt, TupleFetchCallback cb,
+					 void *arg)
 {
 	BTreeLeafTuphdr tupHdr,
 			   *tupHdrPtr;
@@ -264,13 +258,11 @@ o_find_tuple_version_internal(BTreeDescr *desc, Page p, BTreePageItemLocator *lo
 	tupHdr = *tupHdrPtr;
 
 	/*
-	 * Fastpath: If the tuple is not deleted, transaction is finished, and
-	 * there's no callback, check if we can return the current tuple directly
-	 * without traversing the undo chain. This is the common case for
-	 * committed transactions.
+	 * Fastpath: If the tuple is not deleted, transaction is finished, check
+	 * if we can return the current tuple directly without traversing the undo
+	 * chain. This is the common case for committed transactions.
 	 */
-	if (cb == NULL &&
-		tupHdr.deleted == BTreeLeafTupleNonDeleted &&
+	if (tupHdr.deleted == BTreeLeafTupleNonDeleted &&
 		!XACT_INFO_IS_LOCK_ONLY(tupHdr.xactInfo) &&
 		XACT_INFO_IS_FINISHED(tupHdr.xactInfo))
 	{
@@ -302,6 +294,26 @@ o_find_tuple_version_internal(BTreeDescr *desc, Page p, BTreePageItemLocator *lo
 
 		if (is_visible)
 		{
+			/*
+			 * If there's a callback, call it with KeyCheck type since the
+			 * transaction is finished. If callback returns NotMatch, return
+			 * NULL. For Match or Next, we use the visible tuple.
+			 */
+			if (cb)
+			{
+				TupleFetchCallbackResult cbResult;
+
+				cbResult = cb(curTuple, InvalidOXid, oSnapshot, arg,
+							  OTupleFetchCallbackKeyCheck);
+
+				if (cbResult == OTupleFetchNotMatch)
+				{
+					O_TUPLE_SET_NULL(result);
+					MemoryContextSwitchTo(prevMctx);
+					return result;
+				}
+			}
+
 			/* Compute tupleCsn if requested */
 			if (tupleCsn)
 			{
@@ -337,27 +349,7 @@ o_find_tuple_version_internal(BTreeDescr *desc, Page p, BTreePageItemLocator *lo
 			{
 				result_size = o_btree_len(desc, curTuple, OTupleLength);
 			}
-
-			/*
-			 * Use recyclable buffer if provided and large enough, otherwise
-			 * allocate or reallocate as needed.
-			 */
-			if (recycleBuf != NULL)
-			{
-				if (*recycleBufSize < result_size)
-				{
-					if (*recycleBuf)
-						*recycleBuf = repalloc(*recycleBuf, result_size);
-					else
-						*recycleBuf = palloc(result_size);
-					*recycleBufSize = result_size;
-				}
-				result.data = *recycleBuf;
-			}
-			else
-			{
-				result.data = (Pointer) palloc(result_size);
-			}
+			result.data = (Pointer) palloc(result_size);
 			memcpy(result.data, curTuple.data, result_size);
 			result.formatFlags = curTuple.formatFlags;
 			MemoryContextSwitchTo(prevMctx);
@@ -517,27 +509,7 @@ o_find_tuple_version_internal(BTreeDescr *desc, Page p, BTreePageItemLocator *lo
 	{
 		result_size = o_btree_len(desc, curTuple, OTupleLength);
 		/* TODO: check result tuple size */
-
-		/*
-		 * Use recyclable buffer if provided and large enough, otherwise
-		 * allocate or reallocate as needed.
-		 */
-		if (recycleBuf != NULL)
-		{
-			if (*recycleBufSize < result_size)
-			{
-				if (*recycleBuf)
-					*recycleBuf = repalloc(*recycleBuf, result_size);
-				else
-					*recycleBuf = MemoryContextAlloc(mcxt, result_size);
-				*recycleBufSize = result_size;
-			}
-			result.data = *recycleBuf;
-		}
-		else
-		{
-			result.data = (Pointer) MemoryContextAlloc(mcxt, result_size);
-		}
+		result.data = (Pointer) MemoryContextAlloc(mcxt, result_size);
 		memcpy(result.data, curTuple.data, result_size);
 		result.formatFlags = curTuple.formatFlags;
 	}
@@ -549,36 +521,6 @@ o_find_tuple_version_internal(BTreeDescr *desc, Page p, BTreePageItemLocator *lo
 	Assert(!UndoLocationIsValid(undoLocation) || UNDO_REC_EXISTS(desc->undoType, undoLocation));
 	MemoryContextSwitchTo(prevMctx);
 	return result;
-}
-
-/*
- * Finds appropriate tuple version in the undo chain.
- */
-OTuple
-o_find_tuple_version(BTreeDescr *desc, Page p, BTreePageItemLocator *loc,
-					 OSnapshot *oSnapshot, CommitSeqNo *tupleCsn,
-					 MemoryContext mcxt, TupleFetchCallback cb,
-					 void *arg)
-{
-	return o_find_tuple_version_internal(desc, p, loc, oSnapshot, tupleCsn,
-										 mcxt, cb, arg, NULL, NULL);
-}
-
-/*
- * Version with recyclable buffer to avoid repeated allocations
- * during iteration. When recycleBuf is provided and has sufficient
- * space, it will be reused instead of allocating new memory.
- */
-OTuple
-o_find_tuple_version_with_recycle(BTreeDescr *desc, Page p,
-								  BTreePageItemLocator *loc,
-								  OSnapshot *oSnapshot, CommitSeqNo *tupleCsn,
-								  MemoryContext mcxt, TupleFetchCallback cb,
-								  void *arg, Pointer *recycleBuf,
-								  int *recycleBufSize)
-{
-	return o_find_tuple_version_internal(desc, p, loc, oSnapshot, tupleCsn,
-										 mcxt, cb, arg, recycleBuf, recycleBufSize);
 }
 
 BTreeIterator *
@@ -596,8 +538,6 @@ o_btree_iterator_create(BTreeDescr *desc, void *key, BTreeKeyType kind,
 	it->tupleCxt = CurrentMemoryContext;
 	it->fetchCallback = NULL;
 	it->fetchCallbackArg = NULL;
-	it->recycleBuf = NULL;
-	it->recycleBufSize = 0;
 	BTREE_PAGE_LOCATOR_SET_INVALID(&it->undoLoc);
 #ifdef USE_ASSERT_CHECKING
 	O_TUPLE_SET_NULL(it->prevTuple.tuple);
@@ -730,8 +670,6 @@ o_btree_iterator_fetch(BTreeIterator *it, CommitSeqNo *tupleCsn,
 void
 btree_iterator_free(BTreeIterator *it)
 {
-	if (it->recycleBuf)
-		pfree(it->recycleBuf);
 	pfree(it);
 }
 
@@ -869,14 +807,12 @@ o_btree_iterator_fetch_internal(BTreeIterator *it, CommitSeqNo *tupleCsn)
 
 			if (cmp <= 0)
 			{
-				result = o_find_tuple_version_with_recycle(desc, img,
-														   &leaf_item->locator,
-														   &it->oSnapshot, tupleCsn,
-														   it->tupleCxt,
-														   it->fetchCallback,
-														   it->fetchCallbackArg,
-														   &it->recycleBuf,
-														   &it->recycleBufSize);
+				result = o_find_tuple_version(desc, img,
+											  &leaf_item->locator,
+											  &it->oSnapshot, tupleCsn,
+											  it->tupleCxt,
+											  it->fetchCallback,
+											  it->fetchCallbackArg);
 
 				IT_NEXT_OFFSET(it, &leaf_item->locator);
 
@@ -890,14 +826,12 @@ o_btree_iterator_fetch_internal(BTreeIterator *it, CommitSeqNo *tupleCsn)
 			}
 			else
 			{
-				result = o_find_tuple_version_with_recycle(desc, hImg,
-														   &it->undoLoc,
-														   &it->oSnapshot, tupleCsn,
-														   it->tupleCxt,
-														   it->fetchCallback,
-														   it->fetchCallbackArg,
-														   &it->recycleBuf,
-														   &it->recycleBufSize);
+				result = o_find_tuple_version(desc, hImg,
+											  &it->undoLoc,
+											  &it->oSnapshot, tupleCsn,
+											  it->tupleCxt,
+											  it->fetchCallback,
+											  it->fetchCallbackArg);
 
 				UNDO_IT_NEXT_OFFSET(&it->undoIt, &it->undoLoc);
 
@@ -907,14 +841,12 @@ o_btree_iterator_fetch_internal(BTreeIterator *it, CommitSeqNo *tupleCsn)
 		}
 		else
 		{
-			result = o_find_tuple_version_with_recycle(desc, context->img,
-													   &leaf_item->locator,
-													   &it->oSnapshot, tupleCsn,
-													   it->tupleCxt,
-													   it->fetchCallback,
-													   it->fetchCallbackArg,
-													   &it->recycleBuf,
-													   &it->recycleBufSize);
+			result = o_find_tuple_version(desc, context->img,
+										  &leaf_item->locator,
+										  &it->oSnapshot, tupleCsn,
+										  it->tupleCxt,
+										  it->fetchCallback,
+										  it->fetchCallbackArg);
 
 			IT_NEXT_OFFSET(it, &leaf_item->locator);
 
