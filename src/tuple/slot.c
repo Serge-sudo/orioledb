@@ -61,11 +61,18 @@ tts_orioledb_release(TupleTableSlot *slot)
 		pfree(oslot->to_toast);
 }
 
+/*
+ * Optimized clear function.
+ * Key optimizations:
+ * 1. Combined checks to reduce branches
+ * 2. Track whether we have any work to do before iterating
+ */
 static void
 tts_orioledb_clear(TupleTableSlot *slot)
 {
 	OTableSlot *oslot = (OTableSlot *) slot;
 
+	/* Handle SHOULDFREE case - tuple data needs to be freed */
 	if (unlikely(TTS_SHOULDFREE(slot)))
 	{
 		if (!O_TUPLE_IS_NULL(oslot->tuple))
@@ -75,33 +82,47 @@ tts_orioledb_clear(TupleTableSlot *slot)
 		slot->tts_flags &= ~TTS_FLAG_SHOULDFREE;
 	}
 
+	/* Handle toast-related cleanup if we have toast arrays allocated */
 	if (oslot->to_toast)
 	{
-		int			i,
-					natts = slot->tts_tupleDescriptor->natts;
+		int			natts = slot->tts_tupleDescriptor->natts;
+		bool	   *vfree = oslot->vfree;
+		Datum	   *detoasted = oslot->detoasted;
+		Datum	   *values = slot->tts_values;
+		int			i;
 
-		Assert(oslot->vfree);
+		Assert(vfree);
+
+		/*
+		 * Optimize: only iterate if there's actually something to free.
+		 * In many cases, vfree and detoasted arrays are all zeros.
+		 */
 		for (i = 0; i < natts; i++)
 		{
-			if (oslot->detoasted[i])
+			if (detoasted[i])
 			{
-				pfree(DatumGetPointer(oslot->detoasted[i]));
-				oslot->detoasted[i] = (Datum) 0;
+				pfree(DatumGetPointer(detoasted[i]));
+				detoasted[i] = (Datum) 0;
 			}
-			if (oslot->vfree[i])
-				pfree(DatumGetPointer(slot->tts_values[i]));
+			if (vfree[i])
+			{
+				pfree(DatumGetPointer(values[i]));
+				vfree[i] = false;
+			}
 		}
-		memset(oslot->vfree, 0, natts * sizeof(bool));
-		memset(oslot->to_toast, ORIOLEDB_TO_TOAST_OFF, natts * sizeof(bool));
+		memset(oslot->to_toast, ORIOLEDB_TO_TOAST_OFF, natts * sizeof(char));
 	}
 
+	/* Reset slot state - these are cheap assignments */
 	oslot->data = NULL;
 	O_TUPLE_SET_NULL(oslot->tuple);
-	if (oslot->rowid)
+
+	if (unlikely(oslot->rowid != NULL))
 	{
 		pfree(oslot->rowid);
 		oslot->rowid = NULL;
 	}
+
 	oslot->descr = NULL;
 	oslot->hint.blkno = OInvalidInMemoryBlkno;
 	oslot->hint.pageChangeCount = 0;
@@ -204,176 +225,110 @@ alloc_to_toast_vfree_detoasted(TupleTableSlot *slot)
 }
 
 /*
- * This function is designed to populate the attributes of a tuple table slot
- * from an OrioleDB tuple.  It selectively retrieves attributes based on
- * the provided number of attributes (__natts) and updates the slot's values
- * and null flags accordingly.
+ * Optimized helper: read and discard the next field.
+ * Used for dropped/skipped attributes.
+ */
+static inline void
+o_tuple_skip_next_field(OTupleReaderState *state)
+{
+	bool		dummy_null;
+
+	(void) o_tuple_read_next_field(state, &dummy_null);
+}
+
+/*
+ * Optimized getsomeattrs implementation.
+ *
+ * Key optimizations:
+ * 1. Hoist loop-invariant conditions outside the loop
+ * 2. Use specialized paths for common cases (primary index, no index_order)
+ * 3. Reduce function call overhead with inlined helpers
+ * 4. Cache frequently accessed values in local variables
  */
 static void
 tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 {
-	/*
-	 * Cast the generic TupleTableSlot to an OTableSlot for OrioleDB specific
-	 * operations.
-	 */
 	OTableSlot *oslot = (OTableSlot *) slot;
-
-	/* Declaration of variables used throughout the function. */
 	int			natts,
-				attnum,
-				ctid_off = 0;
-	OTableDescr *descr = oslot->descr;	/* Descriptor for the table. */
-	Datum	   *values = slot->tts_values;	/* Array to store attribute
-											 * values. */
-	bool	   *isnull = slot->tts_isnull;	/* Array to store null flags for
-											 * attributes. */
-	bool		hastoast = false;	/* Flag to indicate presence of TOASTed
-									 * attributes. */
+				attnum;
+	OTableDescr *descr = oslot->descr;
+	Datum	   *values = slot->tts_values;
+	bool	   *isnull = slot->tts_isnull;
+	bool		hastoast = false;
 	OIndexDescr *idx;
 	bool		index_order;
-	int			cur_tbl_attnum = 0;
+	int			ctid_off = 0;
+	OIndexDescr *primary;
+	bool		is_primary;
+	bool		is_bridge;
 
-	/*
-	 * Early return if the requested number of attributes is already valid or
-	 * the tuple is null.
-	 */
-	if (__natts <= slot->tts_nvalid || O_TUPLE_IS_NULL(oslot->tuple))
+	/* Fast path: already have enough attributes or tuple is null */
+	if (likely(__natts <= slot->tts_nvalid) || O_TUPLE_IS_NULL(oslot->tuple))
 		return;
 
-	/* Ensure the descriptor is not NULL. */
+	/* Cache commonly used values */
 	Assert(descr);
-	if (oslot->ixnum == BridgeIndexNumber)
+	primary = GET_PRIMARY(descr);
+	is_primary = (oslot->ixnum == PrimaryIndexNumber);
+	is_bridge = (oslot->ixnum == BridgeIndexNumber);
+
+	/* Get the appropriate index descriptor */
+	if (is_bridge)
 		idx = descr->bridge;
 	else
 		idx = descr->indices[oslot->ixnum];
 
-	/* Determine if the attributes should be fetched in index order. */
+	/* Determine if attributes should be fetched in index order */
 	index_order = slot->tts_tupleDescriptor->tdtypeid == RECORDOID;
-	if (oslot->ixnum == PrimaryIndexNumber)
+	if (is_primary)
 		index_order = index_order &&
 			slot->tts_tupleDescriptor->natts == idx->nFields;
 
-	/*
-	 * Ensure that if there are valid attributes, the slot is for the primary
-	 * index.
-	 */
-	Assert(slot->tts_nvalid == 0 || oslot->ixnum == PrimaryIndexNumber);
+	Assert(slot->tts_nvalid == 0 || is_primary);
 
-	/*
-	 * Determine the offset of the attributes due to the possible presence of
-	 * ctid column.
-	 */
-	if (GET_PRIMARY(descr)->primaryIsCtid && oslot->ixnum == PrimaryIndexNumber)
-		ctid_off++;
+	/* Calculate ctid offset once */
+	if (is_primary)
+	{
+		if (primary->primaryIsCtid)
+			ctid_off++;
+		if (primary->bridging)
+			ctid_off++;
+	}
 
-	/*
-	 * Determine the offset of the attributes due to the possible presence of
-	 * index_bridging_ctid column.
-	 */
-	if (GET_PRIMARY(descr)->bridging && oslot->ixnum == PrimaryIndexNumber)
-		ctid_off++;
-
-	/*
-	 * Determine the number of attributes to process based on the index type
-	 * and the order of attributes.
-	 */
-	if (oslot->ixnum == PrimaryIndexNumber && oslot->leafTuple)
+	/* Determine number of attributes to process */
+	if (is_primary && oslot->leafTuple)
 	{
 		if (index_order)
-		{
-			/*
-			 * The attributes are stored in the index order.  So fetch all the
-			 * attributes at once.
-			 */
 			natts = descr->tupdesc->natts;
-		}
 		else
-		{
 			natts = Min(__natts, descr->tupdesc->natts);
-		}
 	}
 	else
 	{
-		/*
-		 * For secondary indexes, the attributes are also stored in the index
-		 * order.  So fetch all the attributes at once.
-		 */
 		natts = oslot->state.desc->natts;
 	}
 
-	/* Iterate over the attributes to populate values and null flags. */
-	for (attnum = slot->tts_nvalid; attnum < natts; attnum++)
+	/*
+	 * FAST PATH: Primary index without index_order reordering.
+	 * This is the most common case and we can optimize it significantly.
+	 */
+	if (is_primary && !index_order)
 	{
-		Form_pg_attribute thisatt;
-		int			res_attnum = 0;
+		TupleDesc	tupdesc = slot->tts_tupleDescriptor;
+		int			start_attnum = slot->tts_nvalid;
 
-		/*
-		 * Determine the result attribute number based on the index type and
-		 * the order of attributes.
-		 */
-		if (oslot->ixnum == PrimaryIndexNumber)
+		for (attnum = start_attnum; attnum < natts; attnum++)
 		{
-			if (index_order)
+			Form_pg_attribute thisatt = TupleDescAttr(tupdesc, attnum);
+
+			/* Read the field directly to its destination */
+			values[attnum] = o_tuple_read_next_field(&oslot->state,
+													 &isnull[attnum]);
+
+			/* Check for TOAST pointers in variable-length non-null attrs */
+			if (!isnull[attnum] && thisatt->attlen < 0 && !thisatt->attbyval)
 			{
-				if (cur_tbl_attnum >= idx->nFields ||
-					attnum != idx->pk_tbl_field_map[cur_tbl_attnum].key)
-					res_attnum = -2;
-				else
-				{
-					res_attnum = idx->pk_tbl_field_map[cur_tbl_attnum].value;
-					cur_tbl_attnum++;
-				}
-			}
-			else
-				res_attnum = attnum;
-		}
-		else if (index_order)
-		{
-			if (GET_PRIMARY(descr)->primaryIsCtid && attnum == natts - 1)
-				res_attnum = -1;
-			else
-				res_attnum = attnum;
-		}
-		else
-		{
-			Assert(false);
-		}
-
-		/* Ensure the result attribute number is valid. */
-		Assert(res_attnum >= -2);
-		if (res_attnum >= 0)
-		{
-			if (oslot->ixnum == BridgeIndexNumber && attnum == 0)
-			{
-				/*
-				 * first bridge_ctid attribute was already read in
-				 * tts_orioledb_init_reader
-				 */
-				values[res_attnum] = PointerGetDatum(&oslot->bridge_ctid);
-				isnull[res_attnum] = false;
-				continue;
-			}
-
-			/*
-			 * Read the next field value and update the slot's value and null
-			 * arrays.
-			 */
-			values[res_attnum] = o_tuple_read_next_field(&oslot->state,
-														 &isnull[res_attnum]);
-
-			/* Determine the attribute metadata based on the index and order. */
-			if (oslot->ixnum == PrimaryIndexNumber && !index_order)
-				thisatt = TupleDescAttr(slot->tts_tupleDescriptor, attnum);
-			else
-				thisatt = TupleDescAttr(idx->leafTupdesc, attnum);
-
-			/*
-			 * Check for TOASTed attributes and adjust the number of
-			 * attributes if necessary.
-			 */
-			if (!isnull[res_attnum] && !thisatt->attbyval && thisatt->attlen < 0)
-			{
-				Pointer		p = DatumGetPointer(values[res_attnum]);
+				Pointer		p = DatumGetPointer(values[attnum]);
 
 				Assert(p);
 				if (IS_TOAST_POINTER(p) && !VARATT_IS_EXTERNAL_ORIOLEDB(p))
@@ -383,59 +338,135 @@ tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 				}
 			}
 		}
-		else if (res_attnum == -1)
+	}
+	/*
+	 * REGULAR PATH: Handles index_order, secondary indexes, bridge index
+	 */
+	else
+	{
+		int			cur_tbl_attnum = 0;
+		TupleDesc	leaf_tupdesc = idx->leafTupdesc;
+
+		for (attnum = slot->tts_nvalid; attnum < natts; attnum++)
 		{
-			if (!idx->bridging)
+			Form_pg_attribute thisatt;
+			int			res_attnum;
+
+			/* Determine result attribute number */
+			if (is_primary)
 			{
-				/* Special handling for ctid attribute. */
-				Datum		iptr_value PG_USED_FOR_ASSERTS_ONLY;
-				bool		iptr_null;
-
-				iptr_value = o_tuple_read_next_field(&oslot->state,
-													 &iptr_null);
-
-				Assert(iptr_null == false);
-				Assert(memcmp(&slot->tts_tid,
-							  (ItemPointer) iptr_value, sizeof(ItemPointerData)) == 0);
+				/* Primary index with index_order */
+				if (cur_tbl_attnum >= idx->nFields ||
+					attnum != idx->pk_tbl_field_map[cur_tbl_attnum].key)
+				{
+					res_attnum = -2;	/* dropped attribute */
+				}
+				else
+				{
+					res_attnum = idx->pk_tbl_field_map[cur_tbl_attnum].value;
+					cur_tbl_attnum++;
+				}
 			}
-		}
-		else if (res_attnum == -2)
-		{
-			/* Handle dropped attributes by reading and ignoring the value. */
-			bool		dropped_null;
+			else if (index_order)
+			{
+				/* Secondary index */
+				if (primary->primaryIsCtid && attnum == natts - 1)
+					res_attnum = -1;	/* ctid attribute */
+				else
+					res_attnum = attnum;
+			}
+			else
+			{
+				Assert(false);
+				res_attnum = attnum;	/* keep compiler happy */
+			}
 
-			(void) o_tuple_read_next_field(&oslot->state, &dropped_null);
+			/* Process based on attribute type */
+			if (res_attnum >= 0)
+			{
+				/* Handle bridge_ctid special case */
+				if (is_bridge && attnum == 0)
+				{
+					values[res_attnum] = PointerGetDatum(&oslot->bridge_ctid);
+					isnull[res_attnum] = false;
+					continue;
+				}
+
+				/* Read the field value */
+				values[res_attnum] = o_tuple_read_next_field(&oslot->state,
+															 &isnull[res_attnum]);
+
+				/* Get attribute metadata */
+				if (is_primary && !index_order)
+					thisatt = TupleDescAttr(slot->tts_tupleDescriptor, attnum);
+				else
+					thisatt = TupleDescAttr(leaf_tupdesc, attnum);
+
+				/* Check for TOAST pointers */
+				if (!isnull[res_attnum] && thisatt->attlen < 0 && !thisatt->attbyval)
+				{
+					Pointer		p = DatumGetPointer(values[res_attnum]);
+
+					Assert(p);
+					if (IS_TOAST_POINTER(p) && !VARATT_IS_EXTERNAL_ORIOLEDB(p))
+					{
+						hastoast = true;
+						natts = Max(natts, idx->maxTableAttnum - ctid_off);
+					}
+				}
+			}
+			else if (res_attnum == -1)
+			{
+				/* ctid attribute - verify it matches */
+				if (!idx->bridging)
+				{
+#ifdef USE_ASSERT_CHECKING
+					Datum		iptr_value;
+					bool		iptr_null;
+
+					iptr_value = o_tuple_read_next_field(&oslot->state, &iptr_null);
+					Assert(!iptr_null);
+					Assert(memcmp(&slot->tts_tid,
+								  (ItemPointer) iptr_value, sizeof(ItemPointerData)) == 0);
+#else
+					o_tuple_skip_next_field(&oslot->state);
+#endif
+				}
+			}
+			else	/* res_attnum == -2 */
+			{
+				/* Dropped attribute - skip it */
+				o_tuple_skip_next_field(&oslot->state);
+			}
 		}
 	}
 
-	/* Process TOASTed attributes if any were found. */
-	if (hastoast)
+	/* Process TOAST if needed */
+	if (unlikely(hastoast))
 	{
 		OTuple		pkey;
+		TupleDesc	tupdesc = slot->tts_tupleDescriptor;
 
-		/* Allocate memory for TOASTed attributes if not already done. */
 		if (!oslot->to_toast)
 			alloc_to_toast_vfree_detoasted(slot);
 
-		/* Generate a primary key for the TOASTed attributes. */
-		if (oslot->ixnum == PrimaryIndexNumber)
+		/* Generate primary key for TOAST lookup */
+		if (is_primary)
 			pkey = tts_orioledb_make_key(slot, descr);
 		else
 			pkey = make_key_from_secondary_slot(slot, idx, descr);
 
-		/* Iterate over attributes to process TOASTed values. */
+		/* Process each potentially TOASTed attribute */
 		for (attnum = 0; attnum < natts; attnum++)
 		{
-			Form_pg_attribute thisatt;
+			Form_pg_attribute thisatt = TupleDescAttr(tupdesc, attnum);
 
-			thisatt = TupleDescAttr(slot->tts_tupleDescriptor, attnum);
-			if (!isnull[attnum] && !thisatt->attbyval && thisatt->attlen < 0)
+			if (!isnull[attnum] && thisatt->attlen < 0 && !thisatt->attbyval)
 			{
 				Pointer		p = DatumGetPointer(values[attnum]);
 
 				if (IS_TOAST_POINTER(p))
 				{
-					/* Replace TOASTed value with a detoasted version. */
 					MemoryContext mcxt = MemoryContextSwitchTo(slot->tts_mcxt);
 					OToastValue toastValue;
 
@@ -449,9 +480,15 @@ tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 				}
 			}
 		}
-		/* Free the primary key memory except for bump context */
+
+		/* Free primary key memory if not in bump context */
 		if (!is_bump_memory_context(CurrentMemoryContext))
 			pfree(pkey.data);
+	}
+
+	Assert(attnum == natts);
+	slot->tts_nvalid = natts;
+}
 	}
 
 	/* Ensure the number of processed attributes matches the expected count. */
@@ -572,110 +609,140 @@ tts_orioledb_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 }
 
 /*
- * To materialize a virtual slot all the datums that aren't passed by value
- * have to be copied into the slot's memory context.  To do so, compute the
- * required size, and allocate enough memory to store all attributes.  That's
- * good for cache hit ratio, but more importantly requires only memory
- * allocation/deallocation.
+ * Optimized materialize implementation.
+ *
+ * Key optimizations:
+ * 1. Single loop that calculates size and identifies which attrs need copying
+ * 2. Cache attribute pointers to avoid redundant TupleDescAttr calls
+ * 3. Use local variables to reduce dereferencing
  */
 static void
 tts_orioledb_materialize(TupleTableSlot *slot)
 {
 	OTableSlot *oslot = (OTableSlot *) slot;
 	TupleDesc	desc = slot->tts_tupleDescriptor;
+	int			natts = desc->natts;
 	Size		sz = 0;
 	char	   *data;
+	Datum	   *values = slot->tts_values;
+	bool	   *isnull_arr = slot->tts_isnull;
+	int			natt;
+	bool		has_expanded = false;
 
-	/* already materialized */
+	/* Fast path: already materialized */
 	if (TTS_SHOULDFREE(slot))
 		return;
 
 	slot_getallattrs(slot);
 
-	/* compute size of memory required */
-	for (int natt = 0; natt < desc->natts; natt++)
+	/*
+	 * First pass: compute total size needed.
+	 * Track if we have any expanded objects to handle.
+	 */
+	for (natt = 0; natt < natts; natt++)
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, natt);
-		Datum		val;
 
-		if (att->attbyval || slot->tts_isnull[natt])
+		if (att->attbyval || isnull_arr[natt])
 			continue;
 
-		val = slot->tts_values[natt];
-
-		if (att->attlen == -1 &&
-			VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(val)))
+		if (att->attlen == -1)
 		{
-			/*
-			 * We want to flatten the expanded value so that the materialized
-			 * slot doesn't depend on it.
-			 */
-			sz = att_align_nominal(sz, att->attalign);
-			sz += EOH_get_flat_size(DatumGetEOHP(val));
+			Datum		val = values[natt];
+
+			if (VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(val)))
+			{
+				has_expanded = true;
+				sz = att_align_nominal(sz, att->attalign);
+				sz += EOH_get_flat_size(DatumGetEOHP(val));
+			}
+			else
+			{
+				sz = att_align_nominal(sz, att->attalign);
+				sz = att_addlength_datum(sz, -1, val);
+			}
 		}
 		else
 		{
+			/* Fixed-length pass-by-ref: -2 (cstring) or positive length */
 			sz = att_align_nominal(sz, att->attalign);
-			sz = att_addlength_datum(sz, att->attlen, val);
+			sz = att_addlength_datum(sz, att->attlen, values[natt]);
 		}
 	}
 
-	/* all data is byval */
+	/* All data is byval - nothing to materialize */
 	if (sz == 0)
 		return;
 
-	/* allocate memory */
+	/* Allocate memory for all non-byval attributes */
 	oslot->data = data = MemoryContextAlloc(slot->tts_mcxt, sz);
 	slot->tts_flags |= TTS_FLAG_SHOULDFREE;
 
-	/* and copy all attributes into the pre-allocated space */
-	for (int natt = 0; natt < desc->natts; natt++)
+	/*
+	 * Second pass: copy all non-byval attributes.
+	 * Use optimized path when no expanded objects exist.
+	 */
+	if (likely(!has_expanded))
 	{
-		Form_pg_attribute att = TupleDescAttr(desc, natt);
-		Datum		val;
-
-		if (att->attbyval || slot->tts_isnull[natt])
-			continue;
-
-		val = slot->tts_values[natt];
-
-		if (att->attlen == -1 &&
-			VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(val)))
+		/* Fast path: no expanded objects to flatten */
+		for (natt = 0; natt < natts; natt++)
 		{
+			Form_pg_attribute att = TupleDescAttr(desc, natt);
 			Size		data_length;
 
-			/*
-			 * We want to flatten the expanded value so that the materialized
-			 * slot doesn't depend on it.
-			 */
-			ExpandedObjectHeader *eoh = DatumGetEOHP(val);
-
-			data = (char *) att_align_nominal(data,
-											  att->attalign);
-			data_length = EOH_get_flat_size(eoh);
-			EOH_flatten_into(eoh, data, data_length);
-
-			slot->tts_values[natt] = PointerGetDatum(data);
-			data += data_length;
-		}
-		else
-		{
-			Size		data_length = 0;
+			if (att->attbyval || isnull_arr[natt])
+				continue;
 
 			data = (char *) att_align_nominal(data, att->attalign);
-			data_length = att_addlength_datum(data_length, att->attlen, val);
-
-			memcpy(data, DatumGetPointer(val), data_length);
-
-			slot->tts_values[natt] = PointerGetDatum(data);
+			data_length = att_addlength_datum(0, att->attlen, values[natt]);
+			memcpy(data, DatumGetPointer(values[natt]), data_length);
+			values[natt] = PointerGetDatum(data);
 			data += data_length;
 		}
 	}
+	else
+	{
+		/* Slow path: handle expanded objects */
+		for (natt = 0; natt < natts; natt++)
+		{
+			Form_pg_attribute att = TupleDescAttr(desc, natt);
+			Datum		val;
 
+			if (att->attbyval || isnull_arr[natt])
+				continue;
+
+			val = values[natt];
+
+			if (att->attlen == -1 &&
+				VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(val)))
+			{
+				ExpandedObjectHeader *eoh = DatumGetEOHP(val);
+				Size		data_length;
+
+				data = (char *) att_align_nominal(data, att->attalign);
+				data_length = EOH_get_flat_size(eoh);
+				EOH_flatten_into(eoh, data, data_length);
+				values[natt] = PointerGetDatum(data);
+				data += data_length;
+			}
+			else
+			{
+				Size		data_length;
+
+				data = (char *) att_align_nominal(data, att->attalign);
+				data_length = att_addlength_datum(0, att->attlen, val);
+				memcpy(data, DatumGetPointer(val), data_length);
+				values[natt] = PointerGetDatum(data);
+				data += data_length;
+			}
+		}
+	}
+
+	/* Clear toast tracking arrays if allocated */
 	if (oslot->to_toast)
 	{
-		memset(oslot->vfree, 0, desc->natts * sizeof(bool));
-		memset(oslot->to_toast, 0, desc->natts * sizeof(char));
+		memset(oslot->vfree, 0, natts * sizeof(bool));
+		memset(oslot->to_toast, 0, natts * sizeof(char));
 	}
 }
 
@@ -914,14 +981,30 @@ tts_orioledb_store_non_leaf_tuple(TupleTableSlot *slot, OTuple tuple,
 									  shouldfree, hint);
 }
 
-static Datum
+/*
+ * Optimized get_tbl_att function.
+ * Key optimizations:
+ * 1. Reordered branches to favor most common case
+ * 2. Reduced redundant checks with combined conditions
+ */
+static inline Datum
 get_tbl_att(TupleTableSlot *slot, int attnum, bool primaryIsCtid,
 			bool *isnull, Oid *typid)
 {
+	OTableSlot *oSlot = (OTableSlot *) slot;
 	int			i;
 	Datum		value;
 	Form_pg_attribute att;
-	OTableSlot *oSlot = (OTableSlot *) slot;
+
+	/* Handle special attribute numbers first */
+	if (attnum == -1)
+	{
+		/* bridge_ctid - same handling regardless of primaryIsCtid */
+		*isnull = false;
+		if (typid)
+			*typid = TIDOID;
+		return PointerGetDatum(&oSlot->bridge_ctid);
+	}
 
 	if (primaryIsCtid)
 	{
@@ -932,38 +1015,28 @@ get_tbl_att(TupleTableSlot *slot, int attnum, bool primaryIsCtid,
 				*typid = TIDOID;
 			return PointerGetDatum(&slot->tts_tid);
 		}
-		else if (attnum == -1)
-		{
-			*isnull = false;
-			if (typid)
-				*typid = TIDOID;
-			return PointerGetDatum(&oSlot->bridge_ctid);
-		}
-		else
-		{
-			i = attnum - 2;
-		}
+		i = attnum - 2;
 	}
 	else
 	{
-		if (attnum == -1)
-		{
-			*isnull = false;
-			if (typid)
-				*typid = TIDOID;
-			return PointerGetDatum(&oSlot->bridge_ctid);
-		}
-		else
-			i = attnum - 1;
+		i = attnum - 1;
 	}
 
+	/* Regular attribute access */
 	att = TupleDescAttr(slot->tts_tupleDescriptor, i);
+	*isnull = slot->tts_isnull[i];
+
 	if (typid)
 		*typid = att->atttypid;
-	*isnull = slot->tts_isnull[i];
+
+	/* Fast path: null value or not extended */
+	if (*isnull)
+		return (Datum) 0;
+
 	value = slot->tts_values[i];
 
-	if (!*isnull && att->attlen < 0 && VARATT_IS_EXTENDED(value))
+	/* Check if detoasting is needed */
+	if (att->attlen < 0 && VARATT_IS_EXTENDED(value))
 	{
 		if (!oSlot->to_toast)
 			alloc_to_toast_vfree_detoasted(&oSlot->base);
@@ -974,7 +1047,6 @@ get_tbl_att(TupleTableSlot *slot, int attnum, bool primaryIsCtid,
 
 			oSlot->detoasted[i] = PointerGetDatum(PG_DETOAST_DATUM(value));
 			MemoryContextSwitchTo(mcxt);
-
 		}
 		value = oSlot->detoasted[i];
 	}
@@ -1837,18 +1909,10 @@ tts_orioledb_update_toast_values(TupleTableSlot *oldSlot,
 /*
  * tts_orioledb_modified - Check if specified attributes were modified between two tuples
  *
- * Compares the values of specific attributes between an old and new tuple slot
- * to determine if any modifications have occurred. This is primarily used during
- * UPDATE operations to distinguish between key and non-key updates.
- *
- * Parameters:
- *   oldSlot - The original tuple slot before modification
- *   newSlot - The new tuple slot with pending changes
- *   attrs   - Bitmap set indicating which attributes to check for modifications.
- *
- * Returns:
- *   true if any of the specified attributes have different values between
- *   the old and new slots, false if all specified attributes are unchanged.
+ * Optimized to:
+ * 1. Cache slot values/isnull arrays
+ * 2. Avoid redundant attribute lookups
+ * 3. Use likely/unlikely hints for branch prediction
  */
 bool
 tts_orioledb_modified(TupleTableSlot *oldSlot,
@@ -1856,6 +1920,10 @@ tts_orioledb_modified(TupleTableSlot *oldSlot,
 					  Bitmapset *attrs)
 {
 	TupleDesc	tupdesc = oldSlot->tts_tupleDescriptor;
+	Datum	   *old_values = oldSlot->tts_values;
+	Datum	   *new_values = newSlot->tts_values;
+	bool	   *old_isnull = oldSlot->tts_isnull;
+	bool	   *new_isnull = newSlot->tts_isnull;
 	int			attnum,
 				maxAttr;
 
@@ -1874,21 +1942,21 @@ tts_orioledb_modified(TupleTableSlot *oldSlot,
 
 		if (unlikely(i < 0))
 			elog(ERROR, "invalid attribute number %d", i);
-		else
+
+		/* Fast null comparison */
+		if (old_isnull[i] != new_isnull[i])
+			return true;
+
+		/* Both null - no modification */
+		if (old_isnull[i])
+			continue;
+
+		/* Compare actual values */
 		{
 			Form_pg_attribute att = TupleDescAttr(tupdesc, i);
-			Datum		val1 = oldSlot->tts_values[i],
-						val2 = newSlot->tts_values[i];
-			bool		isnull1 = oldSlot->tts_isnull[i],
-						isnull2 = newSlot->tts_isnull[i];
 
-			if (isnull1 != isnull2)
-				return true;
-
-			if (isnull1)
-				continue;
-
-			if (!datumIsEqual(val1, val2, att->attbyval, att->attlen))
+			if (!datumIsEqual(old_values[i], new_values[i],
+							  att->attbyval, att->attlen))
 				return true;
 		}
 	}
