@@ -905,33 +905,31 @@ tts_orioledb_store_tuple_internal(TupleTableSlot *slot, OTuple tuple,
 								  BTreeLocationHint *hint)
 {
 	OTableSlot *oslot = (OTableSlot *) slot;
+	OIndexDescr *idx;
 
 	Assert(COMMITSEQNO_IS_NORMAL(csn) || COMMITSEQNO_IS_INPROGRESS(csn));
 	Assert(slot->tts_ops == &TTSOpsOrioleDB);
 
 	/*
 	 * Fastpath: If the slot is already empty and doesn't need freeing, skip
-	 * the expensive tts_orioledb_clear call. This is the common case when
-	 * iterating through tuples.
+	 * the expensive tts_orioledb_clear call entirely. This is the common case
+	 * when iterating through tuples.
 	 */
 	if (likely(TTS_EMPTY(slot) && !TTS_SHOULDFREE(slot) && !oslot->to_toast))
 	{
-		/* Slot is already clean, just reset minimal state */
-		oslot->data = NULL;
-		O_TUPLE_SET_NULL(oslot->tuple);
-		oslot->descr = NULL;
-		oslot->hint.blkno = OInvalidInMemoryBlkno;
-		oslot->hint.pageChangeCount = 0;
+		/*
+		 * Slot is already clean. We don't need to reset data/tuple/descr/hint
+		 * since we're about to overwrite them anyway. Just clear the empty flag.
+		 */
+		slot->tts_flags &= ~TTS_FLAG_EMPTY;
 	}
 	else
 	{
 		tts_orioledb_clear(slot);
+		slot->tts_flags &= ~TTS_FLAG_EMPTY;
 	}
 
 	Assert(!TTS_SHOULDFREE(slot));
-	Assert(TTS_EMPTY(slot));
-
-	slot->tts_flags &= ~TTS_FLAG_EMPTY;
 	slot->tts_nvalid = 0;
 
 	oslot->tuple = tuple;
@@ -943,8 +941,70 @@ tts_orioledb_store_tuple_internal(TupleTableSlot *slot, OTuple tuple,
 
 	if (hint)
 		oslot->hint = *hint;
+	else
+	{
+		oslot->hint.blkno = OInvalidInMemoryBlkno;
+		oslot->hint.pageChangeCount = 0;
+	}
 
-	tts_orioledb_init_reader(slot);
+	/*
+	 * Get the index descriptor. For the common case of primary index leaf
+	 * tuples without ctid/bridging, we inline the fast path of
+	 * tts_orioledb_init_reader to avoid function call overhead and
+	 * unnecessary conditionals.
+	 */
+	if (ixnum == BridgeIndexNumber)
+		idx = descr->bridge;
+	else
+		idx = descr->indices[ixnum];
+
+	/*
+	 * Fast path for common case: primary index leaf tuples without
+	 * primaryIsCtid and bridging. This covers most normal table scans.
+	 */
+	if (likely(leafTuple && !idx->primaryIsCtid && !idx->bridging))
+	{
+		/* Inline o_tuple_init_reader for leaf tuples */
+		Pointer		data = tuple.data;
+
+		if (tuple.formatFlags & O_TUPLE_FLAGS_FIXED_FORMAT)
+		{
+			oslot->state.bp = NULL;
+			oslot->state.tp = (char *) data;
+			oslot->state.hasnulls = false;
+			oslot->state.natts = idx->leafSpec.natts;
+		}
+		else
+		{
+			OTupleHeader header = (OTupleHeader) data;
+
+			if (header->hasnulls)
+			{
+				oslot->state.bp = (bits8 *) (data + SizeOfOTupleHeader);
+				oslot->state.tp = (char *) (data + SizeOfOTupleHeader + MAXALIGN(BITMAPLEN(header->natts)));
+				oslot->state.hasnulls = true;
+				oslot->state.natts = header->natts;
+			}
+			else
+			{
+				oslot->state.bp = NULL;
+				oslot->state.tp = (char *) (data + SizeOfOTupleHeader);
+				oslot->state.hasnulls = false;
+				oslot->state.natts = header->natts;
+			}
+		}
+		oslot->state.off = 0;
+		oslot->state.attnum = 0;
+		oslot->state.desc = idx->leafTupdesc;
+		oslot->state.slow = false;
+
+		slot->tts_tableOid = descr->oids.reloid;
+	}
+	else
+	{
+		/* Slow path: use full tts_orioledb_init_reader for complex cases */
+		tts_orioledb_init_reader(slot);
+	}
 
 	if (shouldfree)
 		slot->tts_flags |= TTS_FLAG_SHOULDFREE;
