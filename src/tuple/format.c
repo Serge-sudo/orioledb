@@ -64,121 +64,158 @@ o_tuple_init_reader(OTupleReaderState *state, OTuple tuple, TupleDesc desc,
 	state->slow = false;
 }
 
+/*
+ * Optimized version of o_tuple_next_field_offset.
+ * Key optimizations:
+ * 1. Reorder branches to favor the most common case (cached offset with fixed-length)
+ * 2. Use likely/unlikely hints for branch prediction
+ * 3. Combine conditions to reduce branching
+ */
 uint32
 o_tuple_next_field_offset(OTupleReaderState *state, Form_pg_attribute att)
 {
 	uint32		off;
+	int16		attlen = att->attlen;
+	bool		slow = state->slow;
 
-	if (!state->slow && att->attcacheoff >= 0)
+	/* Fast path: cached offset available */
+	if (likely(!slow && att->attcacheoff >= 0))
 	{
-		state->off = att->attcacheoff;
+		off = att->attcacheoff;
+		state->off = off;
 	}
-	else if (att->attlen == -1)
+	else if (attlen == -1)
 	{
-		if (!state->slow &&
-			state->off == att_align_nominal(state->off, att->attalign))
+		/* Variable-length attribute */
+		uint32		aligned_off = att_align_nominal(state->off, att->attalign);
+
+		if (!slow && state->off == aligned_off)
 		{
 			att->attcacheoff = state->off;
+			off = state->off;
 		}
 		else
 		{
-			state->off = att_align_pointer(state->off, att->attalign, -1,
-										   state->tp + state->off);
+			off = att_align_pointer(state->off, att->attalign, -1,
+									state->tp + state->off);
+			state->off = off;
 			state->slow = true;
 		}
 	}
 	else
 	{
-		state->off = att_align_nominal(state->off, att->attalign);
-		if (!state->slow)
-			att->attcacheoff = state->off;
+		/* Fixed-length attribute */
+		off = att_align_nominal(state->off, att->attalign);
+		state->off = off;
+		if (!slow)
+			att->attcacheoff = off;
 	}
 
-	off = state->off;
-
-	if (!att->attbyval && att->attlen < 0 &&
-		IS_TOAST_POINTER(state->tp + state->off))
+	/* Update offset for next field */
+	if (attlen > 0)
 	{
-		state->off += sizeof(OToastValue);
+		/* Fixed-length: fastest path */
+		state->off = off + attlen;
+	}
+	else if (attlen == -1)
+	{
+		/* Check for TOAST pointer */
+		if (!att->attbyval && IS_TOAST_POINTER(state->tp + off))
+		{
+			state->off = off + sizeof(OToastValue);
+		}
+		else
+		{
+			state->off = att_addlength_pointer(off, attlen, state->tp + off);
+		}
+		state->slow = true;
 	}
 	else
 	{
-		state->off = att_addlength_pointer(state->off,
-										   att->attlen,
-										   state->tp + state->off);
+		/* attlen == -2 (cstring) */
+		state->off = att_addlength_pointer(off, attlen, state->tp + off);
+		state->slow = true;
 	}
 
-	if (att->attlen <= 0)
-		state->slow = true;
-
 	state->attnum++;
-
 	return off;
 }
 
+/*
+ * Optimized version of o_tuple_read_next_field.
+ * Key optimizations:
+ * 1. Use likely/unlikely hints for branch prediction
+ * 2. Early exit for the most common case
+ * 3. Reduce redundant attribute lookups
+ */
 Datum
 o_tuple_read_next_field(OTupleReaderState *state, bool *isnull)
 {
 	Form_pg_attribute att;
-	Datum		result;
 	uint32		off;
+	uint16		attnum = state->attnum;
 
-	if (state->attnum >= state->natts)
+	/* Most common path: reading regular attributes */
+	if (likely(attnum < state->natts))
 	{
-		Form_pg_attribute attr = &state->desc->attrs[state->attnum];
+		att = TupleDescAttr(state->desc, attnum);
 
-		if (attr->atthasmissing)
-		{
-			result = getmissingattr(state->desc,
-									state->attnum + 1,
-									isnull);
-			state->attnum++;
-			return result;
-		}
-		else
+		/* Check for NULL value */
+		if (unlikely(state->hasnulls && att_isnull(attnum, state->bp)))
 		{
 			*isnull = true;
-			state->attnum++;
+			state->slow = true;
+			state->attnum = attnum + 1;
 			return (Datum) 0;
 		}
+
+		*isnull = false;
+		off = o_tuple_next_field_offset(state, att);
+		return fetchatt(att, state->tp + off);
 	}
 
-	att = TupleDescAttr(state->desc, state->attnum);
+	/* Handle attributes beyond stored count (missing attributes) */
+	att = &state->desc->attrs[attnum];
 
-	if (state->hasnulls && att_isnull(state->attnum, state->bp))
+	if (att->atthasmissing)
+	{
+		Datum		result;
+
+		result = getmissingattr(state->desc, attnum + 1, isnull);
+		state->attnum = attnum + 1;
+		return result;
+	}
+	else
 	{
 		*isnull = true;
-		state->slow = true;
-		state->attnum++;
+		state->attnum = attnum + 1;
 		return (Datum) 0;
 	}
-
-	*isnull = false;
-	off = o_tuple_next_field_offset(state, att);
-
-	return fetchatt(att, state->tp + off);
 }
 
+/*
+ * Optimized pointer-returning variant.
+ */
 static Pointer
 o_tuple_read_next_field_ptr(OTupleReaderState *state)
 {
 	Form_pg_attribute att;
 	uint32		off;
+	uint16		attnum = state->attnum;
 
-	if (state->attnum >= state->natts)
+	if (unlikely(attnum >= state->natts))
 		return NULL;
 
-	att = TupleDescAttr(state->desc, state->attnum);
+	att = TupleDescAttr(state->desc, attnum);
 
-	if (state->hasnulls && att_isnull(state->attnum, state->bp))
+	if (unlikely(state->hasnulls && att_isnull(attnum, state->bp)))
 	{
 		state->slow = true;
-		state->attnum++;
+		state->attnum = attnum + 1;
 		return NULL;
 	}
 
 	off = o_tuple_next_field_offset(state, att);
-
 	return state->tp + off;
 }
 
