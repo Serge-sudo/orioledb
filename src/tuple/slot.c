@@ -105,12 +105,11 @@ tts_orioledb_clear(TupleTableSlot *slot)
 				detoasted[i] = (Datum) 0;
 			}
 			if (vfree[i])
-			{
 				pfree(DatumGetPointer(values[i]));
-				vfree[i] = false;
-			}
 		}
-		memset(oslot->to_toast, ORIOLEDB_TO_TOAST_OFF, natts * sizeof(char));
+		/* Reset tracking arrays */
+		memset(vfree, 0, natts * sizeof(bool));
+		memset(oslot->to_toast, ORIOLEDB_TO_TOAST_OFF, natts * sizeof(bool));
 	}
 
 	/* Reset slot state - these are cheap assignments */
@@ -487,14 +486,6 @@ tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 	}
 
 	Assert(attnum == natts);
-	slot->tts_nvalid = natts;
-}
-	}
-
-	/* Ensure the number of processed attributes matches the expected count. */
-	Assert(attnum == natts);
-
-	/* Update the slot's valid attribute count. */
 	slot->tts_nvalid = natts;
 }
 
