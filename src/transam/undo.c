@@ -175,6 +175,10 @@ bool		oxid_needs_wal_flush = false;
 /*
  * Set to true when we detect page version 1 during page reads.
  * Used to zero out itemSizeHi in undo records from old clusters.
+ * 
+ * This flag is only ever changed from false to true (never back to false),
+ * making concurrent writes safe. Once set, it remains true for the lifetime
+ * of the process, indicating this is an old cluster.
  */
 bool		undo_compat_mode_v1 = false;
 
