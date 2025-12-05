@@ -104,6 +104,25 @@ check_checkpoint_control(CheckpointControl *control)
 						   " but the extension is configured with S3 mode %s.",
 						   control->s3Mode ? "on" : "off",
 						   orioledb_s3_mode ? "on" : "off")));
+
+	/*
+	 * pageVersion field was added in version 2. If it's 0, this is an old
+	 * control file from version 1, so set it accordingly for compatibility.
+	 */
+	if (control->pageVersion == 0)
+		control->pageVersion = 1;
+
+	if (control->pageVersion > ORIOLEDB_PAGE_VERSION)
+		ereport(FATAL,
+				(errmsg("database files are incompatible with server"),
+				 errdetail("OrioleDB cluster has page version %u,"
+						   " but the extension supports up to page version %u.",
+						   control->pageVersion, ORIOLEDB_PAGE_VERSION),
+				 errhint("It looks like you need to upgrade the extension.")));
+
+	if (control->pageVersion < ORIOLEDB_PAGE_VERSION)
+		elog(LOG, "OrioleDB cluster page version %u will be converted to %u on-the-fly",
+			 control->pageVersion, ORIOLEDB_PAGE_VERSION);
 }
 
 /*

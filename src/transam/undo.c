@@ -172,6 +172,9 @@ UndoLocation curRetainUndoLocations[(int) UndoLogsCount] =
 };
 bool		oxid_needs_wal_flush = false;
 
+/* Page version of the cluster, used for undo record compatibility */
+static uint32 cluster_page_version = ORIOLEDB_PAGE_VERSION;
+
 static Size reserved_undo_sizes[(int) UndoLogsCount] =
 {
 	0
@@ -314,6 +317,12 @@ get_undo_meta_by_type(UndoLogType undoType)
 	Assert(index >= 0 && index < (int) UndoLogsCount);
 
 	return &undo_metas[index];
+}
+
+void
+set_cluster_page_version(uint32 version)
+{
+	cluster_page_version = version;
 }
 
 void
@@ -699,6 +708,13 @@ undo_item_buf_read_item(UndoItemBuf *buf,
 
 	ASAN_UNPOISON_MEMORY_REGION(buf->data, buf->length);
 	undo_read(undoType, location, sizeof(UndoStackItem), buf->data);
+
+	/*
+	 * For clusters with page version 1, itemSizeHi field was part of
+	 * padding and may contain garbage. Zero it out for compatibility.
+	 */
+	if (cluster_page_version < 2)
+		((UndoStackItem *) buf->data)->itemSizeHi = 0;
 
 	itemSize = UNDO_GET_ITEM_SIZE(((UndoStackItem *) buf->data));
 	if (itemSize > buf->length)
