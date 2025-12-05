@@ -172,7 +172,11 @@ UndoLocation curRetainUndoLocations[(int) UndoLogsCount] =
 };
 bool		oxid_needs_wal_flush = false;
 
-/* Page version of the cluster, used for undo record compatibility */
+/*
+ * Page version of the cluster, used for undo record compatibility.
+ * This is set once during postmaster startup (in checkpoint_shmem_init)
+ * and never modified afterwards, so no synchronization is needed.
+ */
 static uint32 cluster_page_version = ORIOLEDB_PAGE_VERSION;
 
 static Size reserved_undo_sizes[(int) UndoLogsCount] =
