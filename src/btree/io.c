@@ -34,7 +34,6 @@
 #include "s3/worker.h"
 #include "tableam/descr.h"
 #include "tableam/handler.h"
-#include "transam/undo.h"
 #include "utils/compress.h"
 #include "utils/elog.h"
 #include "utils/page_pool.h"
@@ -1192,13 +1191,12 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 			if (page_version != ORIOLEDB_PAGE_VERSION)
 			{
 				/*
-				 * Version 1 pages are from before itemSizeHi was added.
-				 * Set compat mode flag to zero itemSizeHi in undo records.
+				 * Now we have only one page version (1). When we have
+				 * different versions we'll need to bump ORIOLEDB_PAGE_VERSION
+				 * and add on-the-fly conversion function from all previous
+				 * page versions in this place
 				 */
-				if (page_version == 1)
-					undo_compat_mode_v1 = true;
-				else
-					elog(FATAL, "Page version %u of OrioleDB cluster is not supported (expected %u or 1)", page_version, ORIOLEDB_PAGE_VERSION);
+				elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", page_version, ORIOLEDB_PAGE_VERSION);
 			}
 		}
 	}
@@ -1232,13 +1230,13 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 				if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION)
 				{
 					/*
-					 * Version 1 pages are from before itemSizeHi was added.
-					 * Set compat mode flag to zero itemSizeHi in undo records.
+					 * Now we have only one page version (1). When we have
+					 * different versions we'll need to bump
+					 * ORIOLEDB_PAGE_VERSION and add on-the-fly conversion
+					 * function from all previous page versions after
+					 * decompression.
 					 */
-					if (ondisk_page_header.page_version == 1)
-						undo_compat_mode_v1 = true;
-					else
-						elog(FATAL, "Page version %u of OrioleDB cluster is not supported (expected %u or 1)", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+					elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
 				}
 
 				if (ondisk_page_header.compress_version != ORIOLEDB_COMPRESS_VERSION)
@@ -1281,13 +1279,12 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 					if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION)
 					{
 						/*
-						 * Version 1 pages are from before itemSizeHi was added.
-						 * Set compat mode flag to zero itemSizeHi in undo records.
+						 * Now we have only one page version (1). When we have
+						 * different versions we'll need to bump
+						 * ORIOLEDB_PAGE_VERSION and add on-the-fly conversion
+						 * function from all previous page versions here
 						 */
-						if (ondisk_page_header.page_version == 1)
-							undo_compat_mode_v1 = true;
-						else
-							elog(FATAL, "Page version %u of OrioleDB cluster is not supported (expected %u or 1)", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+						elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
 					}
 				}
 				btree_page_header = (BTreePageHeader *) img;

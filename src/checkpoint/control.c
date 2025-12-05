@@ -104,6 +104,25 @@ check_checkpoint_control(CheckpointControl *control)
 						   " but the extension is configured with S3 mode %s.",
 						   control->s3Mode ? "on" : "off",
 						   orioledb_s3_mode ? "on" : "off")));
+
+	/*
+	 * undoVersion field was added in version 2. If it's 0, this is an old
+	 * control file from version 1, so set it accordingly for compatibility.
+	 */
+	if (control->undoVersion == 0)
+		control->undoVersion = 1;
+
+	if (control->undoVersion > ORIOLEDB_UNDO_VERSION)
+		ereport(FATAL,
+				(errmsg("database files are incompatible with server"),
+				 errdetail("OrioleDB cluster has undo version %u,"
+						   " but the extension supports up to undo version %u.",
+						   control->undoVersion, ORIOLEDB_UNDO_VERSION),
+				 errhint("It looks like you need to upgrade the extension.")));
+
+	if (control->undoVersion < ORIOLEDB_UNDO_VERSION)
+		elog(LOG, "OrioleDB cluster undo version %u will be converted to %u on-the-fly",
+			 control->undoVersion, ORIOLEDB_UNDO_VERSION);
 }
 
 /*

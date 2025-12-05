@@ -173,14 +173,11 @@ UndoLocation curRetainUndoLocations[(int) UndoLogsCount] =
 bool		oxid_needs_wal_flush = false;
 
 /*
- * Set to true when we detect page version 1 during page reads.
- * Used to zero out itemSizeHi in undo records from old clusters.
- * 
- * This flag is only ever changed from false to true (never back to false),
- * making concurrent writes safe. Once set, it remains true for the lifetime
- * of the process, indicating this is an old cluster.
+ * Undo log format version from checkpoint control.
+ * Used to handle compatibility with old undo record formats.
+ * Initialized to current version, updated when loading checkpoint.
  */
-bool		undo_compat_mode_v1 = false;
+static uint32 cluster_undo_version = ORIOLEDB_UNDO_VERSION;
 
 static Size reserved_undo_sizes[(int) UndoLogsCount] =
 {
@@ -324,6 +321,12 @@ get_undo_meta_by_type(UndoLogType undoType)
 	Assert(index >= 0 && index < (int) UndoLogsCount);
 
 	return &undo_metas[index];
+}
+
+void
+set_cluster_undo_version(uint32 version)
+{
+	cluster_undo_version = version;
 }
 
 void
@@ -711,10 +714,10 @@ undo_item_buf_read_item(UndoItemBuf *buf,
 	undo_read(undoType, location, sizeof(UndoStackItem), buf->data);
 
 	/*
-	 * For page version 1 clusters, itemSizeHi field was padding and may
-	 * contain garbage. Zero it out for compatibility.
+	 * For undo version 1, itemSizeHi field was padding and may contain
+	 * garbage. Zero it out for compatibility.
 	 */
-	if (undo_compat_mode_v1)
+	if (cluster_undo_version < 2)
 		((UndoStackItem *) buf->data)->itemSizeHi = 0;
 
 	itemSize = UNDO_GET_ITEM_SIZE(((UndoStackItem *) buf->data));

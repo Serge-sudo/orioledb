@@ -324,6 +324,9 @@ checkpoint_shmem_init(Pointer ptr, bool found)
 		if (!get_checkpoint_control_data(&control))
 			return;
 
+		/* Set the cluster undo version for undo record compatibility */
+		set_cluster_undo_version(control.undoVersion);
+
 		checkpoint_state->controlIdentifier = control.controlIdentifier;
 		checkpoint_state->lastCheckpointNumber = control.lastCheckpointNumber;
 		checkpoint_state->controlToastConsistentPtr = control.toastConsistentPtr;
@@ -1332,6 +1335,8 @@ o_perform_checkpoint(XLogRecPtr redo_pos, int flags)
 	control.checkpointRetainXmax = checkpoint_xmax;
 	control.binaryVersion = ORIOLEDB_BINARY_VERSION;
 	control.s3Mode = orioledb_s3_mode;
+	/* undoVersion is set after crc field for backward compatibility */
+	control.undoVersion = ORIOLEDB_UNDO_VERSION;
 
 	write_checkpoint_control(&control);
 

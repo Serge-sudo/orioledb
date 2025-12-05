@@ -46,6 +46,11 @@ typedef struct
 	uint32		binaryVersion;
 	bool		s3Mode;
 	pg_crc32c	crc;
+	/*
+	 * undoVersion must be after crc to maintain backward compatibility.
+	 * Old control files will have 0 here, which gets defaulted to version 1.
+	 */
+	uint32		undoVersion;
 } CheckpointControl;
 
 #define CONTROL_FILENAME    ORIOLEDB_DATA_DIR"/control"
