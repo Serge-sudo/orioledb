@@ -48,7 +48,11 @@ typedef struct
 	pg_crc32c	crc;
 	/*
 	 * undoVersion is placed in the padding area after crc.
-	 * Old control files have this zeroed (version 0), new files have version 1.
+	 * The padding area is the space between sizeof(CheckpointControl) and
+	 * CHECKPOINT_CONTROL_FILE_SIZE (8192 bytes), which is explicitly zeroed
+	 * in write_checkpoint_control() before writing to disk.
+	 * Old control files have undoVersion=0 (from zeroed padding).
+	 * New control files have undoVersion=1 (explicitly set).
 	 * This placement ensures backward compatibility without CRC issues.
 	 */
 	uint32		undoVersion;
