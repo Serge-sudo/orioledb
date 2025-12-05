@@ -44,9 +44,9 @@ typedef struct
 	OXid		checkpointRetainXmin;
 	OXid		checkpointRetainXmax;
 	uint32		binaryVersion;
-	uint32		pageVersion;
 	bool		s3Mode;
 	pg_crc32c	crc;
+	uint32		pageVersion;
 } CheckpointControl;
 
 #define CONTROL_FILENAME    ORIOLEDB_DATA_DIR"/control"
