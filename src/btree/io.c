@@ -1163,7 +1163,7 @@ convert_page_version(Pointer img, uint8 from_version, uint8 to_version)
 	if (from_version < to_version)
 	{
 		/* Convert from_version to from_version + 1 */
-		if (from_version == 1 && (from_version + 1) <= to_version)
+		if (from_version == 1)
 		{
 			/*
 			 * Version 1 to 2: The only change was adding itemSizeHi to undo records.
@@ -1174,9 +1174,9 @@ convert_page_version(Pointer img, uint8 from_version, uint8 to_version)
 			header->o_header.page_version = 2;
 		}
 		
-		/* Recursively convert to next version */
-		if (from_version + 1 < to_version)
-			convert_page_version(img, from_version + 1, to_version);
+		/* Recursively convert to next version if needed */
+		if (header->o_header.page_version < to_version)
+			convert_page_version(img, header->o_header.page_version, to_version);
 	}
 	else
 	{
@@ -1276,11 +1276,11 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 				if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION)
 				{
 					/*
-					 * Convert page from old version to current version on-the-fly.
+					 * Conversion will be performed after decompression.
 					 */
 					if (ondisk_page_header.page_version < ORIOLEDB_PAGE_VERSION)
 					{
-						/* Will convert after decompression */
+						/* Conversion happens below after o_decompress_page */
 					}
 					else
 					{
