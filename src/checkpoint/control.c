@@ -106,12 +106,9 @@ check_checkpoint_control(CheckpointControl *control)
 						   orioledb_s3_mode ? "on" : "off")));
 
 	/*
-	 * undoVersion field was added in version 2. If it's 0, this is an old
-	 * control file from version 1, so set it accordingly for compatibility.
+	 * undoVersion field is in padding area after crc. Old clusters have
+	 * undoVersion=0 (from zeroed padding), new clusters have undoVersion=1.
 	 */
-	if (control->undoVersion == 0)
-		control->undoVersion = 1;
-
 	if (control->undoVersion > ORIOLEDB_UNDO_VERSION)
 		ereport(FATAL,
 				(errmsg("database files are incompatible with server"),

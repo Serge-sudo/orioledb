@@ -714,10 +714,10 @@ undo_item_buf_read_item(UndoItemBuf *buf,
 	undo_read(undoType, location, sizeof(UndoStackItem), buf->data);
 
 	/*
-	 * For undo version 1, itemSizeHi field was padding and may contain
-	 * garbage. Zero it out for compatibility.
+	 * For undo version 0 (old clusters), itemSizeHi field was padding and
+	 * may contain garbage. Zero it out for compatibility.
 	 */
-	if (cluster_undo_version < 2)
+	if (cluster_undo_version < 1)
 		((UndoStackItem *) buf->data)->itemSizeHi = 0;
 
 	itemSize = UNDO_GET_ITEM_SIZE(((UndoStackItem *) buf->data));

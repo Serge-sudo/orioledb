@@ -47,8 +47,9 @@ typedef struct
 	bool		s3Mode;
 	pg_crc32c	crc;
 	/*
-	 * undoVersion must be after crc to maintain backward compatibility.
-	 * Old control files will have 0 here, which gets defaulted to version 1.
+	 * undoVersion is placed in the padding area after crc.
+	 * Old control files have this zeroed (version 0), new files have version 1.
+	 * This placement ensures backward compatibility without CRC issues.
 	 */
 	uint32		undoVersion;
 } CheckpointControl;

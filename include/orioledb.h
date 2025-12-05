@@ -75,7 +75,7 @@
 #define ORIOLEDB_PAGE_VERSION	1	/* Version of binary page format */
 #define ORIOLEDB_COMPRESS_VERSION 1 /* Version of page compression (only for
 									 * compressed pages) */
-#define ORIOLEDB_UNDO_VERSION	2	/* Version of undo log format */
+#define ORIOLEDB_UNDO_VERSION	1	/* Version of undo log format */
 
 /*
  * perform_page_split() removes a key data from first right page downlink.
