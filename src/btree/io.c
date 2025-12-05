@@ -34,6 +34,7 @@
 #include "s3/worker.h"
 #include "tableam/descr.h"
 #include "tableam/handler.h"
+#include "transam/undo.h"
 #include "utils/compress.h"
 #include "utils/elog.h"
 #include "utils/page_pool.h"
@@ -1146,6 +1147,45 @@ get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 }
 
 /*
+ * Convert page from old version to current version.
+ * Recursively handles multi-step conversions (e.g., 1->2->3).
+ */
+static void
+convert_page_version(Pointer img, uint8 from_version, uint8 to_version)
+{
+	BTreePageHeader *header = (BTreePageHeader *) img;
+	
+	/* Base case: already at target version */
+	if (from_version == to_version)
+		return;
+	
+	/* Recursive conversion: convert one step at a time */
+	if (from_version < to_version)
+	{
+		/* Convert from_version to from_version + 1 */
+		if (from_version == 1 && (from_version + 1) <= to_version)
+		{
+			/*
+			 * Version 1 to 2: The only change was adding itemSizeHi to undo records.
+			 * Undo records from version 1 clusters have garbage in itemSizeHi field.
+			 * Set global flag so undo reading code knows to zero it.
+			 */
+			have_version1_pages = true;
+			header->o_header.page_version = 2;
+		}
+		
+		/* Recursively convert to next version */
+		if (from_version + 1 < to_version)
+			convert_page_version(img, from_version + 1, to_version);
+	}
+	else
+	{
+		elog(FATAL, "Cannot convert page from version %u to %u (downgrade not supported)",
+			 from_version, to_version);
+	}
+}
+
+/*
  * Reads a page from disk to the img from a valid downlink. It's fills an empty
  * array of offsets for the page.
  */
@@ -1191,12 +1231,18 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 			if (page_version != ORIOLEDB_PAGE_VERSION)
 			{
 				/*
-				 * Now we have only one page version (1). When we have
-				 * different versions we'll need to bump ORIOLEDB_PAGE_VERSION
-				 * and add on-the-fly conversion function from all previous
-				 * page versions in this place
+				 * Convert page from old version to current version on-the-fly.
+				 * This handles format changes between versions.
 				 */
-				elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", page_version, ORIOLEDB_PAGE_VERSION);
+				if (page_version < ORIOLEDB_PAGE_VERSION)
+				{
+					convert_page_version(img, page_version, ORIOLEDB_PAGE_VERSION);
+				}
+				else
+				{
+					elog(FATAL, "Page version %u is newer than supported version %u",
+						 page_version, ORIOLEDB_PAGE_VERSION);
+				}
 			}
 		}
 	}
@@ -1230,13 +1276,17 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 				if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION)
 				{
 					/*
-					 * Now we have only one page version (1). When we have
-					 * different versions we'll need to bump
-					 * ORIOLEDB_PAGE_VERSION and add on-the-fly conversion
-					 * function from all previous page versions after
-					 * decompression.
+					 * Convert page from old version to current version on-the-fly.
 					 */
-					elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+					if (ondisk_page_header.page_version < ORIOLEDB_PAGE_VERSION)
+					{
+						/* Will convert after decompression */
+					}
+					else
+					{
+						elog(FATAL, "Page version %u is newer than supported version %u",
+							 ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+					}
 				}
 
 				if (ondisk_page_header.compress_version != ORIOLEDB_COMPRESS_VERSION)
@@ -1252,6 +1302,13 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 				}
 
 				o_decompress_page(buf + sizeof(OrioleDBOndiskPageHeader), ondisk_page_header.compress_page_size, img);
+				
+				/* Convert page version if needed after decompression */
+				if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION &&
+					ondisk_page_header.page_version < ORIOLEDB_PAGE_VERSION)
+				{
+					convert_page_version(img, ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+				}
 			}
 		}
 		else
@@ -1279,12 +1336,17 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 					if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION)
 					{
 						/*
-						 * Now we have only one page version (1). When we have
-						 * different versions we'll need to bump
-						 * ORIOLEDB_PAGE_VERSION and add on-the-fly conversion
-						 * function from all previous page versions here
+						 * Convert page from old version to current version on-the-fly.
 						 */
-						elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+						if (ondisk_page_header.page_version < ORIOLEDB_PAGE_VERSION)
+						{
+							convert_page_version(img, ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+						}
+						else
+						{
+							elog(FATAL, "Page version %u is newer than supported version %u",
+								 ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+						}
 					}
 				}
 				btree_page_header = (BTreePageHeader *) img;

@@ -45,18 +45,6 @@ typedef struct
 	OXid		checkpointRetainXmax;
 	uint32		binaryVersion;
 	bool		s3Mode;
-	/*
-	 * undoVersion is placed in the implicit padding before crc.
-	 * Due to alignment, there are 3 bytes of implicit padding after s3Mode
-	 * (bool, 1 byte) before the 4-byte aligned crc field.
-	 * We use the first byte for undoVersion, and keep the other 2 as explicit padding.
-	 * Old control files have all padding bytes zeroed, so undoVersion=0.
-	 * New control files have undoVersion=1 (explicitly set).
-	 * This placement preserves CRC offset (160) and ensures backward compatibility.
-	 */
-	uint8		undoVersion;
-	uint8		padding1;
-	uint8		padding2;
 	pg_crc32c	crc;
 } CheckpointControl;
 
