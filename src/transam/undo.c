@@ -177,7 +177,7 @@ bool		oxid_needs_wal_flush = false;
  * Used to handle compatibility with old undo record formats.
  * Initialized to current version, updated when loading checkpoint.
  */
-static uint32 cluster_undo_version = ORIOLEDB_UNDO_VERSION;
+static uint8 cluster_undo_version = ORIOLEDB_UNDO_VERSION;
 
 static Size reserved_undo_sizes[(int) UndoLogsCount] =
 {
@@ -324,7 +324,7 @@ get_undo_meta_by_type(UndoLogType undoType)
 }
 
 void
-set_cluster_undo_version(uint32 version)
+set_cluster_undo_version(uint8 version)
 {
 	cluster_undo_version = version;
 }

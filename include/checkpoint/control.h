@@ -45,17 +45,18 @@ typedef struct
 	OXid		checkpointRetainXmax;
 	uint32		binaryVersion;
 	bool		s3Mode;
-	pg_crc32c	crc;
 	/*
-	 * undoVersion is placed in the padding area after crc.
-	 * The padding area is the space between sizeof(CheckpointControl) and
-	 * CHECKPOINT_CONTROL_FILE_SIZE (8192 bytes), which is explicitly zeroed
-	 * in write_checkpoint_control() before writing to disk.
-	 * Old control files have undoVersion=0 (from zeroed padding).
+	 * undoVersion is placed in the implicit padding before crc.
+	 * Due to alignment, there are 3 bytes of padding after s3Mode (bool)
+	 * before the 4-byte aligned crc field. We use 1 byte for undoVersion.
+	 * Old control files have these padding bytes zeroed, so undoVersion=0.
 	 * New control files have undoVersion=1 (explicitly set).
-	 * This placement ensures backward compatibility without CRC issues.
+	 * This placement preserves CRC offset and ensures backward compatibility.
 	 */
-	uint32		undoVersion;
+	uint8		undoVersion;
+	uint8		padding1;
+	uint8		padding2;
+	pg_crc32c	crc;
 } CheckpointControl;
 
 #define CONTROL_FILENAME    ORIOLEDB_DATA_DIR"/control"

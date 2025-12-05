@@ -344,7 +344,7 @@ extern PendingTruncatesMeta *pending_truncates_meta;
 extern Size undo_shmem_needs(void);
 extern void undo_shmem_init(Pointer buf, bool found);
 extern UndoMeta *get_undo_meta_by_type(UndoLogType undoType);
-extern void set_cluster_undo_version(uint32 version);
+extern void set_cluster_undo_version(uint8 version);
 
 extern void update_min_undo_locations(UndoLogType undoType,
 									  bool have_lock,
