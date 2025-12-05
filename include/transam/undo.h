@@ -327,6 +327,7 @@ typedef enum
 extern bool oxid_needs_wal_flush;
 extern UndoLocation curRetainUndoLocations[(int) UndoLogsCount];
 extern PendingTruncatesMeta *pending_truncates_meta;
+extern bool have_version1_pages;
 
 #define ORIOLEDB_UNDO_DATA_ROW_FILENAME_TEMPLATE (ORIOLEDB_UNDO_DIR "/%02X%08Xrow")
 #define ORIOLEDB_UNDO_DATA_PAGE_FILENAME_TEMPLATE (ORIOLEDB_UNDO_DIR "/%02X%08Xpage")

@@ -172,6 +172,12 @@ UndoLocation curRetainUndoLocations[(int) UndoLogsCount] =
 };
 bool		oxid_needs_wal_flush = false;
 
+/*
+ * Flag to track if we've seen version 1 pages (for undo compatibility).
+ * Once set to true, we zero itemSizeHi when reading undo records.
+ */
+bool		have_version1_pages = false;
+
 static Size reserved_undo_sizes[(int) UndoLogsCount] =
 {
 	0
@@ -699,6 +705,13 @@ undo_item_buf_read_item(UndoItemBuf *buf,
 
 	ASAN_UNPOISON_MEMORY_REGION(buf->data, buf->length);
 	undo_read(undoType, location, sizeof(UndoStackItem), buf->data);
+
+	/*
+	 * For undo records from version 1 clusters, itemSizeHi field was padding
+	 * and may contain garbage. Zero it out for compatibility.
+	 */
+	if (have_version1_pages)
+		((UndoStackItem *) buf->data)->itemSizeHi = 0;
 
 	itemSize = UNDO_GET_ITEM_SIZE(((UndoStackItem *) buf->data));
 	if (itemSize > buf->length)
