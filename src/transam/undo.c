@@ -173,11 +173,10 @@ UndoLocation curRetainUndoLocations[(int) UndoLogsCount] =
 bool		oxid_needs_wal_flush = false;
 
 /*
- * Page version of the cluster, used for undo record compatibility.
- * This is set once during postmaster startup (in checkpoint_shmem_init)
- * and never modified afterwards, so no synchronization is needed.
+ * Set to true when we detect page version 1 during page reads.
+ * Used to zero out itemSizeHi in undo records from old clusters.
  */
-static uint32 cluster_page_version = ORIOLEDB_PAGE_VERSION;
+bool		undo_compat_mode_v1 = false;
 
 static Size reserved_undo_sizes[(int) UndoLogsCount] =
 {
@@ -321,12 +320,6 @@ get_undo_meta_by_type(UndoLogType undoType)
 	Assert(index >= 0 && index < (int) UndoLogsCount);
 
 	return &undo_metas[index];
-}
-
-void
-set_cluster_page_version(uint32 version)
-{
-	cluster_page_version = version;
 }
 
 void
@@ -714,10 +707,10 @@ undo_item_buf_read_item(UndoItemBuf *buf,
 	undo_read(undoType, location, sizeof(UndoStackItem), buf->data);
 
 	/*
-	 * For clusters with page version 1, itemSizeHi field was part of
-	 * padding and may contain garbage. Zero it out for compatibility.
+	 * For page version 1 clusters, itemSizeHi field was padding and may
+	 * contain garbage. Zero it out for compatibility.
 	 */
-	if (cluster_page_version < 2)
+	if (undo_compat_mode_v1)
 		((UndoStackItem *) buf->data)->itemSizeHi = 0;
 
 	itemSize = UNDO_GET_ITEM_SIZE(((UndoStackItem *) buf->data));

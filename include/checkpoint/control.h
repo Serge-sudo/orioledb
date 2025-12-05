@@ -46,13 +46,6 @@ typedef struct
 	uint32		binaryVersion;
 	bool		s3Mode;
 	pg_crc32c	crc;
-	/*
-	 * pageVersion must be placed after crc to maintain backward compatibility.
-	 * CRC is calculated over bytes [0, offsetof(CheckpointControl, crc)).
-	 * Old control files will have 0 in this position (from padding), which
-	 * gets defaulted to version 1.
-	 */
-	uint32		pageVersion;
 } CheckpointControl;
 
 #define CONTROL_FILENAME    ORIOLEDB_DATA_DIR"/control"
