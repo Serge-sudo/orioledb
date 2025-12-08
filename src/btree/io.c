@@ -89,10 +89,15 @@ static bool io_in_progress = false;
  * subsequent undo record reads.
  * 
  * Thread safety: The flag only transitions from false to true, never back.
- * Multiple threads may set it concurrently, which is harmless. Readers may
- * briefly see false while a concurrent write is in progress, but since all
- * data in the cluster is the same version, this will be corrected on the
- * next read. Declared volatile to ensure visibility across threads.
+ * Multiple threads may set it concurrently, which is harmless since the write
+ * is idempotent (always setting to true). Readers may briefly see false while
+ * a concurrent write is in progress, but since all data in the cluster is the
+ * same version, any missed conversion will be corrected on subsequent reads.
+ * 
+ * Declared volatile to ensure visibility across threads. While atomic operations
+ * would provide stronger guarantees, volatile is sufficient for this write-once
+ * flag pattern in a recovery/migration context where occasional missed reads
+ * during the initial transition are acceptable.
  */
 volatile bool orioledb_reading_v1_pages = false;
 
