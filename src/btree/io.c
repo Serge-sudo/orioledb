@@ -82,6 +82,12 @@ static IOShmem *ioShmem = NULL;
 static int	num_io_lwlocks;
 static bool io_in_progress = false;
 
+/*
+ * Global flag to track if we're reading from version 1 pages.
+ * Set when first v1 page is detected, remains true for cluster lifetime.
+ */
+volatile bool orioledb_reading_v1_pages = false;
+
 static bool prepare_non_leaf_page(Page p);
 static uint64 get_free_disk_offset(BTreeDescr *desc);
 static bool get_free_disk_extent(BTreeDescr *desc, uint32 chkpNum,
@@ -1149,28 +1155,25 @@ get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 /*
  * Convert undo records in a page from version 1 to version 2.
  * Version 1 didn't have itemSizeHi field, so we need to zero it out.
- * This function walks through all undo stack items in the page and
- * zeros out the itemSizeHi field in each item header.
  */
 static void
 convert_page_undo_records_v1_to_v2(Pointer page)
 {
-	UndoLocation cur_loc = 0;
-	BTreePageHeader *header = (BTreePageHeader *) page;
+	/*
+	 * Set global flag to indicate we're dealing with version 1 data.
+	 * This will be used by undo record reading code to zero out
+	 * the itemSizeHi field in UndoStackItem structures.
+	 */
+	orioledb_reading_v1_pages = true;
 	
 	/*
-	 * For version 1 pages, we need to zero out itemSizeHi in any
-	 * UndoStackItem structures that might be referenced or embedded.
-	 * However, B-tree pages only contain undo location references,
-	 * not the actual undo records. The actual conversion of undo
-	 * records happens when they are read from undo log files.
+	 * B-tree pages only contain undo location references, not the actual
+	 * undo records. The actual conversion of undo records happens when
+	 * they are read from undo log files via undo_item_buf_read_item().
 	 * 
-	 * This function serves as a placeholder for any page-specific
-	 * conversion that might be needed. Currently, the B-tree page
-	 * format itself hasn't changed, only the undo record format.
+	 * No conversion needed for B-tree page format itself - it hasn't changed.
 	 */
-	
-	/* Nothing to convert in the B-tree page format itself */
+	(void) page;	/* unused */
 }
 
 /*
@@ -1284,7 +1287,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 					 * function from all previous compress versions
 					 * before/during decompression.
 					 */
-					elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+					elog(FATAL, "Compress version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.compress_version, ORIOLEDB_COMPRESS_VERSION);
 				}
 
 				o_decompress_page(buf + sizeof(OrioleDBOndiskPageHeader), ondisk_page_header.compress_page_size, img);

@@ -54,6 +54,10 @@ extern void btree_smgr_punch_hole(BTreeDescr *desc, uint32 chkpNum,
 								  off_t offset, int length);
 extern void init_btree_io_lwlocks(void);
 extern bool read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink, FileExtent *extent);
+
+/* Global flag to track if we're reading from version 1 pages */
+extern volatile bool orioledb_reading_v1_pages;
+
 extern void load_page(OBTreeFindPageContext *context);
 extern uint64 perform_page_io(BTreeDescr *desc, OInMemoryBlkno blkno,
 							  Page img, uint32 checkpoint_number,
