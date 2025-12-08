@@ -179,6 +179,23 @@ static Size reserved_undo_sizes[(int) UndoLogsCount] =
 };
 
 /*
+ * Maximum size for version 1 undo records (16-bit size field).
+ * Version 1 used only itemSizeLo (uint16), limiting records to 64KB.
+ */
+#define UNDO_V1_MAX_ITEM_SIZE	(64 * 1024)
+
+/*
+ * Check if a buffer tag represents an undo log type.
+ */
+static inline bool
+is_undo_log_tag(uint32 tag)
+{
+	return (tag == (uint32)UndoLogRegular ||
+			tag == (uint32)UndoLogRegularPageLevel ||
+			tag == (uint32)UndoLogSystem);
+}
+
+/*
  * Callback to process undo buffer pages after reading from disk.
  * This converts version 1 undo records by zeroing out itemSizeHi field.
  */
@@ -189,14 +206,8 @@ process_undo_buffer_callback(Pointer data, uint32 tag, bool write, bool from_dis
 	
 	/*
 	 * Only process on read from disk, and only for undo log tags.
-	 * Explicitly check for the three undo log types.
 	 */
-	if (write || !from_disk)
-		return;
-		
-	if (tag != (uint32)UndoLogRegular && 
-	    tag != (uint32)UndoLogRegularPageLevel && 
-	    tag != (uint32)UndoLogSystem)
+	if (write || !from_disk || !is_undo_log_tag(tag))
 		return;
 	
 	/*
@@ -235,7 +246,7 @@ process_undo_buffer_callback(Pointer data, uint32 tag, bool write, bool from_dis
 		 * If size seems invalid, we've reached the end of valid records.
 		 */
 		if (itemSize < sizeof(UndoStackItem) || 
-		    itemSize > (64 * 1024) ||
+		    itemSize > UNDO_V1_MAX_ITEM_SIZE ||
 		    offset + itemSize > ORIOLEDB_BLCKSZ)
 			break;
 			

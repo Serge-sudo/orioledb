@@ -327,8 +327,11 @@ o_buffers_rw(OBuffersDesc *desc, Pointer buf,
 		}
 
 		/*
-		 * Call the callback to process the buffer if it was just read from disk,
-		 * we're doing a read operation, and it hasn't been converted yet.
+		 * Call the callback to process the buffer if all conditions are met:
+		 * - Not a write operation (only process on reads)
+		 * - Buffer was just loaded from disk (not from cache)
+		 * - Buffer hasn't been converted yet (prevents duplicate processing)
+		 * - A callback function is registered
 		 */
 		if (!write && from_disk && !buffer->converted && desc->processCallback)
 		{
