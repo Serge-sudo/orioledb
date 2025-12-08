@@ -1160,12 +1160,12 @@ get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 static void
 convert_page_undo_records_v1_to_v2(Pointer page)
 {
-	BTreePageHeader *header = (BTreePageHeader *) page;
-	
-	/* Suppress unused variable warning */
-	(void) header;
-	
-	/* No conversion needed for B-tree page format itself */
+	/*
+	 * No conversion needed for B-tree page format itself.
+	 * This function is called to mark that the page has been processed
+	 * and validated for version compatibility.
+	 */
+	(void) page;	/* unused */
 }
 
 /*
