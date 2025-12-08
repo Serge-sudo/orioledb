@@ -1157,9 +1157,6 @@ zero_undo_item_size_hi(UndoLocation undoLocation)
 	UndoStackItem item;
 	UndoLogType undoType;
 	
-	if (undoLocation == InvalidUndoLocation)
-		return;
-	
 	/* Determine undo log type from location */
 	undoType = (UndoLogType)(undoLocation >> 62);
 	
@@ -1196,7 +1193,7 @@ convert_page_undo_records_v1_to_v2(Pointer page)
 		BTREE_PAGE_FOREACH_ITEMS(page, &loc)
 		{
 			BTreeLeafTuphdr *tuphdr;
-			OTuple		tup;
+			OTuple		tup;	/* Required by BTREE_PAGE_READ_LEAF_ITEM macro */
 			
 			BTREE_PAGE_READ_LEAF_ITEM(tuphdr, tup, page, &loc);
 			
