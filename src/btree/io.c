@@ -34,6 +34,7 @@
 #include "s3/worker.h"
 #include "tableam/descr.h"
 #include "tableam/handler.h"
+#include "transam/undo.h"
 #include "utils/compress.h"
 #include "utils/elog.h"
 #include "utils/page_pool.h"
@@ -81,12 +82,6 @@ static LWLockPadded *io_locks;
 static IOShmem *ioShmem = NULL;
 static int	num_io_lwlocks;
 static bool io_in_progress = false;
-
-/*
- * Global flag to track if we're reading from version 1 pages.
- * Set when first v1 page is detected, remains true for cluster lifetime.
- */
-volatile bool orioledb_reading_v1_pages = false;
 
 static bool prepare_non_leaf_page(Page p);
 static uint64 get_free_disk_offset(BTreeDescr *desc);
@@ -1153,27 +1148,64 @@ get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 }
 
 /*
+ * Helper function to zero out itemSizeHi for a specific undo location.
+ * Reads the undo record header and writes it back with itemSizeHi zeroed.
+ */
+static void
+zero_undo_item_size_hi(UndoLocation undoLocation)
+{
+	UndoStackItem item;
+	UndoLogType undoType;
+	
+	if (undoLocation == InvalidUndoLocation)
+		return;
+	
+	/* Determine undo log type from location */
+	undoType = (UndoLogType)(undoLocation >> 62);
+	
+	/* Read the undo stack item header */
+	undo_read(undoType, undoLocation, sizeof(UndoStackItem), (Pointer) &item);
+	
+	/* Zero out the high bits */
+	item.itemSizeHi = 0;
+	
+	/* Write it back */
+	undo_write(undoType, undoLocation, sizeof(UndoStackItem), (Pointer) &item);
+}
+
+/*
  * Convert undo records in a page from version 1 to version 2.
  * Version 1 didn't have itemSizeHi field, so we need to zero it out.
+ * This walks through the page and processes all undo locations.
  */
 static void
 convert_page_undo_records_v1_to_v2(Pointer page)
 {
-	/*
-	 * Set global flag to indicate we're dealing with version 1 data.
-	 * This will be used by undo record reading code to zero out
-	 * the itemSizeHi field in UndoStackItem structures.
-	 */
-	orioledb_reading_v1_pages = true;
+	BTreePageHeader *header = (BTreePageHeader *) page;
+	BTreePageItemLocator loc;
 	
-	/*
-	 * B-tree pages only contain undo location references, not the actual
-	 * undo records. The actual conversion of undo records happens when
-	 * they are read from undo log files via undo_item_buf_read_item().
-	 * 
-	 * No conversion needed for B-tree page format itself - it hasn't changed.
-	 */
-	(void) page;	/* unused */
+	/* Process page-level undo location */
+	if (header->undoLocation != InvalidUndoLocation)
+	{
+		zero_undo_item_size_hi(header->undoLocation);
+	}
+	
+	/* Process tuple-level undo locations for leaf pages */
+	if (O_PAGE_IS(page, LEAF))
+	{
+		BTREE_PAGE_FOREACH_ITEMS(page, &loc)
+		{
+			BTreeLeafTuphdr *tuphdr;
+			OTuple		tup;
+			
+			BTREE_PAGE_READ_LEAF_ITEM(tuphdr, tup, page, &loc);
+			
+			if (tuphdr->undoLocation != InvalidUndoLocation)
+			{
+				zero_undo_item_size_hi(tuphdr->undoLocation);
+			}
+		}
+	}
 }
 
 /*
