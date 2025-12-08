@@ -108,9 +108,6 @@ o_buffers_shmem_init(OBuffersDesc *desc, void *buf, bool found)
 static void
 open_file(OBuffersDesc *desc, uint32 tag, uint64 fileNum)
 {
-	int32		version;
-	bool		found = false;
-	
 	Assert(OBuffersMaxTagIsValid(tag));
 
 	if (desc->curFile >= 0 &&
@@ -121,94 +118,32 @@ open_file(OBuffersDesc *desc, uint32 tag, uint64 fileNum)
 	if (desc->curFile >= 0)
 		FileClose(desc->curFile);
 
-	/*
-	 * Try to open file with current version first, then fall back to older versions.
-	 * Version 0 means unversioned (no suffix), version 1+ adds .1, .2, etc suffix.
-	 * Use signed integer to avoid wrap-around when decrementing from 0.
-	 */
-	for (version = (int32)desc->version[tag]; version >= 0; version--)
-	{
-		if (version == 0)
-		{
-			/* Unversioned file - use template as-is */
-			pg_snprintf(desc->curFileName, MAXPGPATH,
-						desc->filenameTemplate[tag],
-						(uint32) (fileNum >> 32),
-						(uint32) fileNum);
-		}
-		else
-		{
-			/* Versioned file - append .N suffix */
-			char base_name[MAXPGPATH];
-			pg_snprintf(base_name, MAXPGPATH,
-						desc->filenameTemplate[tag],
-						(uint32) (fileNum >> 32),
-						(uint32) fileNum);
-			pg_snprintf(desc->curFileName, MAXPGPATH, "%s.%d", base_name, version);
-		}
-		
-		desc->curFile = PathNameOpenFile(desc->curFileName,
-										 O_RDWR | O_CREAT | PG_BINARY);
-		if (desc->curFile >= 0)
-		{
-			desc->curFileVersion = (uint32)version;
-			found = true;
-			break;
-		}
-		
-		/* If file doesn't exist and we're at version 0, break */
-		if (version == 0)
-			break;
-	}
-	
+	pg_snprintf(desc->curFileName, MAXPGPATH,
+				desc->filenameTemplate[tag],
+				(uint32) (fileNum >> 32),
+				(uint32) fileNum);
+	desc->curFile = PathNameOpenFile(desc->curFileName,
+									 O_RDWR | O_CREAT | PG_BINARY);
 	desc->curFileNum = fileNum;
 	desc->curFileTag = tag;
-	
-	if (!found || desc->curFile < 0)
+	if (desc->curFile < 0)
 		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not open buffer file %s: %m", desc->curFileName)));
+						errmsg("could not open undo log file %s: %m", desc->curFileName)));
 }
 
 static void
 unlink_file(OBuffersDesc *desc, uint32 tag, uint64 fileNum)
 {
 	static char fileNameToUnlink[MAXPGPATH];
-	int32		version;
 
 	Assert(OBuffersMaxTagIsValid(tag));
 
-	/*
-	 * Delete all versions of the file.
-	 * Start from current version and go down to version 0 (unversioned).
-	 * Use signed integer to avoid wrap-around when decrementing from 0.
-	 */
-	for (version = (int32)desc->version[tag]; version >= 0; version--)
-	{
-		if (version == 0)
-		{
-			/* Unversioned file */
-			pg_snprintf(fileNameToUnlink, MAXPGPATH,
-						desc->filenameTemplate[tag],
-						(uint32) (fileNum >> 32),
-						(uint32) fileNum);
-		}
-		else
-		{
-			/* Versioned file - append .N suffix */
-			char base_name[MAXPGPATH];
-			pg_snprintf(base_name, MAXPGPATH,
-						desc->filenameTemplate[tag],
-						(uint32) (fileNum >> 32),
-						(uint32) fileNum);
-			pg_snprintf(fileNameToUnlink, MAXPGPATH, "%s.%d", base_name, version);
-		}
-		
-		(void) unlink(fileNameToUnlink);
-		
-		/* If version is 0, we're done */
-		if (version == 0)
-			break;
-	}
+	pg_snprintf(fileNameToUnlink, MAXPGPATH,
+				desc->filenameTemplate[tag],
+				(uint32) (fileNum >> 32),
+				(uint32) fileNum);
+
+	(void) unlink(fileNameToUnlink);
 }
 
 static void
@@ -237,13 +172,9 @@ static void
 read_buffer(OBuffersDesc *desc, OBuffer *buffer)
 {
 	int			result;
-	uint32		file_version;
 
 	open_file(desc, buffer->tag,
 			  buffer->blockNum / (desc->singleFileSize / ORIOLEDB_BLCKSZ));
-	
-	file_version = desc->curFileVersion;
-	
 	result = OFileRead(desc->curFile, buffer->data, ORIOLEDB_BLCKSZ,
 					   (buffer->blockNum * ORIOLEDB_BLCKSZ) % desc->singleFileSize,
 					   WAIT_EVENT_SLRU_READ);
@@ -255,20 +186,6 @@ read_buffer(OBuffersDesc *desc, OBuffer *buffer)
 
 	if (result < ORIOLEDB_BLCKSZ)
 		memset(&buffer->data[result], 0, ORIOLEDB_BLCKSZ - result);
-	
-	/*
-	 * If we read from an older version file, apply transformation.
-	 */
-	if (file_version < desc->version[buffer->tag] && 
-		desc->transformCallback[buffer->tag] != NULL)
-	{
-		if (!desc->transformCallback[buffer->tag](buffer->data, buffer->tag, 
-												  file_version, desc->version[buffer->tag]))
-		{
-			ereport(PANIC, (errmsg("failed to transform buffer data from version %u to %u",
-								   file_version, desc->version[buffer->tag])));
-		}
-	}
 }
 
 static OBuffer *

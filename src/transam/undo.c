@@ -18,6 +18,7 @@
 
 #include "orioledb.h"
 
+#include "btree/io.h"
 #include "btree/scan.h"
 #include "btree/undo.h"
 #include "catalog/storage.h"
@@ -177,81 +178,12 @@ static Size reserved_undo_sizes[(int) UndoLogsCount] =
 	0
 };
 
-/*
- * Maximum size for version 0 undo records (16-bit size field).
- * Version 0 used only itemSizeLo (uint16), limiting records to 64KB.
- */
-#define UNDO_V0_MAX_ITEM_SIZE	(64 * 1024)
-
-/*
- * Current undo file version.
- * Version 0: Original format with 16-bit itemSizeLo only
- * Version 1: Added 32-bit itemSizeHi for 48-bit sizes
- */
-#define UNDO_FILE_VERSION 1
-
-/*
- * Transformation callback for converting undo pages from version 0 to version 1.
- * This zeros out the itemSizeHi field in all UndoStackItem records in the page.
- */
-static bool
-transform_undo_v0_to_v1(Pointer data, uint32 tag, uint32 from_version, uint32 to_version)
-{
-	UndoLocation offset = 0;
-	
-	/* Only transform from version 0 to version 1 */
-	if (from_version != 0 || to_version != 1)
-		return false;
-	
-	/*
-	 * Walk through all undo records in this page and zero out itemSizeHi.
-	 * Each record starts with a UndoStackItem header.
-	 */
-	while (offset + sizeof(UndoStackItem) <= ORIOLEDB_BLCKSZ)
-	{
-		UndoStackItem *item = (UndoStackItem *)(data + offset);
-		Size itemSize;
-		
-		/*
-		 * Zero out itemSizeHi for version 0 compatibility.
-		 * Version 0 didn't have this field, and it may contain garbage.
-		 * After zeroing, UNDO_GET_ITEM_SIZE will only use itemSizeLo.
-		 */
-		item->itemSizeHi = 0;
-		
-		/* Get the size using only itemSizeLo now (max 64KB) */
-		itemSize = UNDO_GET_ITEM_SIZE(item);
-		
-		/*
-		 * Sanity check: item size should be reasonable.
-		 * Version 0 records can only be up to 64KB (16-bit size).
-		 * If size seems invalid, we've reached the end of valid records.
-		 */
-		if (itemSize < sizeof(UndoStackItem) || 
-		    itemSize > UNDO_V0_MAX_ITEM_SIZE ||
-		    offset + itemSize > ORIOLEDB_BLCKSZ)
-			break;
-			
-		offset += MAXALIGN(itemSize);
-		
-		/* Stop if we've processed all records in this page */
-		if (offset >= ORIOLEDB_BLCKSZ)
-			break;
-	}
-	
-	return true;
-}
-
 static OBuffersDesc undoBuffersDesc =
 {
 	.singleFileSize = UNDO_FILE_SIZE,
-	.filenameTemplate = {ORIOLEDB_UNDO_DATA_ROW_FILENAME_TEMPLATE, 
-						 ORIOLEDB_UNDO_DATA_PAGE_FILENAME_TEMPLATE, 
-						 ORIOLEDB_UNDO_SYSTEM_FILENAME_TEMPLATE},
+	.filenameTemplate = {ORIOLEDB_UNDO_DATA_ROW_FILENAME_TEMPLATE, ORIOLEDB_UNDO_DATA_PAGE_FILENAME_TEMPLATE, ORIOLEDB_UNDO_SYSTEM_FILENAME_TEMPLATE},
 	.groupCtlTrancheName = "undoBuffersGroupCtlTranche",
-	.bufferCtlTrancheName = "undoBuffersCtlTranche",
-	.version = {UNDO_FILE_VERSION, UNDO_FILE_VERSION, UNDO_FILE_VERSION, 0},
-	.transformCallback = {transform_undo_v0_to_v1, transform_undo_v0_to_v1, transform_undo_v0_to_v1, NULL}
+	.bufferCtlTrancheName = "undoBuffersCtlTranche"
 };
 
 static void wait_for_reserved_location(UndoLogType undoType,
@@ -770,10 +702,13 @@ undo_item_buf_read_item(UndoItemBuf *buf,
 	undo_read(undoType, location, sizeof(UndoStackItem), buf->data);
 
 	/*
-	 * Note: itemSizeHi conversion for version 1 is now handled by
-	 * process_undo_buffer_callback when the page is first read from disk,
-	 * so we don't need to do it here.
+	 * Zero out itemSizeHi if we're reading from version 1 pages.
+	 * Version 1 didn't have this field, so it may contain garbage.
 	 */
+	if (orioledb_reading_v1_pages)
+	{
+		((UndoStackItem *) buf->data)->itemSizeHi = 0;
+	}
 
 	itemSize = UNDO_GET_ITEM_SIZE(((UndoStackItem *) buf->data));
 	if (itemSize > buf->length)
