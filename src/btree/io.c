@@ -1147,32 +1147,25 @@ get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 }
 
 /*
- * Convert undo records in a page from version 1 to version 2.
- * Version 1 didn't have itemSizeHi field, so we need to zero it out.
- * This function walks through all undo stack items in the page and
- * zeros out the itemSizeHi field in each item header.
+ * Convert page from version 1 to version 2.
+ * 
+ * Currently, this is a placeholder function. The B-tree page format itself
+ * hasn't changed between version 1 and 2. The version bump is primarily to
+ * indicate that undo records referenced by this page are in the old format
+ * (version 1 didn't have itemSizeHi field in UndoStackItem).
+ * 
+ * The actual conversion of undo records happens when they are read from
+ * undo log files during recovery, not when B-tree pages are read.
  */
 static void
 convert_page_undo_records_v1_to_v2(Pointer page)
 {
 	BTreePageHeader *header = (BTreePageHeader *) page;
 	
-	/*
-	 * For version 1 pages, we need to zero out itemSizeHi in any
-	 * UndoStackItem structures that might be referenced or embedded.
-	 * However, B-tree pages only contain undo location references,
-	 * not the actual undo records. The actual conversion of undo
-	 * records happens when they are read from undo log files.
-	 * 
-	 * This function serves as a placeholder for any page-specific
-	 * conversion that might be needed. Currently, the B-tree page
-	 * format itself hasn't changed, only the undo record format.
-	 */
-	
 	/* Suppress unused variable warning */
 	(void) header;
 	
-	/* Nothing to convert in the B-tree page format itself */
+	/* No conversion needed for B-tree page format itself */
 }
 
 /*
@@ -1264,17 +1257,11 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 
 				if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION)
 				{
-					if (ondisk_page_header.page_version == 1 && ORIOLEDB_PAGE_VERSION == 2)
-					{
-						/*
-						 * Convert from version 1 to version 2.
-						 * Decompress first, then convert.
-						 */
-					}
-					else
+					if (ondisk_page_header.page_version != 1 || ORIOLEDB_PAGE_VERSION != 2)
 					{
 						elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
 					}
+					/* Version 1 to 2 conversion is handled after decompression */
 				}
 
 				if (ondisk_page_header.compress_version != ORIOLEDB_COMPRESS_VERSION)
@@ -1291,7 +1278,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 
 				o_decompress_page(buf + sizeof(OrioleDBOndiskPageHeader), ondisk_page_header.compress_page_size, img);
 				
-				/* Apply conversion after decompression if needed */
+				/* Apply version conversion after decompression if needed */
 				if (ondisk_page_header.page_version == 1 && ORIOLEDB_PAGE_VERSION == 2)
 				{
 					convert_page_undo_records_v1_to_v2(img);
