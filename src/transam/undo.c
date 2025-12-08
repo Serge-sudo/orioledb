@@ -174,9 +174,34 @@ bool		oxid_needs_wal_flush = false;
 
 /*
  * Flag to track if we've seen version 1 pages (for undo compatibility).
- * Once set to true, we zero itemSizeHi when reading undo records.
+ * Once set to true, we zero itemSizeHi when reading undo records, because
+ * undo records written by version 1 pages have garbage in itemSizeHi field.
+ * This flag is set when any version 1 page is encountered and remains true
+ * until the cluster is fully upgraded and old undo is cleaned up.
  */
 bool		have_version1_pages = false;
+
+/*
+ * Determine if undo record needs version 1 compatibility conversion.
+ * This checks if the undo record was potentially written by a version 1 page.
+ * 
+ * Currently uses cluster-wide flag, but this interface allows for future
+ * enhancements like per-location version tracking.
+ */
+static inline bool
+undo_needs_v1_compat(UndoLogType undoType, UndoLocation location)
+{
+	/*
+	 * If we've seen any version 1 pages, conservatively assume all undo
+	 * records may have been written by version 1 pages and need conversion.
+	 * This is safe because zeroing itemSizeHi is idempotent for v2 records
+	 * (it should already be zero or have a valid value that will be lost).
+	 * 
+	 * Future enhancement: track upgrade time and only convert undo written
+	 * before that time, or track page version per undo chain.
+	 */
+	return have_version1_pages;
+}
 
 static Size reserved_undo_sizes[(int) UndoLogsCount] =
 {
@@ -707,10 +732,11 @@ undo_item_buf_read_item(UndoItemBuf *buf,
 	undo_read(undoType, location, sizeof(UndoStackItem), buf->data);
 
 	/*
-	 * For undo records from version 1 clusters, itemSizeHi field was padding
-	 * and may contain garbage. Zero it out for compatibility.
+	 * Apply version 1 compatibility conversion if needed.
+	 * For undo records written by version 1 pages, itemSizeHi field
+	 * was padding and may contain garbage. Zero it out for compatibility.
 	 */
-	if (have_version1_pages)
+	if (undo_needs_v1_compat(undoType, location))
 		((UndoStackItem *) buf->data)->itemSizeHi = 0;
 
 	itemSize = UNDO_GET_ITEM_SIZE(((UndoStackItem *) buf->data));

@@ -1167,8 +1167,11 @@ convert_page_version(Pointer img, uint8 from_version, uint8 to_version)
 		{
 			/*
 			 * Version 1 to 2: The only change was adding itemSizeHi to undo records.
-			 * Undo records from version 1 clusters have garbage in itemSizeHi field.
-			 * Set global flag so undo reading code knows to zero it.
+			 * Undo records written by version 1 pages have garbage in itemSizeHi field.
+			 * 
+			 * Set global flag to enable undo conversion. This flag stays set for the
+			 * lifetime of the cluster to ensure all old undo records are properly
+			 * handled. Future enhancement: track upgrade time to only convert old undo.
 			 */
 			have_version1_pages = true;
 			header->o_header.page_version = 2;
