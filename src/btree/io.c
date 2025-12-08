@@ -82,6 +82,9 @@ static IOShmem *ioShmem = NULL;
 static int	num_io_lwlocks;
 static bool io_in_progress = false;
 
+/* Global flag to track if we're reading from version 1 pages (for undo conversion) */
+bool orioledb_reading_v1_pages = false;
+
 static bool prepare_non_leaf_page(Page p);
 static uint64 get_free_disk_offset(BTreeDescr *desc);
 static bool get_free_disk_extent(BTreeDescr *desc, uint32 chkpNum,
@@ -1160,6 +1163,13 @@ get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 static void
 convert_page_undo_records_v1_to_v2(Pointer page)
 {
+	/*
+	 * Set global flag to indicate we're dealing with version 1 data.
+	 * This will be used by undo record reading code to zero out
+	 * the itemSizeHi field in UndoStackItem structures.
+	 */
+	orioledb_reading_v1_pages = true;
+	
 	/*
 	 * No conversion needed for B-tree page format itself.
 	 * This function is called to mark that the page has been processed

@@ -18,6 +18,7 @@
 
 #include "orioledb.h"
 
+#include "btree/io.h"
 #include "btree/scan.h"
 #include "btree/undo.h"
 #include "catalog/storage.h"
@@ -699,6 +700,15 @@ undo_item_buf_read_item(UndoItemBuf *buf,
 
 	ASAN_UNPOISON_MEMORY_REGION(buf->data, buf->length);
 	undo_read(undoType, location, sizeof(UndoStackItem), buf->data);
+
+	/*
+	 * Zero out itemSizeHi if we're reading from version 1 pages.
+	 * Version 1 didn't have this field, so it may contain garbage.
+	 */
+	if (orioledb_reading_v1_pages)
+	{
+		((UndoStackItem *) buf->data)->itemSizeHi = 0;
+	}
 
 	itemSize = UNDO_GET_ITEM_SIZE(((UndoStackItem *) buf->data));
 	if (itemSize > buf->length)
