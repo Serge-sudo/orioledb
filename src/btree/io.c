@@ -92,9 +92,9 @@ static bool io_in_progress = false;
  * Multiple threads may set it concurrently, which is harmless. Readers may
  * briefly see false while a concurrent write is in progress, but since all
  * data in the cluster is the same version, this will be corrected on the
- * next read.
+ * next read. Declared volatile to ensure visibility across threads.
  */
-bool orioledb_reading_v1_pages = false;
+volatile bool orioledb_reading_v1_pages = false;
 
 static bool prepare_non_leaf_page(Page p);
 static uint64 get_free_disk_offset(BTreeDescr *desc);
@@ -1180,7 +1180,7 @@ convert_page_undo_records_v1_to_v2(Pointer page)
 	 * the itemSizeHi field in UndoStackItem structures.
 	 */
 	orioledb_reading_v1_pages = true;
-	
+
 	/*
 	 * No conversion needed for B-tree page format itself.
 	 * This function is called to mark that the page has been processed
