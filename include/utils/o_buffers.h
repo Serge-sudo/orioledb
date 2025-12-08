@@ -34,7 +34,7 @@ typedef bool (*OBuffersTransformCallback)(Pointer data, uint32 tag, uint32 from_
 
 typedef struct
 {
-	/* these fields are initilized by user */
+	/* these fields are initialized by user */
 	uint64		singleFileSize;
 	const char *filenameTemplate[OBuffersMaxTags];
 	const char *groupCtlTrancheName;
@@ -43,7 +43,7 @@ typedef struct
 	uint32		version[OBuffersMaxTags];					/* version for each tag, 0 means unversioned */
 	OBuffersTransformCallback transformCallback[OBuffersMaxTags];	/* transformation callbacks for each tag */
 
-	/* these fields are initilized in o_buffers.c */
+	/* these fields are initialized in o_buffers.c */
 	uint32		groupsCount;
 	OBuffersMeta *metaPageBlkno;
 	OBuffersGroup *groups;

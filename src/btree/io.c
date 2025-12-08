@@ -1248,7 +1248,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 					 * function from all previous compress versions
 					 * before/during decompression.
 					 */
-					elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+					elog(FATAL, "Compress version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.compress_version, ORIOLEDB_COMPRESS_VERSION);
 				}
 
 				o_decompress_page(buf + sizeof(OrioleDBOndiskPageHeader), ondisk_page_header.compress_page_size, img);

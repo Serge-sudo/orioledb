@@ -108,7 +108,7 @@ o_buffers_shmem_init(OBuffersDesc *desc, void *buf, bool found)
 static void
 open_file(OBuffersDesc *desc, uint32 tag, uint64 fileNum)
 {
-	uint32		version;
+	int32		version;
 	bool		found = false;
 	
 	Assert(OBuffersMaxTagIsValid(tag));
@@ -124,8 +124,9 @@ open_file(OBuffersDesc *desc, uint32 tag, uint64 fileNum)
 	/*
 	 * Try to open file with current version first, then fall back to older versions.
 	 * Version 0 means unversioned (no suffix), version 1+ adds .1, .2, etc suffix.
+	 * Use signed integer to avoid wrap-around when decrementing from 0.
 	 */
-	for (version = desc->version[tag]; version >= 0; version--)
+	for (version = (int32)desc->version[tag]; version >= 0; version--)
 	{
 		if (version == 0)
 		{
@@ -143,14 +144,14 @@ open_file(OBuffersDesc *desc, uint32 tag, uint64 fileNum)
 						desc->filenameTemplate[tag],
 						(uint32) (fileNum >> 32),
 						(uint32) fileNum);
-			pg_snprintf(desc->curFileName, MAXPGPATH, "%s.%u", base_name, version);
+			pg_snprintf(desc->curFileName, MAXPGPATH, "%s.%d", base_name, version);
 		}
 		
 		desc->curFile = PathNameOpenFile(desc->curFileName,
 										 O_RDWR | O_CREAT | PG_BINARY);
 		if (desc->curFile >= 0)
 		{
-			desc->curFileVersion = version;
+			desc->curFileVersion = (uint32)version;
 			found = true;
 			break;
 		}
@@ -172,15 +173,16 @@ static void
 unlink_file(OBuffersDesc *desc, uint32 tag, uint64 fileNum)
 {
 	static char fileNameToUnlink[MAXPGPATH];
-	uint32		version;
+	int32		version;
 
 	Assert(OBuffersMaxTagIsValid(tag));
 
 	/*
 	 * Delete all versions of the file.
 	 * Start from current version and go down to version 0 (unversioned).
+	 * Use signed integer to avoid wrap-around when decrementing from 0.
 	 */
-	for (version = desc->version[tag]; version >= 0; version--)
+	for (version = (int32)desc->version[tag]; version >= 0; version--)
 	{
 		if (version == 0)
 		{
@@ -198,7 +200,7 @@ unlink_file(OBuffersDesc *desc, uint32 tag, uint64 fileNum)
 						desc->filenameTemplate[tag],
 						(uint32) (fileNum >> 32),
 						(uint32) fileNum);
-			pg_snprintf(fileNameToUnlink, MAXPGPATH, "%s.%u", base_name, version);
+			pg_snprintf(fileNameToUnlink, MAXPGPATH, "%s.%d", base_name, version);
 		}
 		
 		(void) unlink(fileNameToUnlink);
