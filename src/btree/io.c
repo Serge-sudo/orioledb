@@ -1155,7 +1155,6 @@ get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 static void
 convert_page_undo_records_v1_to_v2(Pointer page)
 {
-	UndoLocation cur_loc = 0;
 	BTreePageHeader *header = (BTreePageHeader *) page;
 	
 	/*
@@ -1169,6 +1168,9 @@ convert_page_undo_records_v1_to_v2(Pointer page)
 	 * conversion that might be needed. Currently, the B-tree page
 	 * format itself hasn't changed, only the undo record format.
 	 */
+	
+	/* Suppress unused variable warning */
+	(void) header;
 	
 	/* Nothing to convert in the B-tree page format itself */
 }
@@ -1284,7 +1286,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 					 * function from all previous compress versions
 					 * before/during decompression.
 					 */
-					elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+					elog(FATAL, "Compress version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.compress_version, ORIOLEDB_COMPRESS_VERSION);
 				}
 
 				o_decompress_page(buf + sizeof(OrioleDBOndiskPageHeader), ondisk_page_header.compress_page_size, img);
