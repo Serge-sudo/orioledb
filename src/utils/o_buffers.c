@@ -40,6 +40,7 @@ typedef struct
 	uint32		shadowTag;
 	uint32		usageCount;
 	bool		dirty;
+	bool		converted;		/* true if version conversion has been applied */
 	char		data[ORIOLEDB_BLCKSZ];
 } OBuffer;
 
@@ -95,6 +96,7 @@ o_buffers_shmem_init(OBuffersDesc *desc, void *buf, bool found)
 				buffer->blockNum = -1;
 				buffer->usageCount = 0;
 				buffer->dirty = false;
+				buffer->converted = false;
 				buffer->tag = 0;
 			}
 		}
@@ -265,6 +267,7 @@ get_buffer(OBuffersDesc *desc, uint32 tag, int64 blockNum, bool write, bool *fro
 
 	buffer->usageCount = 1;
 	buffer->dirty = false;
+	buffer->converted = false;
 	buffer->blockNum = blockNum;
 	buffer->tag = tag;
 	buffer->shadowBlockNum = prevBlockNum;
@@ -324,12 +327,13 @@ o_buffers_rw(OBuffersDesc *desc, Pointer buf,
 		}
 
 		/*
-		 * Call the callback to process the buffer if it was just read from disk
-		 * and we're doing a read operation.
+		 * Call the callback to process the buffer if it was just read from disk,
+		 * we're doing a read operation, and it hasn't been converted yet.
 		 */
-		if (!write && from_disk && desc->processCallback)
+		if (!write && from_disk && !buffer->converted && desc->processCallback)
 		{
 			desc->processCallback(buffer->data, tag, write, from_disk);
+			buffer->converted = true;
 		}
 
 		if (write)
