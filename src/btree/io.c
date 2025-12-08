@@ -82,7 +82,18 @@ static IOShmem *ioShmem = NULL;
 static int	num_io_lwlocks;
 static bool io_in_progress = false;
 
-/* Global flag to track if we're reading from version 1 pages (for undo conversion) */
+/*
+ * Flag to track if we're reading from version 1 pages (for undo conversion).
+ * This is set when the first version 1 page is encountered and remains true.
+ * All pages in a cluster have the same version, so once set, it applies to all
+ * subsequent undo record reads.
+ * 
+ * Thread safety: The flag only transitions from false to true, never back.
+ * Multiple threads may set it concurrently, which is harmless. Readers may
+ * briefly see false while a concurrent write is in progress, but since all
+ * data in the cluster is the same version, this will be corrected on the
+ * next read.
+ */
 bool orioledb_reading_v1_pages = false;
 
 static bool prepare_non_leaf_page(Page p);
