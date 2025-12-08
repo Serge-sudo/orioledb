@@ -178,12 +178,69 @@ static Size reserved_undo_sizes[(int) UndoLogsCount] =
 	0
 };
 
+/*
+ * Callback to process undo buffer pages after reading from disk.
+ * This converts version 1 undo records by zeroing out itemSizeHi field.
+ */
+static void
+process_undo_buffer_callback(Pointer data, uint32 tag, bool write, bool from_disk)
+{
+	UndoLocation offset = 0;
+	
+	/*
+	 * Only process on read from disk, and only for undo log tags.
+	 * Tags 0-2 are for undo logs (row, page, system).
+	 */
+	if (write || !from_disk || tag >= (uint32)UndoLogsCount)
+		return;
+	
+	/*
+	 * Only process if we've detected version 1 pages.
+	 * Once set, this flag remains true for the cluster.
+	 */
+	if (!orioledb_reading_v1_pages)
+		return;
+	
+	/*
+	 * Walk through all undo records in this page and zero out itemSizeHi.
+	 * Each record starts with a UndoStackItem header.
+	 */
+	while (offset + sizeof(UndoStackItem) <= ORIOLEDB_BLCKSZ)
+	{
+		UndoStackItem *item = (UndoStackItem *)(data + offset);
+		Size itemSize;
+		
+		/*
+		 * Zero out itemSizeHi for version 1 compatibility.
+		 * Version 1 didn't have this field.
+		 */
+		item->itemSizeHi = 0;
+		
+		/* Get the size using only itemSizeLo now */
+		itemSize = UNDO_GET_ITEM_SIZE(item);
+		
+		/*
+		 * Sanity check: item size should be reasonable.
+		 * If not, we've likely reached the end of valid records.
+		 */
+		if (itemSize < sizeof(UndoStackItem) || itemSize > ORIOLEDB_BLCKSZ)
+			break;
+			
+		offset += MAXALIGN(itemSize);
+		
+		/* Stop if we've processed all records in this page */
+		if (offset >= ORIOLEDB_BLCKSZ)
+			break;
+	}
+}
+
 static OBuffersDesc undoBuffersDesc =
 {
 	.singleFileSize = UNDO_FILE_SIZE,
 	.filenameTemplate = {ORIOLEDB_UNDO_DATA_ROW_FILENAME_TEMPLATE, ORIOLEDB_UNDO_DATA_PAGE_FILENAME_TEMPLATE, ORIOLEDB_UNDO_SYSTEM_FILENAME_TEMPLATE},
 	.groupCtlTrancheName = "undoBuffersGroupCtlTranche",
-	.bufferCtlTrancheName = "undoBuffersCtlTranche"
+	.bufferCtlTrancheName = "undoBuffersCtlTranche",
+	.processCallback = process_undo_buffer_callback
 };
 
 static void wait_for_reserved_location(UndoLogType undoType,
@@ -702,13 +759,10 @@ undo_item_buf_read_item(UndoItemBuf *buf,
 	undo_read(undoType, location, sizeof(UndoStackItem), buf->data);
 
 	/*
-	 * Zero out itemSizeHi if we're reading from version 1 pages.
-	 * Version 1 didn't have this field, so it may contain garbage.
+	 * Note: itemSizeHi conversion for version 1 is now handled by
+	 * process_undo_buffer_callback when the page is first read from disk,
+	 * so we don't need to do it here.
 	 */
-	if (orioledb_reading_v1_pages)
-	{
-		((UndoStackItem *) buf->data)->itemSizeHi = 0;
-	}
 
 	itemSize = UNDO_GET_ITEM_SIZE(((UndoStackItem *) buf->data));
 	if (itemSize > buf->length)

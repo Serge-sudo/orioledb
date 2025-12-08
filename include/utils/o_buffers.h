@@ -21,6 +21,16 @@ typedef struct OBuffersGroup OBuffersGroup;
 #define OBuffersMaxTagIsValid(tag) \
 	((tag) >= 0 && (tag) < OBuffersMaxTags)
 
+/*
+ * Callback function type for processing buffer data after reading from disk.
+ * Parameters:
+ *   data - pointer to buffer data
+ *   tag - buffer tag (identifies which type of data)
+ *   write - true if writing, false if reading
+ *   from_disk - true if data was just read from disk, false if from memory
+ */
+typedef void (*OBuffersProcessCallback)(Pointer data, uint32 tag, bool write, bool from_disk);
+
 typedef struct
 {
 	/* these fields are initilized by user */
@@ -29,6 +39,7 @@ typedef struct
 	const char *groupCtlTrancheName;
 	const char *bufferCtlTrancheName;
 	uint32		buffersCount;
+	OBuffersProcessCallback processCallback;	/* optional callback for processing data */
 
 	/* these fields are initilized in o_buffers.c */
 	uint32		groupsCount;

@@ -189,7 +189,7 @@ read_buffer(OBuffersDesc *desc, OBuffer *buffer)
 }
 
 static OBuffer *
-get_buffer(OBuffersDesc *desc, uint32 tag, int64 blockNum, bool write)
+get_buffer(OBuffersDesc *desc, uint32 tag, int64 blockNum, bool write, bool *from_disk)
 {
 	OBuffersGroup *group = &desc->groups[blockNum % desc->groupsCount];
 	OBuffer    *buffer = NULL;
@@ -199,6 +199,8 @@ get_buffer(OBuffersDesc *desc, uint32 tag, int64 blockNum, bool write)
 	bool		prevDirty;
 	int64		prevBlockNum;
 	uint32		prevTag;
+
+	*from_disk = false;
 
 	/* First check if required buffer is already loaded */
 	LWLockAcquire(&group->groupCtlLock, LW_SHARED);
@@ -277,6 +279,9 @@ get_buffer(OBuffersDesc *desc, uint32 tag, int64 blockNum, bool write)
 
 	buffer->shadowBlockNum = -1;
 
+	/* Buffer was just read from disk */
+	*from_disk = true;
+
 	return buffer;
 }
 
@@ -292,7 +297,8 @@ o_buffers_rw(OBuffersDesc *desc, Pointer buf,
 
 	for (blockNum = firstBlockNum; blockNum <= lastBlockNum; blockNum++)
 	{
-		OBuffer    *buffer = get_buffer(desc, tag, blockNum, write);
+		bool		from_disk = false;
+		OBuffer    *buffer = get_buffer(desc, tag, blockNum, write, &from_disk);
 		uint32		copySize,
 					copyOffset;
 
@@ -315,6 +321,15 @@ o_buffers_rw(OBuffersDesc *desc, Pointer buf,
 		{
 			copySize = ORIOLEDB_BLCKSZ;
 			copyOffset = 0;
+		}
+
+		/*
+		 * Call the callback to process the buffer if it was just read from disk
+		 * and we're doing a read operation.
+		 */
+		if (!write && from_disk && desc->processCallback)
+		{
+			desc->processCallback(buffer->data, tag, write, from_disk);
 		}
 
 		if (write)
