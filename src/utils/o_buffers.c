@@ -40,7 +40,6 @@ typedef struct
 	uint32		shadowTag;
 	uint32		usageCount;
 	bool		dirty;
-	bool		converted;		/* true if version conversion has been applied */
 	char		data[ORIOLEDB_BLCKSZ];
 } OBuffer;
 
@@ -96,7 +95,6 @@ o_buffers_shmem_init(OBuffersDesc *desc, void *buf, bool found)
 				buffer->blockNum = -1;
 				buffer->usageCount = 0;
 				buffer->dirty = false;
-				buffer->converted = false;
 				buffer->tag = 0;
 			}
 		}
@@ -110,6 +108,9 @@ o_buffers_shmem_init(OBuffersDesc *desc, void *buf, bool found)
 static void
 open_file(OBuffersDesc *desc, uint32 tag, uint64 fileNum)
 {
+	uint32		version;
+	bool		found = false;
+	
 	Assert(OBuffersMaxTagIsValid(tag));
 
 	if (desc->curFile >= 0 &&
@@ -120,32 +121,92 @@ open_file(OBuffersDesc *desc, uint32 tag, uint64 fileNum)
 	if (desc->curFile >= 0)
 		FileClose(desc->curFile);
 
-	pg_snprintf(desc->curFileName, MAXPGPATH,
-				desc->filenameTemplate[tag],
-				(uint32) (fileNum >> 32),
-				(uint32) fileNum);
-	desc->curFile = PathNameOpenFile(desc->curFileName,
-									 O_RDWR | O_CREAT | PG_BINARY);
+	/*
+	 * Try to open file with current version first, then fall back to older versions.
+	 * Version 0 means unversioned (no suffix), version 1+ adds .1, .2, etc suffix.
+	 */
+	for (version = desc->version[tag]; version >= 0; version--)
+	{
+		if (version == 0)
+		{
+			/* Unversioned file - use template as-is */
+			pg_snprintf(desc->curFileName, MAXPGPATH,
+						desc->filenameTemplate[tag],
+						(uint32) (fileNum >> 32),
+						(uint32) fileNum);
+		}
+		else
+		{
+			/* Versioned file - append .N suffix */
+			char base_name[MAXPGPATH];
+			pg_snprintf(base_name, MAXPGPATH,
+						desc->filenameTemplate[tag],
+						(uint32) (fileNum >> 32),
+						(uint32) fileNum);
+			pg_snprintf(desc->curFileName, MAXPGPATH, "%s.%u", base_name, version);
+		}
+		
+		desc->curFile = PathNameOpenFile(desc->curFileName,
+										 O_RDWR | O_CREAT | PG_BINARY);
+		if (desc->curFile >= 0)
+		{
+			desc->curFileVersion = version;
+			found = true;
+			break;
+		}
+		
+		/* If file doesn't exist and we're at version 0, break */
+		if (version == 0)
+			break;
+	}
+	
 	desc->curFileNum = fileNum;
 	desc->curFileTag = tag;
-	if (desc->curFile < 0)
+	
+	if (!found || desc->curFile < 0)
 		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not open undo log file %s: %m", desc->curFileName)));
+						errmsg("could not open buffer file %s: %m", desc->curFileName)));
 }
 
 static void
 unlink_file(OBuffersDesc *desc, uint32 tag, uint64 fileNum)
 {
 	static char fileNameToUnlink[MAXPGPATH];
+	uint32		version;
 
 	Assert(OBuffersMaxTagIsValid(tag));
 
-	pg_snprintf(fileNameToUnlink, MAXPGPATH,
-				desc->filenameTemplate[tag],
-				(uint32) (fileNum >> 32),
-				(uint32) fileNum);
-
-	(void) unlink(fileNameToUnlink);
+	/*
+	 * Delete all versions of the file.
+	 * Start from current version and go down to version 0 (unversioned).
+	 */
+	for (version = desc->version[tag]; version >= 0; version--)
+	{
+		if (version == 0)
+		{
+			/* Unversioned file */
+			pg_snprintf(fileNameToUnlink, MAXPGPATH,
+						desc->filenameTemplate[tag],
+						(uint32) (fileNum >> 32),
+						(uint32) fileNum);
+		}
+		else
+		{
+			/* Versioned file - append .N suffix */
+			char base_name[MAXPGPATH];
+			pg_snprintf(base_name, MAXPGPATH,
+						desc->filenameTemplate[tag],
+						(uint32) (fileNum >> 32),
+						(uint32) fileNum);
+			pg_snprintf(fileNameToUnlink, MAXPGPATH, "%s.%u", base_name, version);
+		}
+		
+		(void) unlink(fileNameToUnlink);
+		
+		/* If version is 0, we're done */
+		if (version == 0)
+			break;
+	}
 }
 
 static void
@@ -174,9 +235,13 @@ static void
 read_buffer(OBuffersDesc *desc, OBuffer *buffer)
 {
 	int			result;
+	uint32		file_version;
 
 	open_file(desc, buffer->tag,
 			  buffer->blockNum / (desc->singleFileSize / ORIOLEDB_BLCKSZ));
+	
+	file_version = desc->curFileVersion;
+	
 	result = OFileRead(desc->curFile, buffer->data, ORIOLEDB_BLCKSZ,
 					   (buffer->blockNum * ORIOLEDB_BLCKSZ) % desc->singleFileSize,
 					   WAIT_EVENT_SLRU_READ);
@@ -188,10 +253,24 @@ read_buffer(OBuffersDesc *desc, OBuffer *buffer)
 
 	if (result < ORIOLEDB_BLCKSZ)
 		memset(&buffer->data[result], 0, ORIOLEDB_BLCKSZ - result);
+	
+	/*
+	 * If we read from an older version file, apply transformation.
+	 */
+	if (file_version < desc->version[buffer->tag] && 
+		desc->transformCallback[buffer->tag] != NULL)
+	{
+		if (!desc->transformCallback[buffer->tag](buffer->data, buffer->tag, 
+												  file_version, desc->version[buffer->tag]))
+		{
+			ereport(PANIC, (errmsg("failed to transform buffer data from version %u to %u",
+								   file_version, desc->version[buffer->tag])));
+		}
+	}
 }
 
 static OBuffer *
-get_buffer(OBuffersDesc *desc, uint32 tag, int64 blockNum, bool write, bool *from_disk)
+get_buffer(OBuffersDesc *desc, uint32 tag, int64 blockNum, bool write)
 {
 	OBuffersGroup *group = &desc->groups[blockNum % desc->groupsCount];
 	OBuffer    *buffer = NULL;
@@ -201,8 +280,6 @@ get_buffer(OBuffersDesc *desc, uint32 tag, int64 blockNum, bool write, bool *fro
 	bool		prevDirty;
 	int64		prevBlockNum;
 	uint32		prevTag;
-
-	*from_disk = false;
 
 	/* First check if required buffer is already loaded */
 	LWLockAcquire(&group->groupCtlLock, LW_SHARED);
@@ -267,7 +344,6 @@ get_buffer(OBuffersDesc *desc, uint32 tag, int64 blockNum, bool write, bool *fro
 
 	buffer->usageCount = 1;
 	buffer->dirty = false;
-	buffer->converted = false;
 	buffer->blockNum = blockNum;
 	buffer->tag = tag;
 	buffer->shadowBlockNum = prevBlockNum;
@@ -281,9 +357,6 @@ get_buffer(OBuffersDesc *desc, uint32 tag, int64 blockNum, bool write, bool *fro
 	read_buffer(desc, buffer);
 
 	buffer->shadowBlockNum = -1;
-
-	/* Buffer was just read from disk */
-	*from_disk = true;
 
 	return buffer;
 }
@@ -300,8 +373,7 @@ o_buffers_rw(OBuffersDesc *desc, Pointer buf,
 
 	for (blockNum = firstBlockNum; blockNum <= lastBlockNum; blockNum++)
 	{
-		bool		from_disk = false;
-		OBuffer    *buffer = get_buffer(desc, tag, blockNum, write, &from_disk);
+		OBuffer    *buffer = get_buffer(desc, tag, blockNum, write);
 		uint32		copySize,
 					copyOffset;
 
@@ -324,19 +396,6 @@ o_buffers_rw(OBuffersDesc *desc, Pointer buf,
 		{
 			copySize = ORIOLEDB_BLCKSZ;
 			copyOffset = 0;
-		}
-
-		/*
-		 * Call the callback to process the buffer if all conditions are met:
-		 * - Not a write operation (only process on reads)
-		 * - Buffer was just loaded from disk (not from cache)
-		 * - Buffer hasn't been converted yet (prevents duplicate processing)
-		 * - A callback function is registered
-		 */
-		if (!write && from_disk && !buffer->converted && desc->processCallback)
-		{
-			desc->processCallback(buffer->data, tag, write, from_disk);
-			buffer->converted = true;
 		}
 
 		if (write)

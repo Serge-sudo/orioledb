@@ -82,32 +82,12 @@ static IOShmem *ioShmem = NULL;
 static int	num_io_lwlocks;
 static bool io_in_progress = false;
 
-/*
- * Flag to track if we're reading from version 1 pages (for undo conversion).
- * This is set when the first version 1 page is encountered and remains true.
- * All pages in a cluster have the same version, so once set, it applies to all
- * subsequent undo record reads.
- * 
- * Thread safety: The flag only transitions from false to true, never back.
- * Multiple threads may set it concurrently, which is harmless since the write
- * is idempotent (always setting to true). Readers may briefly see false while
- * a concurrent write is in progress, but since all data in the cluster is the
- * same version, any missed conversion will be corrected on subsequent reads.
- * 
- * Declared volatile to ensure visibility across threads. While atomic operations
- * would provide stronger guarantees, volatile is sufficient for this write-once
- * flag pattern in a recovery/migration context where occasional missed reads
- * during the initial transition are acceptable.
- */
-volatile bool orioledb_reading_v1_pages = false;
-
 static bool prepare_non_leaf_page(Page p);
 static uint64 get_free_disk_offset(BTreeDescr *desc);
 static bool get_free_disk_extent(BTreeDescr *desc, uint32 chkpNum,
 								 off_t page_size, FileExtent *extent);
 static bool get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 											FileExtent *extent, uint32 checkpoint_number);
-static void convert_page_undo_records_v1_to_v2(Pointer page);
 
 static bool write_page_to_disk(BTreeDescr *desc, FileExtent *extent,
 							   uint32 curChkpNum,
@@ -1166,35 +1146,6 @@ get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 }
 
 /*
- * Convert page from version 1 to version 2.
- * 
- * Currently, this is a placeholder function. The B-tree page format itself
- * hasn't changed between version 1 and 2. The version bump is primarily to
- * indicate that undo records referenced by this page are in the old format
- * (version 1 didn't have itemSizeHi field in UndoStackItem).
- * 
- * The actual conversion of undo records happens when they are read from
- * undo log files during recovery, not when B-tree pages are read.
- */
-static void
-convert_page_undo_records_v1_to_v2(Pointer page)
-{
-	/*
-	 * Set global flag to indicate we're dealing with version 1 data.
-	 * This will be used by undo record reading code to zero out
-	 * the itemSizeHi field in UndoStackItem structures.
-	 */
-	orioledb_reading_v1_pages = true;
-
-	/*
-	 * No conversion needed for B-tree page format itself.
-	 * This function is called to mark that the page has been processed
-	 * and validated for version compatibility.
-	 */
-	(void) page;	/* unused */
-}
-
-/*
  * Reads a page from disk to the img from a valid downlink. It's fills an empty
  * array of offsets for the page.
  */
@@ -1239,18 +1190,13 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 			page_version = ((OrioleDBOndiskPageHeader *) img)->page_version;
 			if (page_version != ORIOLEDB_PAGE_VERSION)
 			{
-				if (page_version == 1 && ORIOLEDB_PAGE_VERSION == 2)
-				{
-					/*
-					 * Convert from version 1 to version 2.
-					 * Version 1 didn't have itemSizeHi in UndoStackItem.
-					 */
-					convert_page_undo_records_v1_to_v2(img);
-				}
-				else
-				{
-					elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", page_version, ORIOLEDB_PAGE_VERSION);
-				}
+				/*
+				 * Now we have only one page version (1). When we have
+				 * different versions we'll need to bump ORIOLEDB_PAGE_VERSION
+				 * and add on-the-fly conversion function from all previous
+				 * page versions in this place
+				 */
+				elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", page_version, ORIOLEDB_PAGE_VERSION);
 			}
 		}
 	}
@@ -1283,11 +1229,14 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 
 				if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION)
 				{
-					if (ondisk_page_header.page_version != 1 || ORIOLEDB_PAGE_VERSION != 2)
-					{
-						elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
-					}
-					/* Version 1 to 2 conversion is handled after decompression */
+					/*
+					 * Now we have only one page version (1). When we have
+					 * different versions we'll need to bump
+					 * ORIOLEDB_PAGE_VERSION and add on-the-fly conversion
+					 * function from all previous page versions after
+					 * decompression.
+					 */
+					elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
 				}
 
 				if (ondisk_page_header.compress_version != ORIOLEDB_COMPRESS_VERSION)
@@ -1299,16 +1248,10 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 					 * function from all previous compress versions
 					 * before/during decompression.
 					 */
-					elog(FATAL, "Compress version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.compress_version, ORIOLEDB_COMPRESS_VERSION);
+					elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
 				}
 
 				o_decompress_page(buf + sizeof(OrioleDBOndiskPageHeader), ondisk_page_header.compress_page_size, img);
-				
-				/* Apply version conversion after decompression if needed */
-				if (ondisk_page_header.page_version == 1 && ORIOLEDB_PAGE_VERSION == 2)
-				{
-					convert_page_undo_records_v1_to_v2(img);
-				}
 			}
 		}
 		else
@@ -1335,18 +1278,13 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 				{
 					if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION)
 					{
-						if (ondisk_page_header.page_version == 1 && ORIOLEDB_PAGE_VERSION == 2)
-						{
-							/*
-							 * Convert from version 1 to version 2.
-							 * Version 1 didn't have itemSizeHi in UndoStackItem.
-							 */
-							convert_page_undo_records_v1_to_v2(img);
-						}
-						else
-						{
-							elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
-						}
+						/*
+						 * Now we have only one page version (1). When we have
+						 * different versions we'll need to bump
+						 * ORIOLEDB_PAGE_VERSION and add on-the-fly conversion
+						 * function from all previous page versions here
+						 */
+						elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
 					}
 				}
 				btree_page_header = (BTreePageHeader *) img;

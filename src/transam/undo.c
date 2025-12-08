@@ -18,7 +18,6 @@
 
 #include "orioledb.h"
 
-#include "btree/io.h"
 #include "btree/scan.h"
 #include "btree/undo.h"
 #include "catalog/storage.h"
@@ -179,51 +178,34 @@ static Size reserved_undo_sizes[(int) UndoLogsCount] =
 };
 
 /*
- * Maximum size for version 1 undo records (16-bit size field).
- * Version 1 used only itemSizeLo (uint16), limiting records to 64KB.
+ * Maximum size for version 0 undo records (16-bit size field).
+ * Version 0 used only itemSizeLo (uint16), limiting records to 64KB.
  */
-#define UNDO_V1_MAX_ITEM_SIZE	(64 * 1024)
+#define UNDO_V0_MAX_ITEM_SIZE	(64 * 1024)
 
 /*
- * Check if a buffer tag represents an undo log type.
+ * Current undo file version.
+ * Version 0: Original format with 16-bit itemSizeLo only
+ * Version 1: Added 32-bit itemSizeHi for 48-bit sizes
  */
-static inline bool
-is_undo_log_tag(uint32 tag)
-{
-	return (tag == (uint32)UndoLogRegular ||
-			tag == (uint32)UndoLogRegularPageLevel ||
-			tag == (uint32)UndoLogSystem);
-}
+#define UNDO_FILE_VERSION 1
 
 /*
- * Callback to process undo buffer pages after reading from disk.
- * This converts version 1 undo records by zeroing out itemSizeHi field.
+ * Transformation callback for converting undo pages from version 0 to version 1.
+ * This zeros out the itemSizeHi field in all UndoStackItem records in the page.
  */
-static void
-process_undo_buffer_callback(Pointer data, uint32 tag, bool write, bool from_disk)
+static bool
+transform_undo_v0_to_v1(Pointer data, uint32 tag, uint32 from_version, uint32 to_version)
 {
 	UndoLocation offset = 0;
 	
-	/*
-	 * Only process on read from disk, and only for undo log tags.
-	 */
-	if (write || !from_disk || !is_undo_log_tag(tag))
-		return;
-	
-	/*
-	 * Only process if we've detected version 1 pages.
-	 * Once set, this flag remains true for the cluster.
-	 */
-	if (!orioledb_reading_v1_pages)
-		return;
+	/* Only transform from version 0 to version 1 */
+	if (from_version != 0 || to_version != 1)
+		return false;
 	
 	/*
 	 * Walk through all undo records in this page and zero out itemSizeHi.
 	 * Each record starts with a UndoStackItem header.
-	 * 
-	 * Note: This processes the entire page at once when it's first loaded
-	 * from disk. The OBuffer.converted flag ensures we only do this once
-	 * per page.
 	 */
 	while (offset + sizeof(UndoStackItem) <= ORIOLEDB_BLCKSZ)
 	{
@@ -231,8 +213,8 @@ process_undo_buffer_callback(Pointer data, uint32 tag, bool write, bool from_dis
 		Size itemSize;
 		
 		/*
-		 * Zero out itemSizeHi for version 1 compatibility.
-		 * Version 1 didn't have this field, and it may contain garbage.
+		 * Zero out itemSizeHi for version 0 compatibility.
+		 * Version 0 didn't have this field, and it may contain garbage.
 		 * After zeroing, UNDO_GET_ITEM_SIZE will only use itemSizeLo.
 		 */
 		item->itemSizeHi = 0;
@@ -242,11 +224,11 @@ process_undo_buffer_callback(Pointer data, uint32 tag, bool write, bool from_dis
 		
 		/*
 		 * Sanity check: item size should be reasonable.
-		 * Version 1 records can only be up to 64KB (16-bit size).
+		 * Version 0 records can only be up to 64KB (16-bit size).
 		 * If size seems invalid, we've reached the end of valid records.
 		 */
 		if (itemSize < sizeof(UndoStackItem) || 
-		    itemSize > UNDO_V1_MAX_ITEM_SIZE ||
+		    itemSize > UNDO_V0_MAX_ITEM_SIZE ||
 		    offset + itemSize > ORIOLEDB_BLCKSZ)
 			break;
 			
@@ -256,15 +238,20 @@ process_undo_buffer_callback(Pointer data, uint32 tag, bool write, bool from_dis
 		if (offset >= ORIOLEDB_BLCKSZ)
 			break;
 	}
+	
+	return true;
 }
 
 static OBuffersDesc undoBuffersDesc =
 {
 	.singleFileSize = UNDO_FILE_SIZE,
-	.filenameTemplate = {ORIOLEDB_UNDO_DATA_ROW_FILENAME_TEMPLATE, ORIOLEDB_UNDO_DATA_PAGE_FILENAME_TEMPLATE, ORIOLEDB_UNDO_SYSTEM_FILENAME_TEMPLATE},
+	.filenameTemplate = {ORIOLEDB_UNDO_DATA_ROW_FILENAME_TEMPLATE, 
+						 ORIOLEDB_UNDO_DATA_PAGE_FILENAME_TEMPLATE, 
+						 ORIOLEDB_UNDO_SYSTEM_FILENAME_TEMPLATE},
 	.groupCtlTrancheName = "undoBuffersGroupCtlTranche",
 	.bufferCtlTrancheName = "undoBuffersCtlTranche",
-	.processCallback = process_undo_buffer_callback
+	.version = {UNDO_FILE_VERSION, UNDO_FILE_VERSION, UNDO_FILE_VERSION, 0},
+	.transformCallback = {transform_undo_v0_to_v1, transform_undo_v0_to_v1, transform_undo_v0_to_v1, NULL}
 };
 
 static void wait_for_reserved_location(UndoLogType undoType,

@@ -22,14 +22,15 @@ typedef struct OBuffersGroup OBuffersGroup;
 	((tag) >= 0 && (tag) < OBuffersMaxTags)
 
 /*
- * Callback function type for processing buffer data after reading from disk.
+ * Callback function type for transforming buffer data from an older version.
  * Parameters:
  *   data - pointer to buffer data
  *   tag - buffer tag (identifies which type of data)
- *   write - true if writing, false if reading
- *   from_disk - true if data was just read from disk, false if from memory
+ *   from_version - the version number the data was read from
+ *   to_version - the target version number
+ * Returns: true if transformation was successful, false otherwise
  */
-typedef void (*OBuffersProcessCallback)(Pointer data, uint32 tag, bool write, bool from_disk);
+typedef bool (*OBuffersTransformCallback)(Pointer data, uint32 tag, uint32 from_version, uint32 to_version);
 
 typedef struct
 {
@@ -39,7 +40,8 @@ typedef struct
 	const char *groupCtlTrancheName;
 	const char *bufferCtlTrancheName;
 	uint32		buffersCount;
-	OBuffersProcessCallback processCallback;	/* optional callback for processing data */
+	uint32		version[OBuffersMaxTags];					/* version for each tag, 0 means unversioned */
+	OBuffersTransformCallback transformCallback[OBuffersMaxTags];	/* transformation callbacks for each tag */
 
 	/* these fields are initilized in o_buffers.c */
 	uint32		groupsCount;
@@ -49,6 +51,7 @@ typedef struct
 	char		curFileName[MAXPGPATH];
 	uint32		curFileTag;
 	uint64		curFileNum;
+	uint32		curFileVersion;		/* version of currently open file */
 } OBuffersDesc;
 
 extern Size o_buffers_shmem_needs(OBuffersDesc *desc);
