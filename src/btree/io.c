@@ -1150,24 +1150,41 @@ get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 /*
  * Helper function to zero out itemSizeHi for a specific undo location.
  * Reads the undo record header and writes it back with itemSizeHi zeroed.
+ * 
+ * This function follows the undo chain (prev pointers) and zeros out
+ * itemSizeHi for all predecessors in the linked list, since undo records
+ * form a chain through the prev field.
  */
 static void
 zero_undo_item_size_hi(UndoLocation undoLocation)
 {
 	UndoStackItem item;
 	UndoLogType undoType;
+	UndoLocation currentLocation;
 	
 	/* Determine undo log type from location */
 	undoType = (UndoLogType)(undoLocation >> 62);
+	currentLocation = undoLocation;
 	
-	/* Read the undo stack item header */
-	undo_read(undoType, undoLocation, sizeof(UndoStackItem), (Pointer) &item);
-	
-	/* Zero out the high bits */
-	item.itemSizeHi = 0;
-	
-	/* Write it back */
-	undo_write(undoType, undoLocation, sizeof(UndoStackItem), (Pointer) &item);
+	/* Follow the undo chain and zero itemSizeHi for each item */
+	while (currentLocation != InvalidUndoLocation)
+	{
+		/* Check if this undo record still exists */
+		if (!UNDO_REC_EXISTS(undoType, currentLocation))
+			break;
+		
+		/* Read the undo stack item header */
+		undo_read(undoType, currentLocation, sizeof(UndoStackItem), (Pointer) &item);
+		
+		/* Zero out the high bits */
+		item.itemSizeHi = 0;
+		
+		/* Write it back */
+		undo_write(undoType, currentLocation, sizeof(UndoStackItem), (Pointer) &item);
+		
+		/* Move to the previous item in the chain */
+		currentLocation = item.prev;
+	}
 }
 
 /*
