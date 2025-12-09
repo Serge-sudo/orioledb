@@ -1154,6 +1154,11 @@ get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
  * This function follows the undo chain (prev pointers) and zeros out
  * itemSizeHi for all predecessors in the linked list, since undo records
  * form a chain through the prev field.
+ * 
+ * Note: This is called during page load from disk (read_page_from_disk),
+ * which happens during recovery or initial page access. At this point,
+ * there is no concurrent access to these undo records, so no locking
+ * is required for the read-modify-write operations.
  */
 static void
 zero_undo_item_size_hi(UndoLocation undoLocation)
