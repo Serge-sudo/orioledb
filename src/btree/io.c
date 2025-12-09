@@ -1165,16 +1165,19 @@ zero_undo_item_size_hi(UndoLocation undoLocation)
 {
 	UndoStackItem item;
 	UndoLogType undoType;
-	UndoLocation currentLocation;
+	UndoLocation currentLocation = undoLocation;
 	
 	/* Determine undo log type from location */
 	undoType = (UndoLogType)(undoLocation >> 62);
-	currentLocation = undoLocation;
 	
 	/* Follow the undo chain and zero itemSizeHi for each item */
 	while (currentLocation != InvalidUndoLocation)
 	{
-		/* Check if this undo record still exists */
+		/*
+		 * Check if this undo record still exists. Records may have been
+		 * truncated or are no longer available if they fall outside the
+		 * retention window.
+		 */
 		if (!UNDO_REC_EXISTS(undoType, currentLocation))
 			break;
 		
