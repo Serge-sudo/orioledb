@@ -1219,7 +1219,7 @@ convert_page_between_versions(Pointer page, uint32 from_version, uint32 to_versi
 		/* No conversion needed */
 		return;
 	}
-	
+
 	/*
 	 * For now, we only support sequential upgrades (e.g., 1->2, 2->3).
 	 * If we need to support skipping versions (e.g., 1->3), we can
@@ -1230,7 +1230,7 @@ convert_page_between_versions(Pointer page, uint32 from_version, uint32 to_versi
 		elog(ERROR, "Cannot downgrade page from version %u to version %u",
 			 from_version, to_version);
 	}
-	
+
 	/* Apply conversions sequentially for each version step */
 	while (from_version < to_version)
 	{
@@ -1241,14 +1241,14 @@ convert_page_between_versions(Pointer page, uint32 from_version, uint32 to_versi
 				convert_page_v1_to_v2(page);
 				from_version = 2;
 				break;
-				
+
 			/* Future version conversions can be added here:
 			 * case 2:
 			 *     convert_page_v2_to_v3(page);
 			 *     from_version = 3;
 			 *     break;
 			 */
-				
+
 			default:
 				elog(ERROR, "Unsupported page version conversion from %u to %u",
 					 from_version, to_version);
