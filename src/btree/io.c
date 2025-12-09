@@ -89,7 +89,7 @@ static bool get_free_disk_extent(BTreeDescr *desc, uint32 chkpNum,
 								 off_t page_size, FileExtent *extent);
 static bool get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 											FileExtent *extent, uint32 checkpoint_number);
-static void convert_page_undo_records_v1_to_v2(Pointer page);
+static void convert_page_between_versions(Pointer page, uint32 from_version, uint32 to_version);
 
 static bool write_page_to_disk(BTreeDescr *desc, FileExtent *extent,
 							   uint32 curChkpNum,
@@ -1176,7 +1176,7 @@ zero_undo_item_size_hi(UndoLocation undoLocation)
  * This walks through the page and processes all undo locations.
  */
 static void
-convert_page_undo_records_v1_to_v2(Pointer page)
+convert_page_v1_to_v2(Pointer page)
 {
 	BTreePageHeader *header = (BTreePageHeader *) page;
 	BTreePageItemLocator loc;
@@ -1201,6 +1201,57 @@ convert_page_undo_records_v1_to_v2(Pointer page)
 			{
 				zero_undo_item_size_hi(tuphdr->undoLocation);
 			}
+		}
+	}
+}
+
+/*
+ * General interface for converting pages between versions.
+ * This function dispatches to specific conversion functions based on
+ * the source and target versions.
+ */
+static void
+convert_page_between_versions(Pointer page, uint32 from_version, uint32 to_version)
+{
+	/* Handle conversion paths */
+	if (from_version == to_version)
+	{
+		/* No conversion needed */
+		return;
+	}
+	
+	/*
+	 * For now, we only support sequential upgrades (e.g., 1->2, 2->3).
+	 * If we need to support skipping versions (e.g., 1->3), we can
+	 * implement a chain of conversions here.
+	 */
+	if (from_version > to_version)
+	{
+		elog(ERROR, "Cannot downgrade page from version %u to version %u",
+			 from_version, to_version);
+	}
+	
+	/* Apply conversions sequentially for each version step */
+	while (from_version < to_version)
+	{
+		switch (from_version)
+		{
+			case 1:
+				/* Convert from version 1 to version 2 */
+				convert_page_v1_to_v2(page);
+				from_version = 2;
+				break;
+				
+			/* Future version conversions can be added here:
+			 * case 2:
+			 *     convert_page_v2_to_v3(page);
+			 *     from_version = 3;
+			 *     break;
+			 */
+				
+			default:
+				elog(ERROR, "Unsupported page version conversion from %u to %u",
+					 from_version, to_version);
 		}
 	}
 }
@@ -1250,18 +1301,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 			page_version = ((OrioleDBOndiskPageHeader *) img)->page_version;
 			if (page_version != ORIOLEDB_PAGE_VERSION)
 			{
-				if (page_version == 1 && ORIOLEDB_PAGE_VERSION == 2)
-				{
-					/*
-					 * Convert from version 1 to version 2.
-					 * Version 1 didn't have itemSizeHi in UndoStackItem.
-					 */
-					convert_page_undo_records_v1_to_v2(img);
-				}
-				else
-				{
-					elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", page_version, ORIOLEDB_PAGE_VERSION);
-				}
+				convert_page_between_versions(img, page_version, ORIOLEDB_PAGE_VERSION);
 			}
 		}
 	}
@@ -1322,9 +1362,9 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 				o_decompress_page(buf + sizeof(OrioleDBOndiskPageHeader), ondisk_page_header.compress_page_size, img);
 				
 				/* Apply conversion after decompression if needed */
-				if (ondisk_page_header.page_version == 1 && ORIOLEDB_PAGE_VERSION == 2)
+				if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION)
 				{
-					convert_page_undo_records_v1_to_v2(img);
+					convert_page_between_versions(img, ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
 				}
 			}
 		}
@@ -1352,18 +1392,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 				{
 					if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION)
 					{
-						if (ondisk_page_header.page_version == 1 && ORIOLEDB_PAGE_VERSION == 2)
-						{
-							/*
-							 * Convert from version 1 to version 2.
-							 * Version 1 didn't have itemSizeHi in UndoStackItem.
-							 */
-							convert_page_undo_records_v1_to_v2(img);
-						}
-						else
-						{
-							elog(FATAL, "Page version %u of OrioleDB cluster is not among supported for conversion %u", ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
-						}
+						convert_page_between_versions(img, ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
 					}
 				}
 				btree_page_header = (BTreePageHeader *) img;
