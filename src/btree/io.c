@@ -1170,50 +1170,53 @@ static void
 zero_undo_item_size_hi(UndoLocation undoLocation, UndoLogType undoType)
 {
 	UndoStackItem item;
-	UndoLocation currentLocation = undoLocation;
 
-	/* Follow the undo chain and zero itemSizeHi for each item */
-	while (currentLocation != InvalidUndoLocation)
+	/*
+	 * Only process the head undo item directly referenced by the page.
+	 * We don't follow the prev chain because:
+	 * 1. In v1 format, the padding (including itemSizeHi) contains garbage
+	 * 2. Following prev chain using garbage data leads to invalid locations
+	 * 3. Items earlier in the chain may already be v2 format or may have
+	 *    been processed when loading other pages
+	 * 4. The head item is what matters - it's the most recent and will be
+	 *    accessed when the page is used
+	 */
+
+	/*
+	 * Check if this undo record still exists. Records may have been
+	 * truncated or are no longer available if they fall outside the
+	 * retention window. If so, we can skip it - truncated records
+	 * won't be accessed anyway.
+	 */
+	if (!UNDO_REC_EXISTS(undoType, undoLocation))
+		return;
+
+	/* Read the undo stack item header */
+	undo_read(undoType, undoLocation, sizeof(UndoStackItem), (Pointer) &item);
+
+	/* Zero out the high bits */
+	item.itemSizeHi = 0;
+
+	/*
+	 * Try to write it back. The undo_write function has assertions about
+	 * retention windows. If the record is outside the retention window,
+	 * we can't write it back, but that's okay - it won't be accessed.
+	 * We wrap this in a PG_TRY block to catch any assertions or errors.
+	 */
+	PG_TRY();
+	{
+		undo_write(undoType, undoLocation, sizeof(UndoStackItem), (Pointer) &item);
+	}
+	PG_CATCH();
 	{
 		/*
-		 * Check if this undo record still exists. Records may have been
-		 * truncated or are no longer available if they fall outside the
-		 * retention window. If so, we can skip it - truncated records
+		 * If we can't write (e.g., assertion failure due to retention),
+		 * just skip this record. The record is likely truncated and
 		 * won't be accessed anyway.
 		 */
-		if (!UNDO_REC_EXISTS(undoType, currentLocation))
-			break;
-
-		/* Read the undo stack item header */
-		undo_read(undoType, currentLocation, sizeof(UndoStackItem), (Pointer) &item);
-
-		/* Zero out the high bits */
-		item.itemSizeHi = 0;
-
-		/*
-		 * Try to write it back. The undo_write function has assertions about
-		 * retention windows. If the record is outside the retention window,
-		 * we can't write it back, but that's okay - it won't be accessed.
-		 * We wrap this in a PG_TRY block to catch any assertions or errors.
-		 */
-		PG_TRY();
-		{
-			undo_write(undoType, currentLocation, sizeof(UndoStackItem), (Pointer) &item);
-		}
-		PG_CATCH();
-		{
-			/*
-			 * If we can't write (e.g., assertion failure due to retention),
-			 * just skip this record and continue with the chain.
-			 * The record is likely truncated and won't be accessed anyway.
-			 */
-			FlushErrorState();
-		}
-		PG_END_TRY();
-
-		/* Move to the previous item in the chain */
-		currentLocation = item.prev;
+		FlushErrorState();
 	}
+	PG_END_TRY();
 }
 
 /*
