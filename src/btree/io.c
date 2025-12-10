@@ -89,7 +89,7 @@ static bool get_free_disk_extent(BTreeDescr *desc, uint32 chkpNum,
 								 off_t page_size, FileExtent *extent);
 static bool get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 											FileExtent *extent, uint32 checkpoint_number);
-static void convert_page_between_versions(Pointer page, uint32 from_version, uint32 to_version);
+static void convert_page_between_versions(Pointer page, uint32 from_version, uint32 to_version, UndoLogType undoType);
 
 static bool write_page_to_disk(BTreeDescr *desc, FileExtent *extent,
 							   uint32 curChkpNum,
@@ -1161,14 +1161,10 @@ get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
  * is required for the read-modify-write operations.
  */
 static void
-zero_undo_item_size_hi(UndoLocation undoLocation)
+zero_undo_item_size_hi(UndoLocation undoLocation, UndoLogType undoType)
 {
 	UndoStackItem item;
-	UndoLogType undoType;
 	UndoLocation currentLocation = undoLocation;
-	
-	/* Determine undo log type from location */
-	undoType = (UndoLogType)(undoLocation >> 62);
 	
 	/* Follow the undo chain and zero itemSizeHi for each item */
 	while (currentLocation != InvalidUndoLocation)
@@ -1201,18 +1197,18 @@ zero_undo_item_size_hi(UndoLocation undoLocation)
  * This walks through the page and processes all undo locations.
  */
 static void
-convert_page_v1_to_v2(Pointer page)
+convert_page_v1_to_v2(Pointer page, UndoLogType undoType)
 {
 	BTreePageHeader *header = (BTreePageHeader *) page;
 	BTreePageItemLocator loc;
 	
-	/* Process page-level undo location */
+	/* Process page-level undo location (uses page-level undo type) */
 	if (header->undoLocation != InvalidUndoLocation)
 	{
-		zero_undo_item_size_hi(header->undoLocation);
+		zero_undo_item_size_hi(header->undoLocation, GET_PAGE_LEVEL_UNDO_TYPE(undoType));
 	}
 	
-	/* Process tuple-level undo locations for leaf pages */
+	/* Process tuple-level undo locations for leaf pages (uses regular undo type) */
 	if (O_PAGE_IS(page, LEAF))
 	{
 		BTREE_PAGE_FOREACH_ITEMS(page, &loc)
@@ -1224,7 +1220,7 @@ convert_page_v1_to_v2(Pointer page)
 			
 			if (tuphdr->undoLocation != InvalidUndoLocation)
 			{
-				zero_undo_item_size_hi(tuphdr->undoLocation);
+				zero_undo_item_size_hi(tuphdr->undoLocation, undoType);
 			}
 		}
 	}
@@ -1236,7 +1232,7 @@ convert_page_v1_to_v2(Pointer page)
  * the source and target versions.
  */
 static void
-convert_page_between_versions(Pointer page, uint32 from_version, uint32 to_version)
+convert_page_between_versions(Pointer page, uint32 from_version, uint32 to_version, UndoLogType undoType)
 {
 	/* Handle conversion paths */
 	if (from_version == to_version)
@@ -1263,13 +1259,13 @@ convert_page_between_versions(Pointer page, uint32 from_version, uint32 to_versi
 		{
 			case 1:
 				/* Convert from version 1 to version 2 */
-				convert_page_v1_to_v2(page);
+				convert_page_v1_to_v2(page, undoType);
 				from_version = 2;
 				break;
 
 			/* Future version conversions can be added here:
 			 * case 2:
-			 *     convert_page_v2_to_v3(page);
+			 *     convert_page_v2_to_v3(page, undoType);
 			 *     from_version = 3;
 			 *     break;
 			 */
@@ -1326,7 +1322,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 			page_version = ((OrioleDBOndiskPageHeader *) img)->page_version;
 			if (page_version != ORIOLEDB_PAGE_VERSION)
 			{
-				convert_page_between_versions(img, page_version, ORIOLEDB_PAGE_VERSION);
+				convert_page_between_versions(img, page_version, ORIOLEDB_PAGE_VERSION, desc->undoType);
 			}
 		}
 	}
@@ -1389,7 +1385,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 				/* Apply conversion after decompression if needed */
 				if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION)
 				{
-					convert_page_between_versions(img, ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+					convert_page_between_versions(img, ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION, desc->undoType);
 				}
 			}
 		}
@@ -1417,7 +1413,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 				{
 					if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION)
 					{
-						convert_page_between_versions(img, ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+						convert_page_between_versions(img, ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION, desc->undoType);
 					}
 				}
 				btree_page_header = (BTreePageHeader *) img;
