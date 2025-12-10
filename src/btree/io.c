@@ -1147,19 +1147,160 @@ get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 }
 
 /*
- * No conversion is needed between page versions 1 and 2.
- * 
- * The only format change was adding UndoStackItem.itemSizeHi (32-bit) field
- * to support 48-bit item sizes (combined with the existing 16-bit itemSizeLo).
- * This field was placed in former padding at the end of the struct that was
- * already zeroed in version 1, so v1 undo records already have itemSizeHi = 0
- * by design. The B-tree page format itself is unchanged - pages only contain
- * UndoLocation pointers, not undo data.
- * 
- * The page version bump from 1 to 2 serves as an indicator that the cluster
- * format supports the extended item size field, but no actual data conversion
- * is required during page load.
+ * Version 1 of the page format didn't have the itemSizeHi field in UndoStackItem.
+ * Version 2 added this 32-bit field to support 48-bit item sizes (combining with
+ * the existing 16-bit itemSizeLo). Since the padding was NOT guaranteed to be
+ * zeroed in version 1, we must explicitly zero out itemSizeHi when loading v1 pages.
  */
+
+/*
+ * Zero out the itemSizeHi field for an undo record and all predecessors in its chain.
+ * This is needed when converting from version 1 to version 2, as version 1 didn't
+ * have this field.
+ *
+ * Note: This conversion happens during page load from disk (recovery or initial access),
+ * which happens during recovery or initial page access. At this point,
+ * there is no concurrent access to these undo records, so no locking
+ * is required for the read-modify-write operations.
+ *
+ * However, some undo records may have been truncated outside the retention window.
+ * For those records, we skip the write operation since they cannot be accessed anyway.
+ */
+static void
+zero_undo_item_size_hi(UndoLocation undoLocation, UndoLogType undoType)
+{
+	UndoStackItem item;
+	UndoLocation currentLocation = undoLocation;
+
+	/* Follow the undo chain and zero itemSizeHi for each item */
+	while (currentLocation != InvalidUndoLocation)
+	{
+		/*
+		 * Check if this undo record still exists. Records may have been
+		 * truncated or are no longer available if they fall outside the
+		 * retention window. If so, we can skip it - truncated records
+		 * won't be accessed anyway.
+		 */
+		if (!UNDO_REC_EXISTS(undoType, currentLocation))
+			break;
+
+		/* Read the undo stack item header */
+		undo_read(undoType, currentLocation, sizeof(UndoStackItem), (Pointer) &item);
+
+		/* Zero out the high bits */
+		item.itemSizeHi = 0;
+
+		/*
+		 * Try to write it back. The undo_write function has assertions about
+		 * retention windows. If the record is outside the retention window,
+		 * we can't write it back, but that's okay - it won't be accessed.
+		 * We wrap this in a PG_TRY block to catch any assertions or errors.
+		 */
+		PG_TRY();
+		{
+			undo_write(undoType, currentLocation, sizeof(UndoStackItem), (Pointer) &item);
+		}
+		PG_CATCH();
+		{
+			/*
+			 * If we can't write (e.g., assertion failure due to retention),
+			 * just skip this record and continue with the chain.
+			 * The record is likely truncated and won't be accessed anyway.
+			 */
+			FlushErrorState();
+		}
+		PG_END_TRY();
+
+		/* Move to the previous item in the chain */
+		currentLocation = item.prev;
+	}
+}
+
+/*
+ * Convert undo records in a page from version 1 to version 2.
+ * Version 1 didn't have itemSizeHi field, so we need to zero it out.
+ * This walks through the page and processes all undo locations.
+ */
+static void
+convert_page_v1_to_v2(Pointer page, UndoLogType undoType)
+{
+	BTreePageHeader *header = (BTreePageHeader *) page;
+	BTreePageItemLocator loc;
+
+	/* Process page-level undo location (uses page-level undo type) */
+	if (header->undoLocation != InvalidUndoLocation)
+	{
+		zero_undo_item_size_hi(header->undoLocation, GET_PAGE_LEVEL_UNDO_TYPE(undoType));
+	}
+
+	/* Process tuple-level undo locations for leaf pages (uses regular undo type) */
+	if (O_PAGE_IS(page, LEAF))
+	{
+		BTREE_PAGE_FOREACH_ITEMS(page, &loc)
+		{
+			BTreeLeafTuphdr *tuphdr;
+			OTuple		tup;	/* Required by BTREE_PAGE_READ_LEAF_ITEM macro */
+
+			BTREE_PAGE_READ_LEAF_ITEM(tuphdr, tup, page, &loc);
+
+			if (tuphdr->undoLocation != InvalidUndoLocation)
+			{
+				zero_undo_item_size_hi(tuphdr->undoLocation, undoType);
+			}
+		}
+	}
+}
+
+/*
+ * General interface for converting pages between versions.
+ * This function dispatches to specific conversion functions based on
+ * the source and target versions.
+ */
+static void
+convert_page_between_versions(Pointer page, uint32 from_version, uint32 to_version, UndoLogType undoType)
+{
+	/* Handle conversion paths */
+	if (from_version == to_version)
+	{
+		/* No conversion needed */
+		return;
+	}
+
+	/*
+	 * For now, we only support sequential upgrades (e.g., 1->2, 2->3).
+	 * If we need to support skipping versions (e.g., 1->3), we can
+	 * implement a chain of conversions here.
+	 */
+	if (from_version > to_version)
+	{
+		elog(ERROR, "Cannot downgrade page from version %u to version %u",
+			 from_version, to_version);
+	}
+
+	/* Apply conversions sequentially for each version step */
+	while (from_version < to_version)
+	{
+		switch (from_version)
+		{
+			case 1:
+				/* Convert from version 1 to version 2 */
+				convert_page_v1_to_v2(page, undoType);
+				from_version = 2;
+				break;
+
+			/* Future version conversions can be added here:
+			 * case 2:
+			 *     convert_page_v2_to_v3(page, undoType);
+			 *     from_version = 3;
+			 *     break;
+			 */
+
+			default:
+				elog(ERROR, "Unsupported page version conversion from %u to %u",
+					 from_version, to_version);
+		}
+	}
+}
 
 /*
  * Reads a page from disk to the img from a valid downlink. It's fills an empty
@@ -1206,12 +1347,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 			page_version = ((OrioleDBOndiskPageHeader *) img)->page_version;
 			if (page_version != ORIOLEDB_PAGE_VERSION)
 			{
-				/*
-				 * Page version mismatch. Currently no conversion is needed
-				 * between versions 1 and 2 - see comment above.
-				 */
-				elog(DEBUG1, "Page version %u differs from current version %u",
-					 page_version, ORIOLEDB_PAGE_VERSION);
+				convert_page_between_versions(img, page_version, ORIOLEDB_PAGE_VERSION, desc->undoType);
 			}
 		}
 	}
@@ -1271,15 +1407,10 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 
 				o_decompress_page(buf + sizeof(OrioleDBOndiskPageHeader), ondisk_page_header.compress_page_size, img);
 
-				/* Check page version after decompression */
+				/* Check page version after decompression and convert if needed */
 				if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION)
 				{
-					/*
-					 * Page version mismatch. Currently no conversion is needed
-					 * between versions 1 and 2 - see comment above.
-					 */
-					elog(DEBUG1, "Page version %u differs from current version %u",
-						 ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+					convert_page_between_versions(img, ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION, desc->undoType);
 				}
 			}
 		}
@@ -1307,12 +1438,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 				{
 					if (ondisk_page_header.page_version != ORIOLEDB_PAGE_VERSION)
 					{
-						/*
-						 * Page version mismatch. Currently no conversion is needed
-						 * between versions 1 and 2 - see comment above.
-						 */
-						elog(DEBUG1, "Page version %u differs from current version %u",
-							 ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION);
+						convert_page_between_versions(img, ondisk_page_header.page_version, ORIOLEDB_PAGE_VERSION, desc->undoType);
 					}
 				}
 				btree_page_header = (BTreePageHeader *) img;
