@@ -1149,15 +1149,16 @@ get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 /*
  * No conversion is needed between page versions 1 and 2.
  * 
- * The only format change was adding UndoStackItem.itemSizeHi field for
- * 48-bit item sizes. This field was placed in former padding at the end
- * of the struct that was already zeroed in version 1, so v1 undo records
- * already have itemSizeHi = 0 by design. The B-tree page format itself
- * is unchanged - pages only contain UndoLocation pointers, not undo data.
+ * The only format change was adding UndoStackItem.itemSizeHi (32-bit) field
+ * to support 48-bit item sizes (combined with the existing 16-bit itemSizeLo).
+ * This field was placed in former padding at the end of the struct that was
+ * already zeroed in version 1, so v1 undo records already have itemSizeHi = 0
+ * by design. The B-tree page format itself is unchanged - pages only contain
+ * UndoLocation pointers, not undo data.
  * 
- * The page version bump from 1 to 2 serves as an indicator that the
- * cluster format supports the extended item size field, but no actual
- * data conversion is required during page load.
+ * The page version bump from 1 to 2 serves as an indicator that the cluster
+ * format supports the extended item size field, but no actual data conversion
+ * is required during page load.
  */
 
 /*
