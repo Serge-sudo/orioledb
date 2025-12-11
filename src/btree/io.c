@@ -1205,7 +1205,7 @@ zero_undo_item_size_hi(UndoLocation undoLocation, UndoLogType undoType)
 	 */
 	PG_TRY();
 	{
-		undo_write(undoType, undoLocation, sizeof(UndoStackItem), (Pointer) &item);
+		undo_write(undoType, actualLocation, sizeof(UndoStackItem), (Pointer) &item);
 	}
 	PG_CATCH();
 	{
@@ -1230,13 +1230,13 @@ convert_page_v1_to_v2(Pointer page, UndoLogType undoType)
 	BTreePageHeader *header = (BTreePageHeader *) page;
 	BTreePageItemLocator loc;
 
-	/* Process page-level undo location (uses page-level undo type) */
+	/* Process page-level undo location (uses page-level undo type, no offset) */
 	if (header->undoLocation != InvalidUndoLocation)
 	{
-		zero_undo_item_size_hi(header->undoLocation, GET_PAGE_LEVEL_UNDO_TYPE(undoType));
+		zero_undo_item_size_hi(header->undoLocation, GET_PAGE_LEVEL_UNDO_TYPE(undoType), false);
 	}
 
-	/* Process tuple-level undo locations for leaf pages (uses regular undo type) */
+	/* Process tuple-level undo locations for leaf pages (uses regular undo type, with offset) */
 	if (O_PAGE_IS(page, LEAF))
 	{
 		BTREE_PAGE_FOREACH_ITEMS(page, &loc)
@@ -1248,7 +1248,7 @@ convert_page_v1_to_v2(Pointer page, UndoLogType undoType)
 
 			if (tuphdr->undoLocation != InvalidUndoLocation)
 			{
-				zero_undo_item_size_hi(tuphdr->undoLocation, undoType);
+				zero_undo_item_size_hi(tuphdr->undoLocation, undoType, true);
 			}
 		}
 	}
