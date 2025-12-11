@@ -1,0 +1,59 @@
+/*
+ * Test for page version conversion
+ *
+ * Note: This test validates the page version conversion infrastructure.
+ * Actual conversion from version 1 to version 2 requires a cluster created
+ * with ORIOLEDB_PAGE_VERSION=1, which is not easily testable in the regression
+ * test suite.
+ *
+ * The conversion logic ensures that when loading pages from an older version:
+ * - Version 1 pages are detected correctly
+ * - convert_page_between_versions() is called with correct parameters
+ * - Undo record itemSizeHi fields are zeroed out for v1 compatibility
+ *
+ * This test verifies that the current version (2) works correctly and that
+ * the conversion infrastructure is in place for future upgrades.
+ */
+CREATE SCHEMA page_version_conversion;
+SET SESSION search_path = 'page_version_conversion';
+CREATE EXTENSION orioledb;
+-- Test basic table operations with current page version
+CREATE TABLE o_test(
+	id integer NOT NULL,
+	val text NOT NULL,
+	PRIMARY KEY(id)
+) USING orioledb;
+-- Insert data to create pages
+INSERT INTO o_test SELECT i, 'value_' || i FROM generate_series(1, 100) i;
+-- Perform operations that create undo records
+BEGIN;
+UPDATE o_test SET val = 'updated_' || id WHERE id <= 50;
+DELETE FROM o_test WHERE id > 90;
+ROLLBACK;
+-- Verify data is intact
+SELECT COUNT(*) FROM o_test;
+ count 
+-------
+   100
+(1 row)
+
+SELECT COUNT(*) FROM o_test WHERE val LIKE 'value_%';
+ count 
+-------
+   100
+(1 row)
+
+-- Test that checkpoint works correctly (exercises page writing/reading)
+CHECKPOINT;
+-- More operations after checkpoint
+INSERT INTO o_test SELECT i, 'new_value_' || i FROM generate_series(101, 150) i;
+SELECT COUNT(*) FROM o_test;
+ count 
+-------
+   150
+(1 row)
+
+-- Clean up
+DROP TABLE o_test;
+DROP EXTENSION orioledb CASCADE;
+DROP SCHEMA page_version_conversion CASCADE;

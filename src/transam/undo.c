@@ -18,6 +18,7 @@
 
 #include "orioledb.h"
 
+#include "btree/io.h"
 #include "btree/scan.h"
 #include "btree/undo.h"
 #include "catalog/storage.h"
