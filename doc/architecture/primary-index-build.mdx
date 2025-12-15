@@ -52,6 +52,11 @@ not `CREATE INDEX CONCURRENTLY`).
    - Parallel path: `rebuild_indices_worker_sort()` performs the same scan in each
      worker, writing into participant tuplesorts and accumulating tuple counts in
      shared `oIdxShared`.
+   - Page residency rationale: the sequential scan is expected to pull pages into the
+     shared buffer pool so later batches (workers or leader) can reuse them without
+     repeated disk reads. If pages are not cached, tuplesort accumulation becomes
+     I/O-bound; ensuring scan uses shared buffers (not direct/local buffers) is key to
+     keep heap-to-sort throughput stable.
 
 4. **Sorting**
    - `tuplesort_begin_orioledb_index()` / `tuplesort_begin_orioledb_toast()` create
