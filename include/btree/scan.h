@@ -18,12 +18,27 @@
 #include "btree/page_contents.h"
 
 #include "executor/tuptable.h"
+#include "storage/lwlock.h"
 #include "utils/sampling.h"
+
+#define BTREE_SCAN_CACHE_SLOTS 8
+
+typedef struct
+{
+	uint64		downlink;
+	CommitSeqNo csn;
+	bool		valid;
+	char		page[ORIOLEDB_BLCKSZ];
+} BTreeScanCacheEntry;
 
 typedef struct
 {
 	int			pageLoadTrancheId,
-				downlinksPublishTrancheId;
+				downlinksPublishTrancheId,
+				cacheTrancheId;
+	LWLock		cacheLock;
+	BTreeScanCacheEntry cache[BTREE_SCAN_CACHE_SLOTS];
+	uint32		cacheClock;
 } BTreeScanShmem;
 
 typedef struct BTreeSeqScan BTreeSeqScan;
