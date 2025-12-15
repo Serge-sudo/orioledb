@@ -56,8 +56,8 @@ not `CREATE INDEX CONCURRENTLY`).
      shared buffer pool so later batches (workers or leader) can reuse them without
      repeated disk reads. If pages are not cached, tuplesort accumulation becomes
      I/O-bound; ensuring scan uses shared buffers (not direct/local buffers) is key to
-     keep heap-to-sort throughput stable. See also buffering details in
-     `doc/architecture/buffering.mdx`.
+     keep heap-to-sort throughput stable. For buffer manager mechanics (separate from
+     WAL/undo buffering), see `doc/architecture/buffering.mdx`.
 
 4. **Sorting**
    - `tuplesort_begin_orioledb_index()` / `tuplesort_begin_orioledb_toast()` create
