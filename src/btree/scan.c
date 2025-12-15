@@ -148,18 +148,26 @@ static void get_next_key(BTreeSeqScan *scan, BTreePageItemLocator *intLoc, OFixe
 
 BTreeScanShmem *btreeScanShmem;
 
+static inline uint32
+btree_scan_cache_slot(uint64 downlink, CommitSeqNo csn)
+{
+	uint64		hash = downlink ^ ((uint64) csn << 32) ^ (uint64) csn;
+
+	return (uint32) (hash % BTREE_SCAN_CACHE_SLOTS);
+}
+
 static bool
 btree_scan_try_cache_fetch(uint64 downlink, CommitSeqNo csn, Pointer dst)
 {
-	int			i;
-
 	if (btreeScanShmem == NULL)
 		return false;
 
+	Assert(dst != NULL);
+
 	LWLockAcquire(&btreeScanShmem->cacheLock, LW_SHARED);
-	for (i = 0; i < BTREE_SCAN_CACHE_SLOTS; i++)
 	{
-		BTreeScanCacheEntry *entry = &btreeScanShmem->cache[i];
+		uint32		slot = btree_scan_cache_slot(downlink, csn);
+		BTreeScanCacheEntry *entry = &btreeScanShmem->cache[slot];
 
 		if (entry->valid && entry->downlink == downlink && entry->csn == csn)
 		{
@@ -175,21 +183,20 @@ btree_scan_try_cache_fetch(uint64 downlink, CommitSeqNo csn, Pointer dst)
 static void
 btree_scan_cache_store(uint64 downlink, CommitSeqNo csn, Pointer src)
 {
-	uint32		slot;
-	BTreeScanCacheEntry *entry;
-
 	if (btreeScanShmem == NULL)
 		return;
 
 	LWLockAcquire(&btreeScanShmem->cacheLock, LW_EXCLUSIVE);
-	slot = pg_atomic_fetch_add_u32(&btreeScanShmem->cacheClock, 1) % BTREE_SCAN_CACHE_SLOTS;
-	entry = &btreeScanShmem->cache[slot];
-	entry->valid = false;
-	entry->downlink = downlink;
-	entry->csn = csn;
-	memcpy(entry->page, src, ORIOLEDB_BLCKSZ);
-	pg_write_barrier();
-	entry->valid = true;
+	{
+		uint32		slot = btree_scan_cache_slot(downlink, csn);
+		BTreeScanCacheEntry *entry = &btreeScanShmem->cache[slot];
+
+		entry->downlink = downlink;
+		entry->csn = csn;
+		memcpy(entry->page, src, ORIOLEDB_BLCKSZ);
+		pg_write_barrier();
+		entry->valid = true;
+	}
 	LWLockRelease(&btreeScanShmem->cacheLock);
 }
 
@@ -210,7 +217,6 @@ btree_scan_init_shmem(Pointer ptr, bool found)
 		btreeScanShmem->downlinksPublishTrancheId = LWLockNewTrancheId();
 		btreeScanShmem->cacheTrancheId = LWLockNewTrancheId();
 		memset(btreeScanShmem->cache, 0, sizeof(btreeScanShmem->cache));
-		pg_atomic_init_u32(&btreeScanShmem->cacheClock, 0);
 		LWLockInitialize(&btreeScanShmem->cacheLock, btreeScanShmem->cacheTrancheId);
 	}
 
