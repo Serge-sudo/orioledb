@@ -22,8 +22,9 @@
 #include "utils/sampling.h"
 
 /*
- * Small direct-mapped cache; 32 slots keeps footprint low while covering hot
- * leaves (frequently touched pages across workers during sequential builds).
+ * Small direct-mapped cache in shared memory (OrioleDB shared_buffers); 32 slots
+ * keeps footprint low while covering hot leaves (frequently touched pages across
+ * workers during sequential builds).
  */
 #define BTREE_SCAN_CACHE_SLOTS 32
 
