@@ -151,7 +151,7 @@ BTreeScanShmem *btreeScanShmem;
 static inline uint32
 btree_scan_cache_slot(uint64 downlink, CommitSeqNo csn)
 {
-	uint64		hash = downlink ^ ((uint64) csn << 32) ^ (uint64) csn;
+	uint64		hash = downlink ^ ((uint64) csn * UINT64CONST(0x9E3779B97F4A7C15));
 
 	return (uint32) (hash % BTREE_SCAN_CACHE_SLOTS);
 }
@@ -159,22 +159,23 @@ btree_scan_cache_slot(uint64 downlink, CommitSeqNo csn)
 static bool
 btree_scan_try_cache_fetch(uint64 downlink, CommitSeqNo csn, Pointer dst)
 {
+	uint32		slot;
+	BTreeScanCacheEntry *entry;
+
 	if (btreeScanShmem == NULL)
 		return false;
 
 	Assert(dst != NULL);
 
 	LWLockAcquire(&btreeScanShmem->cacheLock, LW_SHARED);
-	{
-		uint32		slot = btree_scan_cache_slot(downlink, csn);
-		BTreeScanCacheEntry *entry = &btreeScanShmem->cache[slot];
+	slot = btree_scan_cache_slot(downlink, csn);
+	entry = &btreeScanShmem->cache[slot];
 
-		if (entry->valid && entry->downlink == downlink && entry->csn == csn)
-		{
-			memcpy(dst, entry->page, ORIOLEDB_BLCKSZ);
-			LWLockRelease(&btreeScanShmem->cacheLock);
-			return true;
-		}
+	if (entry->valid && entry->downlink == downlink && entry->csn == csn)
+	{
+		memcpy(dst, entry->page, ORIOLEDB_BLCKSZ);
+		LWLockRelease(&btreeScanShmem->cacheLock);
+		return true;
 	}
 	LWLockRelease(&btreeScanShmem->cacheLock);
 	return false;
@@ -183,20 +184,21 @@ btree_scan_try_cache_fetch(uint64 downlink, CommitSeqNo csn, Pointer dst)
 static void
 btree_scan_cache_store(uint64 downlink, CommitSeqNo csn, Pointer src)
 {
+	uint32		slot;
+	BTreeScanCacheEntry *entry;
+
 	if (btreeScanShmem == NULL)
 		return;
 
 	LWLockAcquire(&btreeScanShmem->cacheLock, LW_EXCLUSIVE);
-	{
-		uint32		slot = btree_scan_cache_slot(downlink, csn);
-		BTreeScanCacheEntry *entry = &btreeScanShmem->cache[slot];
+	slot = btree_scan_cache_slot(downlink, csn);
+	entry = &btreeScanShmem->cache[slot];
 
-		entry->downlink = downlink;
-		entry->csn = csn;
-		memcpy(entry->page, src, ORIOLEDB_BLCKSZ);
-		pg_write_barrier();
-		entry->valid = true;
-	}
+	entry->downlink = downlink;
+	entry->csn = csn;
+	memcpy(entry->page, src, ORIOLEDB_BLCKSZ);
+	pg_write_barrier();
+	entry->valid = true;
 	LWLockRelease(&btreeScanShmem->cacheLock);
 }
 
