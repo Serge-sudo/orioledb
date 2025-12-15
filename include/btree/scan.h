@@ -18,6 +18,7 @@
 #include "btree/page_contents.h"
 
 #include "executor/tuptable.h"
+#include "port/atomics.h"
 #include "storage/lwlock.h"
 #include "utils/sampling.h"
 
@@ -38,7 +39,7 @@ typedef struct
 				cacheTrancheId;
 	LWLock		cacheLock;
 	BTreeScanCacheEntry cache[BTREE_SCAN_CACHE_SLOTS];
-	uint32		cacheClock;
+	pg_atomic_uint32 cacheClock;
 } BTreeScanShmem;
 
 typedef struct BTreeSeqScan BTreeSeqScan;

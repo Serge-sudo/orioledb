@@ -182,12 +182,14 @@ btree_scan_cache_store(uint64 downlink, CommitSeqNo csn, Pointer src)
 		return;
 
 	LWLockAcquire(&btreeScanShmem->cacheLock, LW_EXCLUSIVE);
-	slot = btreeScanShmem->cacheClock++ % BTREE_SCAN_CACHE_SLOTS;
+	slot = pg_atomic_fetch_add_u32(&btreeScanShmem->cacheClock, 1) % BTREE_SCAN_CACHE_SLOTS;
 	entry = &btreeScanShmem->cache[slot];
+	entry->valid = false;
 	entry->downlink = downlink;
 	entry->csn = csn;
-	entry->valid = true;
 	memcpy(entry->page, src, ORIOLEDB_BLCKSZ);
+	pg_write_barrier();
+	entry->valid = true;
 	LWLockRelease(&btreeScanShmem->cacheLock);
 }
 
@@ -208,7 +210,7 @@ btree_scan_init_shmem(Pointer ptr, bool found)
 		btreeScanShmem->downlinksPublishTrancheId = LWLockNewTrancheId();
 		btreeScanShmem->cacheTrancheId = LWLockNewTrancheId();
 		memset(btreeScanShmem->cache, 0, sizeof(btreeScanShmem->cache));
-		btreeScanShmem->cacheClock = 0;
+		pg_atomic_init_u32(&btreeScanShmem->cacheClock, 0);
 		LWLockInitialize(&btreeScanShmem->cacheLock, btreeScanShmem->cacheTrancheId);
 	}
 
