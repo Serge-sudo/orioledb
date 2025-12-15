@@ -31,8 +31,8 @@ typedef struct
 {
 	uint64		downlink;
 	CommitSeqNo csn;
-	bool		valid;
 	char		page[ORIOLEDB_BLCKSZ];
+	bool		valid;
 } BTreeScanCacheEntry;
 
 typedef struct

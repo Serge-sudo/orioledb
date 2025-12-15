@@ -152,8 +152,9 @@ static inline uint32
 btree_scan_cache_slot(uint64 downlink, CommitSeqNo csn)
 {
 	/*
-	 * Mix with the 64-bit golden ratio constant to decorrelate sequential
-	 * downlink offsets/CSNs and spread them uniformly across cache slots.
+	 * Mix with the 64-bit golden ratio multiplier ((φ - 1) * 2^64) to
+	 * decorrelate sequential downlink offsets/CSNs and spread them uniformly
+	 * across cache slots.
 	 */
 	uint64		hash = downlink ^ ((uint64) csn * UINT64CONST(0x9E3779B97F4A7C15));
 
@@ -174,6 +175,7 @@ btree_scan_try_cache_fetch(uint64 downlink, CommitSeqNo csn, Pointer dst)
 	LWLockAcquire(&btreeScanShmem->cacheLock, LW_SHARED);
 	slot = btree_scan_cache_slot(downlink, csn);
 	entry = &btreeScanShmem->cache[slot];
+	pg_read_barrier();
 
 	if (entry->valid && entry->downlink == downlink && entry->csn == csn)
 	{
