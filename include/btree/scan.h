@@ -21,6 +21,7 @@
 #include "storage/lwlock.h"
 #include "utils/sampling.h"
 
+/* Small direct-mapped cache; 32 slots keeps footprint low while covering hot leaves */
 #define BTREE_SCAN_CACHE_SLOTS 32
 
 typedef struct

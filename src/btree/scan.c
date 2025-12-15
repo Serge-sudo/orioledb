@@ -151,6 +151,7 @@ BTreeScanShmem *btreeScanShmem;
 static inline uint32
 btree_scan_cache_slot(uint64 downlink, CommitSeqNo csn)
 {
+	/* Mix with golden ratio to spread low-entropy offsets */
 	uint64		hash = downlink ^ ((uint64) csn * UINT64CONST(0x9E3779B97F4A7C15));
 
 	return (uint32) (hash % BTREE_SCAN_CACHE_SLOTS);
@@ -197,6 +198,7 @@ btree_scan_cache_store(uint64 downlink, CommitSeqNo csn, Pointer src)
 	entry->downlink = downlink;
 	entry->csn = csn;
 	memcpy(entry->page, src, ORIOLEDB_BLCKSZ);
+	/* Publish page contents before marking slot valid */
 	pg_write_barrier();
 	entry->valid = true;
 	LWLockRelease(&btreeScanShmem->cacheLock);
