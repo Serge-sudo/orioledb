@@ -66,9 +66,9 @@ not `CREATE INDEX CONCURRENTLY`).
      `put_item_to_stack()`, `stack_page_split()`, `btree_page_reorg()`) to pack items
      according to fillfactor, create right-links/high-keys, and assemble the root.
    - Practical tuning levers and typical bottlenecks:
-     - **Fillfactor & tuple size spread**: higher fillfactor reduces file size but
-       makes `stack_page_split()` happen more often; uneven tuple sizes can cause
-       repeated split/reorg work.
+    - **Fill factor & tuple size spread**: higher fillfactor reduces file size but
+      makes `stack_page_split()` happen more often; uneven tuple sizes can cause
+      repeated split/reorg work.
      - **Sort output locality**: well-ordered tuples minimize `page_locator` walks and
        reduce memmove during `btree_page_reorg()`.
      - **Hot spots in builder**: page zeroing and tuple copies inside
