@@ -18,12 +18,31 @@
 #include "btree/page_contents.h"
 
 #include "executor/tuptable.h"
+#include "storage/lwlock.h"
 #include "utils/sampling.h"
+
+/*
+ * Small direct-mapped cache in shared memory (OrioleDB shared_buffers); 32 slots
+ * keeps footprint low while covering hot leaves (frequently touched pages across
+ * workers during sequential builds).
+ */
+#define BTREE_SCAN_CACHE_SLOTS 32
+
+typedef struct
+{
+	uint64		downlink;
+	CommitSeqNo csn;
+	char		page[ORIOLEDB_BLCKSZ];
+	bool		valid;
+} BTreeScanCacheEntry;
 
 typedef struct
 {
 	int			pageLoadTrancheId,
-				downlinksPublishTrancheId;
+				downlinksPublishTrancheId,
+				cacheTrancheId;
+	LWLock		cacheLock;
+	BTreeScanCacheEntry cache[BTREE_SCAN_CACHE_SLOTS];
 } BTreeScanShmem;
 
 typedef struct BTreeSeqScan BTreeSeqScan;

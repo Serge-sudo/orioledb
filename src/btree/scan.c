@@ -56,6 +56,7 @@
 #include "utils/stopevent.h"
 
 #include "miscadmin.h"
+#include "storage/lwlock.h"
 #include "utils/wait_event.h"
 
 typedef enum
@@ -147,6 +148,70 @@ static void get_next_key(BTreeSeqScan *scan, BTreePageItemLocator *intLoc, OFixe
 
 BTreeScanShmem *btreeScanShmem;
 
+static inline uint32
+btree_scan_cache_slot(uint64 downlink, CommitSeqNo csn)
+{
+	/*
+	 * Mix with the 64-bit golden ratio multiplier ((φ - 1) * 2^64) to
+	 * decorrelate sequential downlink offsets/CSNs and spread them uniformly
+	 * across cache slots.
+	 */
+	uint64		hash = downlink ^ ((uint64) csn * UINT64CONST(0x9E3779B97F4A7C15));
+
+	return (uint32) (hash % BTREE_SCAN_CACHE_SLOTS);
+}
+
+static bool
+btree_scan_try_cache_fetch(uint64 downlink, CommitSeqNo csn, Pointer dst)
+{
+	uint32		slot;
+	BTreeScanCacheEntry *entry;
+
+	if (btreeScanShmem == NULL)
+		return false;
+
+	Assert(dst != NULL);
+
+	LWLockAcquire(&btreeScanShmem->cacheLock, LW_SHARED);
+	slot = btree_scan_cache_slot(downlink, csn);
+	entry = &btreeScanShmem->cache[slot];
+	pg_read_barrier();
+
+	if (entry->valid && entry->downlink == downlink && entry->csn == csn)
+	{
+		memcpy(dst, entry->page, ORIOLEDB_BLCKSZ);
+		LWLockRelease(&btreeScanShmem->cacheLock);
+		return true;
+	}
+	LWLockRelease(&btreeScanShmem->cacheLock);
+	return false;
+}
+
+static void
+btree_scan_cache_store(uint64 downlink, CommitSeqNo csn, Pointer src)
+{
+	uint32		slot;
+	BTreeScanCacheEntry *entry;
+
+	if (btreeScanShmem == NULL)
+		return;
+
+	LWLockAcquire(&btreeScanShmem->cacheLock, LW_EXCLUSIVE);
+	slot = btree_scan_cache_slot(downlink, csn);
+	entry = &btreeScanShmem->cache[slot];
+
+	entry->downlink = downlink;
+	entry->csn = csn;
+	memcpy(entry->page, src, ORIOLEDB_BLCKSZ);
+	/*
+	 * Publish page contents before marking slot valid so no other process can
+	 * observe a valid entry pointing to partially written data.
+	 */
+	pg_write_barrier();
+	entry->valid = true;
+	LWLockRelease(&btreeScanShmem->cacheLock);
+}
+
 Size
 btree_scan_shmem_needs(void)
 {
@@ -162,12 +227,17 @@ btree_scan_init_shmem(Pointer ptr, bool found)
 	{
 		btreeScanShmem->pageLoadTrancheId = LWLockNewTrancheId();
 		btreeScanShmem->downlinksPublishTrancheId = LWLockNewTrancheId();
+		btreeScanShmem->cacheTrancheId = LWLockNewTrancheId();
+		memset(btreeScanShmem->cache, 0, sizeof(btreeScanShmem->cache));
+		LWLockInitialize(&btreeScanShmem->cacheLock, btreeScanShmem->cacheTrancheId);
 	}
 
 	LWLockRegisterTranche(btreeScanShmem->pageLoadTrancheId,
 						  "OBTreeScanPageLoadTrancheId");
 	LWLockRegisterTranche(btreeScanShmem->downlinksPublishTrancheId,
 						  "OBTreeScanDownlinksPublishTrancheId");
+	LWLockRegisterTranche(btreeScanShmem->cacheTrancheId,
+						  "OBTreeScanCacheTrancheId");
 }
 
 
@@ -961,7 +1031,6 @@ load_next_disk_leaf_page(BTreeSeqScan *scan)
 {
 	FileExtent	extent;
 	bool		success;
-	BTreePageHeader *header;
 	BTreeSeqScanDiskDownlink downlink;
 	ParallelOScanDesc poscan = scan->poscan;
 
@@ -991,14 +1060,25 @@ load_next_disk_leaf_page(BTreeSeqScan *scan)
 		downlink = ((BTreeSeqScanDiskDownlink *) dsm_segment_address(scan->dsmSeg))[index];
 	}
 
-	success = read_page_from_disk(scan->desc,
-								  scan->leafImg,
-								  downlink.downlink,
-								  &extent);
-	header = (BTreePageHeader *) scan->leafImg;
-	if (header->csn >= downlink.csn)
-		read_page_from_undo(scan->desc, scan->leafImg, header->undoLocation,
-							downlink.csn, NULL, BTreeKeyNone, NULL);
+	if (btree_scan_try_cache_fetch(downlink.downlink, downlink.csn, scan->leafImg))
+	{
+		success = true;
+	}
+	else
+	{
+		BTreePageHeader *header;
+
+		success = read_page_from_disk(scan->desc,
+									  scan->leafImg,
+									  downlink.downlink,
+									  &extent);
+		header = (BTreePageHeader *) scan->leafImg;
+		if (header->csn >= downlink.csn)
+			read_page_from_undo(scan->desc, scan->leafImg, header->undoLocation,
+								downlink.csn, NULL, BTreeKeyNone, NULL);
+		if (success)
+			btree_scan_cache_store(downlink.downlink, downlink.csn, scan->leafImg);
+	}
 
 	STOPEVENT(STOPEVENT_SCAN_DISK_PAGE,
 			  btree_page_stopevent_params(scan->desc,
