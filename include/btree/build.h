@@ -17,11 +17,20 @@
 #include "btree.h"
 
 typedef struct Tuplesortstate Tuplesortstate;
+typedef OTuple (*OIndexTupleReader) (Tuplesortstate *sortstate, void *arg);
+typedef void (*OIndexTupleCleanup) (OTuple tuple, void *arg);
 
 extern void btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
 								   Tuplesortstate *sortstate,
 								   uint64 ctid, uint64 bridge_ctid,
 								   CheckpointFileHeader *file_header);
+extern void btree_write_index_data_with_reader(BTreeDescr *desc, TupleDesc tupdesc,
+											   Tuplesortstate *sortstate,
+											   uint64 ctid, uint64 bridge_ctid,
+											   CheckpointFileHeader *file_header,
+											   OIndexTupleReader reader,
+											   OIndexTupleCleanup cleanup,
+											   void *reader_arg);
 extern S3TaskLocation btree_write_file_header(BTreeDescr *desc,
 											  CheckpointFileHeader *file_header);
 

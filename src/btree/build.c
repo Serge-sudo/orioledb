@@ -289,11 +289,32 @@ put_tuple_to_stack(BTreeDescr *desc, OIndexBuildStackItem *stack,
 							 sizeof(leaf_header), root_level, metaPageBlkno);
 }
 
+/* Default tuple reader used to keep the legacy tuplesort->btree path intact. */
+static OTuple
+btree_default_reader(Tuplesortstate *sortstate, void *arg)
+{
+	return tuplesort_getotuple(sortstate, true);
+}
+
 void
 btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
 					   Tuplesortstate *sortstate,
 					   uint64 ctid, uint64 bridge_ctid,
 					   CheckpointFileHeader *file_header)
+{
+	btree_write_index_data_with_reader(desc, tupdesc, sortstate,
+									   ctid, bridge_ctid, file_header,
+									   btree_default_reader, NULL, NULL);
+}
+
+void
+btree_write_index_data_with_reader(BTreeDescr *desc, TupleDesc tupdesc,
+								   Tuplesortstate *sortstate,
+								   uint64 ctid, uint64 bridge_ctid,
+								   CheckpointFileHeader *file_header,
+								   OIndexTupleReader reader,
+								   OIndexTupleCleanup cleanup,
+								   void *reader_arg)
 {
 	OTuple		idx_tup;
 	OIndexBuildStackItem *stack;
@@ -330,12 +351,14 @@ btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
 		BTREE_PAGE_LOCATOR_FIRST(stack[i].img, &stack[i].loc);
 	}
 
-	idx_tup = tuplesort_getotuple(sortstate, true);
+	idx_tup = reader(sortstate, reader_arg);
 	while (!O_TUPLE_IS_NULL(idx_tup))
 	{
 		Assert(o_tuple_size(idx_tup, &((OIndexDescr *) desc->arg)->leafSpec) <= O_BTREE_MAX_TUPLE_SIZE);
 		put_tuple_to_stack(desc, stack, idx_tup, &root_level, &metaPageBlkno);
-		idx_tup = tuplesort_getotuple(sortstate, true);
+		if (cleanup)
+			cleanup(idx_tup, reader_arg);
+		idx_tup = reader(sortstate, reader_arg);
 	}
 
 	pfree(values);
