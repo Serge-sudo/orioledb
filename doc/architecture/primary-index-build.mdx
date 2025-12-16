@@ -75,10 +75,10 @@ not `CREATE INDEX CONCURRENTLY`).
      1. Read tuples from tuplesort in key order; form leaf pages until they hit
         fillfactor, splitting with `stack_page_split()` as needed.
      2. Maintain an in-memory stack of partially built pages at each level; when a
-        leaf splits, a downlink (high-key + rightlink) is pushed upward via
+        leaf splits, a downlink (high-key + right-link) is pushed upward via
         `put_downlink_to_stack()`.
      3. Internal pages are filled the same way; splits bubble up until a new root is
-        produced. Rightlinks and highkeys are assigned as pages are sealed.
+        produced. Right-links and high-keys are assigned as pages are sealed.
      4. Completed pages are written sequentially with `btree_page_reorg()` ensuring
         compact layout and flags; the metapage is emitted last with root info and
         checkpoint number.
