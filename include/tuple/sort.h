@@ -20,6 +20,10 @@ extern Tuplesortstate *tuplesort_begin_orioledb_index(OIndexDescr *idx,
 													  int workMem,
 													  bool randomAccess,
 													  SortCoordinate coordinate);
+extern Tuplesortstate *tuplesort_begin_orioledb_primary_rebuild(OIndexDescr *idx,
+																int workMem,
+																bool randomAccess,
+																SortCoordinate coordinate);
 extern Tuplesortstate *tuplesort_begin_orioledb_toast(OIndexDescr *toast,
 													  OIndexDescr *primary,
 													  int workMem,
@@ -27,5 +31,9 @@ extern Tuplesortstate *tuplesort_begin_orioledb_toast(OIndexDescr *toast,
 													  SortCoordinate coordinate);
 extern OTuple tuplesort_getotuple(Tuplesortstate *state, bool forward);
 extern void tuplesort_putotuple(Tuplesortstate *state, OTuple tup);
+extern void tuplesort_put_rebuild_primary(Tuplesortstate *state, OTuple key,
+										  Datum rowid);
+extern bool tuplesort_get_rebuild_rowid(Tuplesortstate *state, Datum *rowid,
+										bool forward);
 
 #endif							/* __TUPLE_SORT_H */

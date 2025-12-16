@@ -289,11 +289,28 @@ put_tuple_to_stack(BTreeDescr *desc, OIndexBuildStackItem *stack,
 							 sizeof(leaf_header), root_level, metaPageBlkno);
 }
 
-void
-btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
-					   Tuplesortstate *sortstate,
-					   uint64 ctid, uint64 bridge_ctid,
-					   CheckpointFileHeader *file_header)
+typedef struct
+{
+	Tuplesortstate *sortstate;
+} BtreeWriteIndexDataSortArg;
+
+static bool
+btree_write_index_data_next_from_sort(OTuple *tup, bool *should_free, void *arg)
+{
+	BtreeWriteIndexDataSortArg *state = (BtreeWriteIndexDataSortArg *) arg;
+
+	*tup = tuplesort_getotuple(state->sortstate, true);
+	*should_free = false;
+
+	return !O_TUPLE_IS_NULL(*tup);
+}
+
+static void
+btree_write_index_data_internal(BTreeDescr *desc, TupleDesc tupdesc,
+								BtreeBuildNextTupleCB callback,
+								void *callback_arg,
+								uint64 ctid, uint64 bridge_ctid,
+								CheckpointFileHeader *file_header)
 {
 	OTuple		idx_tup;
 	OIndexBuildStackItem *stack;
@@ -308,6 +325,7 @@ btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
 	Datum	   *values;
 	bool	   *isnull;
 	uint32		chkpNum;
+	bool		should_free;
 
 	btree_open_smgr(desc);
 
@@ -330,12 +348,12 @@ btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
 		BTREE_PAGE_LOCATOR_FIRST(stack[i].img, &stack[i].loc);
 	}
 
-	idx_tup = tuplesort_getotuple(sortstate, true);
-	while (!O_TUPLE_IS_NULL(idx_tup))
+	while (callback(&idx_tup, &should_free, callback_arg))
 	{
 		Assert(o_tuple_size(idx_tup, &((OIndexDescr *) desc->arg)->leafSpec) <= O_BTREE_MAX_TUPLE_SIZE);
 		put_tuple_to_stack(desc, stack, idx_tup, &root_level, &metaPageBlkno);
-		idx_tup = tuplesort_getotuple(sortstate, true);
+		if (should_free)
+			pfree(idx_tup.data);
 	}
 
 	pfree(values);
@@ -404,6 +422,30 @@ btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
 	file_header->leafPagesNum = pg_atomic_read_u32(&metaPageBlkno.leafPagesNum);
 	file_header->ctid = pg_atomic_read_u64(&metaPageBlkno.ctid);
 	file_header->bridgeCtid = pg_atomic_read_u64(&metaPageBlkno.bridge_ctid);
+}
+
+void
+btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
+					   Tuplesortstate *sortstate,
+					   uint64 ctid, uint64 bridge_ctid,
+					   CheckpointFileHeader *file_header)
+{
+	BtreeWriteIndexDataSortArg arg = {sortstate};
+
+	btree_write_index_data_internal(desc, tupdesc,
+									btree_write_index_data_next_from_sort, &arg,
+									ctid, bridge_ctid, file_header);
+}
+
+void
+btree_write_index_data_callback(BTreeDescr *desc, TupleDesc tupdesc,
+								BtreeBuildNextTupleCB callback,
+								void *callback_arg,
+								uint64 ctid, uint64 bridge_ctid,
+								CheckpointFileHeader *file_header)
+{
+	btree_write_index_data_internal(desc, tupdesc, callback, callback_arg,
+									ctid, bridge_ctid, file_header);
 }
 
 S3TaskLocation

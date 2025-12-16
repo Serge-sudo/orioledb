@@ -87,9 +87,9 @@ typedef OScanDescData *OScanDesc;
  * Operation with indices. It does not update TOAST BTree. Implementations
  * are in tableam_handler.c.
  */
-static void get_keys_from_rowid(OIndexDescr *id, Datum pkDatum, OBTreeKeyBound *key,
-								BTreeLocationHint *hint, CommitSeqNo *csn,
-								uint32 *version, ItemPointer *bridge_ctid);
+void		get_keys_from_rowid(OIndexDescr *id, Datum pkDatum, OBTreeKeyBound *key,
+							   BTreeLocationHint *hint, CommitSeqNo *csn,
+							   uint32 *version, ItemPointer *bridge_ctid);
 static void rowid_set_csn(OIndexDescr *id, Datum pkDatum, CommitSeqNo csn);
 
 
@@ -2316,7 +2316,7 @@ relation_get_descr(Relation rel)
 	return result;
 }
 
-static void
+void
 get_keys_from_rowid(OIndexDescr *id, Datum pkDatum, OBTreeKeyBound *key,
 					BTreeLocationHint *hint, CommitSeqNo *csn, uint32 *version,
 					ItemPointer *bridge_ctid)
