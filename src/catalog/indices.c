@@ -1711,14 +1711,6 @@ rebuild_fetch_tuple_by_rowid(ORebuildPrimaryWriteCtx *ctx, Datum rowid)
 	CommitSeqNo tupleCsn;
 	OTuple		tuple;
 
-	if (ctx->has_hint)
-		hint = ctx->last_hint;
-	else
-	{
-		hint.blkno = OInvalidInMemoryBlkno;
-		hint.pageChangeCount = 0;
-	}
-
 	get_keys_from_rowid(GET_PRIMARY(ctx->old_descr), rowid, &pkey, &hint,
 						&csn, NULL, NULL);
 	O_LOAD_SNAPSHOT_CSN(&oSnapshot, csn);
