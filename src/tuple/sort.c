@@ -672,14 +672,16 @@ tuplesort_put_rebuild_primary(Tuplesortstate *state, OTuple key, Datum rowid)
 	SortTuple	stup;
 	int			keysize;
 	int			rowidlen;
+	struct varlena *rowid_copy;
 	Pointer		rowid_data;
 	Pointer		ptr;
 #if PG_VERSION_NUM >= 170000
 	Size		tuplen;
 #endif
 
-	rowid_data = DatumGetPointer(PG_DETOAST_DATUM_COPY(rowid));
-	rowidlen = VARSIZE_ANY(rowid_data);
+	rowid_copy = PG_DETOAST_DATUM_COPY(rowid);
+	rowid_data = (Pointer) rowid_copy;
+	rowidlen = VARSIZE_ANY(rowid_copy);
 
 	keysize = o_tuple_size(key, spec);
 	stup.tuple = MemoryContextAlloc(base->tuplecontext,
@@ -711,7 +713,7 @@ tuplesort_put_rebuild_primary(Tuplesortstate *state, OTuple key, Datum rowid)
 	tuplesort_puttuple_common(state, &stup,
 							  base->sortKeys->abbrev_converter && !stup.isnull1);
 #endif
-	pfree(rowid_data);
+	pfree(rowid_copy);
 	MemoryContextSwitchTo(oldcontext);
 }
 
