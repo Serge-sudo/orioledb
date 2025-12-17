@@ -33,10 +33,12 @@ typedef struct
 
 typedef struct
 {
-	TupleDesc	tupDesc;
-	OIndexDescr *id;
+	TupleDesc	newTupDesc;
+	TupleDesc	oldTupDesc;
+	OIndexDescr *newIdx;
+	OIndexDescr *oldIdx;
 	bool		enforceUnique;
-} OIndexRebuildSortArg;
+} OIndexRebuildPkSortArg;
 
 static void
 write_o_tuple(void *ptr, OTuple tup, int tupsize)
@@ -156,18 +158,20 @@ comparetup_orioledb_index(const SortTuple *a, const SortTuple *b, Tuplesortstate
 }
 
 static void
-read_rebuild_entry(void *ptr, OIndexDescr *id, OTuple *key, Pointer *rowid,
-				   int *rowid_len)
+read_rebuild_entry(void *ptr, OIndexDescr *newIdx, OIndexDescr *oldIdx,
+				   OTuple *key, OTuple *oldpk)
 {
 	Pointer		p = (Pointer) ptr;
 
 	key->formatFlags = *((uint8 *) p);
 	p += MAXIMUM_ALIGNOF;
 	key->data = p;
-	p += o_tuple_size(*key, &id->nonLeafSpec);
-	*rowid_len = *((int *) p);
+	p += o_tuple_size(*key, &newIdx->nonLeafSpec);
+	(void) *((int *) p);
 	p += sizeof(int);
-	*rowid = p;
+	oldpk->formatFlags = *((uint8 *) p);
+	p += MAXIMUM_ALIGNOF;
+	oldpk->data = p;
 }
 
 static int
@@ -178,11 +182,10 @@ comparetup_orioledb_primary_rebuild(const SortTuple *a, const SortTuple *b,
 	SortSupport sortKey = base->sortKeys;
 	OTuple		ltup;
 	OTuple		rtup;
-	Pointer		lrowid,
-				rrowid;
-	int			lrowid_len,
-				rrowid_len;
+	OTuple		loldpk;
+	OTuple		roldpk;
 	TupleDesc	tupDesc;
+	TupleDesc	oldTupDesc;
 	bool		equal_hasnull = false;
 	int			nkey;
 	int32		compare;
@@ -191,8 +194,9 @@ comparetup_orioledb_primary_rebuild(const SortTuple *a, const SortTuple *b,
 				datum2;
 	bool		isnull1,
 				isnull2;
-	OIndexRebuildSortArg *arg = (OIndexRebuildSortArg *) base->arg;
-	OTupleFixedFormatSpec *spec = &arg->id->nonLeafSpec;
+	OIndexRebuildPkSortArg *arg = (OIndexRebuildPkSortArg *) base->arg;
+	OTupleFixedFormatSpec *spec = &arg->newIdx->nonLeafSpec;
+	OTupleFixedFormatSpec *oldspec = &arg->oldIdx->nonLeafSpec;
 
 	compare = ApplySortComparator(a->datum1, a->isnull1,
 								  b->datum1, b->isnull1,
@@ -200,9 +204,10 @@ comparetup_orioledb_primary_rebuild(const SortTuple *a, const SortTuple *b,
 	if (compare != 0)
 		return compare;
 
-	read_rebuild_entry(a->tuple, arg->id, &ltup, &lrowid, &lrowid_len);
-	read_rebuild_entry(b->tuple, arg->id, &rtup, &rrowid, &rrowid_len);
-	tupDesc = arg->tupDesc;
+	read_rebuild_entry(a->tuple, arg->newIdx, arg->oldIdx, &ltup, &loldpk);
+	read_rebuild_entry(b->tuple, arg->newIdx, arg->oldIdx, &rtup, &roldpk);
+	tupDesc = arg->newTupDesc;
+	oldTupDesc = arg->oldTupDesc;
 
 	if (sortKey->abbrev_converter)
 	{
@@ -224,7 +229,7 @@ comparetup_orioledb_primary_rebuild(const SortTuple *a, const SortTuple *b,
 	sortKey++;
 	for (nkey = 1; nkey < base->nKeys; nkey++, sortKey++)
 	{
-		if (!OIgnoreColumn(arg->id, nkey))
+		if (!OIgnoreColumn(arg->newIdx, nkey))
 		{
 			attno = sortKey->ssup_attno;
 
@@ -247,14 +252,30 @@ comparetup_orioledb_primary_rebuild(const SortTuple *a, const SortTuple *b,
 		ereport(ERROR,
 				(errcode(ERRCODE_UNIQUE_VIOLATION),
 				 errmsg("could not create unique index \"%s\"",
-						arg->id->name.data),
+						arg->newIdx->name.data),
 				 errdetail("Duplicate keys exist.")));
 	}
 
-	if (lrowid_len != rrowid_len)
-		return (lrowid_len < rrowid_len) ? -1 : 1;
+	/* tie-breaker on old primary key */
+	for (nkey = 0; nkey < arg->oldIdx->nPrimaryFields; nkey++)
+	{
+		Datum		lv;
+		Datum		rv;
+		bool		lnull;
+		bool		rnull;
 
-	return memcmp(lrowid, rrowid, lrowid_len);
+		if (OIgnoreColumn(arg->oldIdx, nkey))
+			continue;
+
+		lv = o_fastgetattr(loldpk, nkey + 1, oldTupDesc, oldspec, &lnull);
+		rv = o_fastgetattr(roldpk, nkey + 1, oldTupDesc, oldspec, &rnull);
+
+		compare = ApplySortComparator(lv, lnull, rv, rnull, base->sortKeys);
+		if (compare != 0)
+			return compare;
+	}
+
+	return 0;
 }
 
 static void
@@ -332,35 +353,35 @@ removeabbrev_orioledb_primary_rebuild(Tuplesortstate *state, SortTuple *stups,
 {
 	int			i;
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
-	OIndexRebuildSortArg *arg = (OIndexRebuildSortArg *) base->arg;
-	OTupleFixedFormatSpec *spec = &arg->id->nonLeafSpec;
+	OIndexRebuildPkSortArg *arg = (OIndexRebuildPkSortArg *) base->arg;
+	OTupleFixedFormatSpec *spec = &arg->newIdx->nonLeafSpec;
 
 	for (i = 0; i < count; i++)
 	{
 		SortTuple  *stup = &stups[i];
 		OTuple		tup;
-		Pointer		rowid;
-		int			rowid_len;
+		OTuple		oldpk;
 
-		read_rebuild_entry(stup->tuple, arg->id, &tup, &rowid, &rowid_len);
+		read_rebuild_entry(stup->tuple, arg->newIdx, arg->oldIdx, &tup, &oldpk);
 
 		stup->datum1 = o_fastgetattr(tup,
 									 base->sortKeys[0].ssup_attno,
-									 arg->tupDesc,
+									 arg->newTupDesc,
 									 spec,
 									 &stup->isnull1);
 	}
 }
 
 static int
-rebuild_tuple_data_size(OIndexRebuildSortArg *arg, void *ptr)
+rebuild_tuple_data_size(OIndexRebuildPkSortArg *arg, void *ptr)
 {
 	OTuple		tup;
-	Pointer		rowid;
-	int			rowid_len;
+	OTuple		oldpk;
+	int			oldpk_len;
 
-	read_rebuild_entry(ptr, arg->id, &tup, &rowid, &rowid_len);
-	return o_tuple_size(tup, &arg->id->nonLeafSpec) + sizeof(int) + rowid_len;
+	read_rebuild_entry(ptr, arg->newIdx, arg->oldIdx, &tup, &oldpk);
+	oldpk_len = o_tuple_size(oldpk, &arg->oldIdx->nonLeafSpec);
+	return o_tuple_size(tup, &arg->newIdx->nonLeafSpec) + sizeof(int) + MAXIMUM_ALIGNOF + oldpk_len;
 }
 
 static void
@@ -368,7 +389,7 @@ writetup_orioledb_primary_rebuild(Tuplesortstate *state, LogicalTape *tape,
 								  SortTuple *stup)
 {
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
-	OIndexRebuildSortArg *arg = (OIndexRebuildSortArg *) base->arg;
+	OIndexRebuildPkSortArg *arg = (OIndexRebuildPkSortArg *) base->arg;
 	int			data_size;
 	int			tuplen;
 
@@ -387,23 +408,22 @@ readtup_orioledb_primary_rebuild(Tuplesortstate *state, SortTuple *stup,
 								 LogicalTape *tape, unsigned int len)
 {
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
-	OIndexRebuildSortArg *arg = (OIndexRebuildSortArg *) base->arg;
+	OIndexRebuildPkSortArg *arg = (OIndexRebuildPkSortArg *) base->arg;
 	uint32		tuplen = len - sizeof(int) - 1;
 	Pointer		tup = (Pointer) tuplesort_readtup_alloc(state, MAXIMUM_ALIGNOF + tuplen);
 	OTuple		key;
-	Pointer		rowid;
-	int			rowid_len;
+	OTuple		oldpk;
 
 	LogicalTapeReadExact(tape, tup + MAXIMUM_ALIGNOF, tuplen);
 	LogicalTapeReadExact(tape, tup, 1);
 	if (base->sortopt & TUPLESORT_RANDOMACCESS)
 		LogicalTapeReadExact(tape, &tuplen, sizeof(tuplen));
 	stup->tuple = (void *) tup;
-	read_rebuild_entry(tup, arg->id, &key, &rowid, &rowid_len);
+	read_rebuild_entry(tup, arg->newIdx, arg->oldIdx, &key, &oldpk);
 	stup->datum1 = o_fastgetattr(key,
 								 base->sortKeys[0].ssup_attno,
-								 arg->tupDesc,
-								 &arg->id->nonLeafSpec,
+								 arg->newTupDesc,
+								 &arg->newIdx->nonLeafSpec,
 								 &stup->isnull1);
 }
 
@@ -467,6 +487,7 @@ tuplesort_begin_orioledb_index(OIndexDescr *idx,
 
 Tuplesortstate *
 tuplesort_begin_orioledb_primary_rebuild(OIndexDescr *idx,
+										 OIndexDescr *old_primary,
 										 int workMem,
 										 bool randomAccess,
 										 SortCoordinate coordinate)
@@ -475,16 +496,18 @@ tuplesort_begin_orioledb_primary_rebuild(OIndexDescr *idx,
 												   randomAccess);
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	MemoryContext oldcontext;
-	OIndexRebuildSortArg *arg;
+	OIndexRebuildPkSortArg *arg;
 	int			sort_fields;
 	int			i;
 
 	sort_fields = idx->nPrimaryFields;
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
-	arg = (OIndexRebuildSortArg *) palloc0(sizeof(OIndexRebuildSortArg));
-	arg->id = idx;
-	arg->tupDesc = idx->nonLeafTupdesc;
+	arg = (OIndexRebuildPkSortArg *) palloc0(sizeof(OIndexRebuildPkSortArg));
+	arg->newIdx = idx;
+	arg->oldIdx = old_primary;
+	arg->newTupDesc = idx->nonLeafTupdesc;
+	arg->oldTupDesc = old_primary->nonLeafTupdesc;
 	arg->enforceUnique = idx->unique;
 
 	base->sortKeys = (SortSupport) palloc0(sort_fields *
@@ -670,47 +693,45 @@ tuplesort_putotuple(Tuplesortstate *state, OTuple tup)
 }
 
 void
-tuplesort_put_rebuild_primary(Tuplesortstate *state, OTuple key, Datum rowid)
+tuplesort_put_rebuild_primary(Tuplesortstate *state, OTuple key, OTuple oldpk)
 {
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
-	OIndexRebuildSortArg *arg = (OIndexRebuildSortArg *) base->arg;
-	OTupleFixedFormatSpec *spec = &arg->id->nonLeafSpec;
+	OIndexRebuildPkSortArg *arg = (OIndexRebuildPkSortArg *) base->arg;
+	OTupleFixedFormatSpec *spec = &arg->newIdx->nonLeafSpec;
+	OTupleFixedFormatSpec *oldspec = &arg->oldIdx->nonLeafSpec;
 	MemoryContext oldcontext = MemoryContextSwitchTo(base->tuplecontext);
 	SortTuple	stup;
 	int			keysize;
-	int			rowidlen;
-	struct varlena *rowid_copy;
-	Pointer		rowid_data;
+	int			oldpksize;
 	Pointer		ptr;
 #if PG_VERSION_NUM >= 170000
 	Size		tuplen;
 #endif
 
-	rowid_copy = PG_DETOAST_DATUM_COPY(rowid);
-	rowid_data = (Pointer) rowid_copy;
-	rowidlen = VARSIZE_ANY(rowid_copy);
-
 	keysize = o_tuple_size(key, spec);
+	oldpksize = o_tuple_size(oldpk, oldspec);
 	stup.tuple = MemoryContextAlloc(base->tuplecontext,
-									MAXIMUM_ALIGNOF + keysize + sizeof(int) + rowidlen);
+									MAXIMUM_ALIGNOF + keysize + sizeof(int) + MAXIMUM_ALIGNOF + oldpksize);
 	ptr = (Pointer) stup.tuple;
 
 	*((uint8 *) ptr) = key.formatFlags;
 	ptr += MAXIMUM_ALIGNOF;
 	memcpy(ptr, key.data, keysize);
 	ptr += keysize;
-	memcpy(ptr, &rowidlen, sizeof(int));
+	memcpy(ptr, &oldpksize, sizeof(int));
 	ptr += sizeof(int);
-	memcpy(ptr, rowid_data, rowidlen);
+	*((uint8 *) ptr) = oldpk.formatFlags;
+	ptr += MAXIMUM_ALIGNOF;
+	memcpy(ptr, oldpk.data, oldpksize);
 
 	stup.datum1 = o_fastgetattr(key,
 								base->sortKeys[0].ssup_attno,
-								arg->tupDesc,
+								arg->newTupDesc,
 								spec,
 								&stup.isnull1);
 #if PG_VERSION_NUM >= 170000
 	if (TupleSortUseBumpTupleCxt(base->sortopt))
-		tuplen = MAXALIGN(keysize + sizeof(int) + rowidlen);
+		tuplen = MAXALIGN(keysize + sizeof(int) + MAXIMUM_ALIGNOF + oldpksize);
 	else
 		tuplen = GetMemoryChunkSpace(stup.tuple);
 
@@ -720,20 +741,17 @@ tuplesort_put_rebuild_primary(Tuplesortstate *state, OTuple key, Datum rowid)
 	tuplesort_puttuple_common(state, &stup,
 							  base->sortKeys->abbrev_converter && !stup.isnull1);
 #endif
-	pfree(rowid_copy);
 	MemoryContextSwitchTo(oldcontext);
 }
 
 bool
-tuplesort_get_rebuild_rowid(Tuplesortstate *state, Datum *rowid, bool forward)
+tuplesort_get_rebuild_oldpk(Tuplesortstate *state, OTuple *oldpk, bool forward)
 {
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	MemoryContext oldcontext;
 	SortTuple	stup;
-	OIndexRebuildSortArg *arg = (OIndexRebuildSortArg *) base->arg;
+	OIndexRebuildPkSortArg *arg = (OIndexRebuildPkSortArg *) base->arg;
 	OTuple		key;
-	Pointer		rowid_ptr;
-	int			rowid_len;
 
 	oldcontext = MemoryContextSwitchTo(base->sortcontext);
 	if (!tuplesort_gettuple_common(state, forward, &stup))
@@ -742,8 +760,7 @@ tuplesort_get_rebuild_rowid(Tuplesortstate *state, Datum *rowid, bool forward)
 		return false;
 	}
 
-	read_rebuild_entry(stup.tuple, arg->id, &key, &rowid_ptr, &rowid_len);
-	*rowid = PointerGetDatum(rowid_ptr);
+	read_rebuild_entry(stup.tuple, arg->newIdx, arg->oldIdx, &key, oldpk);
 	MemoryContextSwitchTo(oldcontext);
 	return true;
 }

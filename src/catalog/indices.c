@@ -31,6 +31,7 @@
 #include "tuple/slot.h"
 #include "tuple/sort.h"
 #include "tuple/toast.h"
+#include "tableam/tree.h"
 #include "utils/compress.h"
 #include "utils/planner.h"
 #include "utils/stopevent.h"
@@ -1560,7 +1561,9 @@ rebuild_indices_worker_sort(oIdxSpool *btspool, void *bt_shared,
 	for (i = PrimaryIndexNumber; i < nIndices; i++)
 	{
 		if (i == PrimaryIndexNumber)
-			btspool->sortstates[i] = tuplesort_begin_orioledb_primary_rebuild(btspool->descr->indices[i], work_mem, false, &(coordinate[i]));
+			btspool->sortstates[i] = tuplesort_begin_orioledb_primary_rebuild(btspool->descr->indices[i],
+																			  btspool->old_descr->indices[PrimaryIndexNumber],
+																			  work_mem, false, &(coordinate[i]));
 		else
 			btspool->sortstates[i] = tuplesort_begin_orioledb_index(btspool->descr->indices[i], work_mem, false, &(coordinate[i]));
 	}
@@ -1637,6 +1640,7 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 		for (i = PrimaryIndexNumber; i < descr->nIndices; i++)
 		{
 			OTuple		newTup;
+			OTuple		oldPkTup;
 
 			idx = descr->indices[i];
 
@@ -1648,17 +1652,13 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 
 			if (i == PrimaryIndexNumber)
 			{
-				Datum		rowid;
-				bool		isnull;
-
-				rowid = slot_getsysattr(primarySlot, RowIdAttributeNumber, &isnull);
-				if (isnull)
-					elog(ERROR, "rowid is null during index rebuild");
 				newTup = tts_orioledb_make_key(primarySlot, descr);
+				oldPkTup = tts_orioledb_make_key(primarySlot, old_descr);
 				o_btree_check_size_of_tuple(o_tuple_size(newTup, &idx->nonLeafSpec),
 											idx->name.data, true);
-				tuplesort_put_rebuild_primary(sortstates[i], newTup, rowid);
+				tuplesort_put_rebuild_primary(sortstates[i], newTup, oldPkTup);
 				pfree(newTup.data);
+				pfree(oldPkTup.data);
 				continue;
 			}
 			else
@@ -1697,22 +1697,19 @@ typedef struct
 	TupleTableSlot *slot;
 	uint64	   *ctid;
 	uint64	   *bridge_ctid;
-	BTreeLocationHint last_hint;
-	bool		has_hint;
 } ORebuildPrimaryWriteCtx;
 
 static bool
-rebuild_fetch_tuple_by_rowid(ORebuildPrimaryWriteCtx *ctx, Datum rowid)
+rebuild_fetch_tuple_by_oldpk(ORebuildPrimaryWriteCtx *ctx, OTuple oldpk)
 {
 	OBTreeKeyBound pkey;
-	BTreeLocationHint hint;
 	CommitSeqNo csn;
 	OSnapshot	oSnapshot;
 	CommitSeqNo tupleCsn;
 	OTuple		tuple;
 
-	get_keys_from_rowid(GET_PRIMARY(ctx->old_descr), rowid, &pkey, &hint,
-						&csn, NULL, NULL);
+	o_fill_key_bound(GET_PRIMARY(ctx->old_descr), oldpk, BTreeKeyNonLeafKey, &pkey);
+	csn = COMMITSEQNO_INPROGRESS;
 	O_LOAD_SNAPSHOT_CSN(&oSnapshot, csn);
 
 	tuple = o_btree_find_tuple_by_key(&GET_PRIMARY(ctx->old_descr)->desc,
@@ -1720,16 +1717,13 @@ rebuild_fetch_tuple_by_rowid(ORebuildPrimaryWriteCtx *ctx, Datum rowid)
 									  BTreeKeyBound,
 									  &oSnapshot, &tupleCsn,
 									  ctx->slot->tts_mcxt,
-									  &hint);
+									  NULL);
 
 	if (O_TUPLE_IS_NULL(tuple))
 		return false;
 
-	ctx->last_hint = hint;
-	ctx->has_hint = true;
-
 	tts_orioledb_store_tuple(ctx->slot, tuple, ctx->old_descr, tupleCsn,
-							 PrimaryIndexNumber, true, &hint);
+							 PrimaryIndexNumber, true, NULL);
 	return true;
 }
 
@@ -1737,13 +1731,13 @@ static bool
 rebuild_primary_next_tuple(OTuple *tuple, bool *should_free, void *arg)
 {
 	ORebuildPrimaryWriteCtx *ctx = (ORebuildPrimaryWriteCtx *) arg;
-	Datum		rowid;
+	OTuple		oldpk;
 
-	if (!tuplesort_get_rebuild_rowid(ctx->sortstate, &rowid, true))
+	if (!tuplesort_get_rebuild_oldpk(ctx->sortstate, &oldpk, true))
 		return false;
 
-	if (!rebuild_fetch_tuple_by_rowid(ctx, rowid))
-		elog(ERROR, "failed to fetch tuple by rowid during index rebuild");
+	if (!rebuild_fetch_tuple_by_oldpk(ctx, oldpk))
+		elog(ERROR, "failed to fetch tuple by key during index rebuild");
 
 	tts_orioledb_detoast(ctx->slot);
 	tts_orioledb_toast(ctx->slot, ctx->descr);
@@ -1867,7 +1861,9 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 	for (i = PrimaryIndexNumber; i < descr->nIndices; i++)
 	{
 		if (i == PrimaryIndexNumber)
-			sortstates[i] = tuplesort_begin_orioledb_primary_rebuild(descr->indices[i], work_mem, false, coordinate[i]);
+			sortstates[i] = tuplesort_begin_orioledb_primary_rebuild(descr->indices[i],
+																	 old_descr->indices[PrimaryIndexNumber],
+																	 work_mem, false, coordinate[i]);
 		else
 			sortstates[i] = tuplesort_begin_orioledb_index(descr->indices[i], work_mem, false, coordinate[i]);
 	}
