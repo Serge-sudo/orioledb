@@ -1697,11 +1697,12 @@ typedef struct
 	TupleTableSlot *slot;
 	uint64	   *ctid;
 	uint64	   *bridge_ctid;
+	BTreeLocationHint last_hint;
+	bool		has_hint;
 } ORebuildPrimaryWriteCtx;
 
 static bool
-rebuild_fetch_tuple_by_rowid(OTableDescr *old_descr, Datum rowid,
-							 TupleTableSlot *slot)
+rebuild_fetch_tuple_by_rowid(ORebuildPrimaryWriteCtx *ctx, Datum rowid)
 {
 	OBTreeKeyBound pkey;
 	BTreeLocationHint hint;
@@ -1710,21 +1711,32 @@ rebuild_fetch_tuple_by_rowid(OTableDescr *old_descr, Datum rowid,
 	CommitSeqNo tupleCsn;
 	OTuple		tuple;
 
-	get_keys_from_rowid(GET_PRIMARY(old_descr), rowid, &pkey, &hint,
+	if (ctx->has_hint)
+		hint = ctx->last_hint;
+	else
+	{
+		hint.blkno = OInvalidInMemoryBlkno;
+		hint.pageChangeCount = 0;
+	}
+
+	get_keys_from_rowid(GET_PRIMARY(ctx->old_descr), rowid, &pkey, &hint,
 						&csn, NULL, NULL);
 	O_LOAD_SNAPSHOT_CSN(&oSnapshot, csn);
 
-	tuple = o_btree_find_tuple_by_key(&GET_PRIMARY(old_descr)->desc,
+	tuple = o_btree_find_tuple_by_key(&GET_PRIMARY(ctx->old_descr)->desc,
 									  (Pointer) &pkey,
 									  BTreeKeyBound,
 									  &oSnapshot, &tupleCsn,
-									  slot->tts_mcxt,
+									  ctx->slot->tts_mcxt,
 									  &hint);
 
 	if (O_TUPLE_IS_NULL(tuple))
 		return false;
 
-	tts_orioledb_store_tuple(slot, tuple, old_descr, tupleCsn,
+	ctx->last_hint = hint;
+	ctx->has_hint = true;
+
+	tts_orioledb_store_tuple(ctx->slot, tuple, ctx->old_descr, tupleCsn,
 							 PrimaryIndexNumber, true, &hint);
 	return true;
 }
@@ -1738,7 +1750,7 @@ rebuild_primary_next_tuple(OTuple *tuple, bool *should_free, void *arg)
 	if (!tuplesort_get_rebuild_rowid(ctx->sortstate, &rowid, true))
 		return false;
 
-	if (!rebuild_fetch_tuple_by_rowid(ctx->old_descr, rowid, ctx->slot))
+	if (!rebuild_fetch_tuple_by_rowid(ctx, rowid))
 		elog(ERROR, "failed to fetch tuple by rowid during index rebuild");
 
 	tts_orioledb_detoast(ctx->slot);
