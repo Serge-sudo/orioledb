@@ -94,15 +94,15 @@ comparetup_orioledb_index(const SortTuple *a, const SortTuple *b, Tuplesortstate
 
 	if (sortKey->abbrev_converter)
 	{
-		attno = sortKey->ssup_attno;
+	attno = sortKey->ssup_attno;
 
-		datum1 = o_fastgetattr(ltup, attno, tupDesc, spec, &isnull1);
-		datum2 = o_fastgetattr(rtup, attno, tupDesc, spec, &isnull2);
+	datum1 = o_fastgetattr(ltup, attno, tupDesc, spec, &isnull1);
+	datum2 = o_fastgetattr(rtup, attno, tupDesc, spec, &isnull2);
 
-		compare = ApplySortAbbrevFullComparator(datum1, isnull1,
-												datum2, isnull2,
-												sortKey);
-		if (compare != 0)
+	compare = ApplySortAbbrevFullComparator(datum1, isnull1,
+											datum2, isnull2,
+											sortKey);
+	if (compare != 0)
 			return compare;
 	}
 
@@ -224,19 +224,22 @@ comparetup_orioledb_primary_rebuild(const SortTuple *a, const SortTuple *b,
 	sortKey++;
 	for (nkey = 1; nkey < base->nKeys; nkey++, sortKey++)
 	{
-		attno = sortKey->ssup_attno;
+		if (!OIgnoreColumn(arg->id, nkey))
+		{
+			attno = sortKey->ssup_attno;
 
-		datum1 = o_fastgetattr(ltup, attno, tupDesc, spec, &isnull1);
-		datum2 = o_fastgetattr(rtup, attno, tupDesc, spec, &isnull2);
+			datum1 = o_fastgetattr(ltup, attno, tupDesc, spec, &isnull1);
+			datum2 = o_fastgetattr(rtup, attno, tupDesc, spec, &isnull2);
 
-		compare = ApplySortComparator(datum1, isnull1,
-									  datum2, isnull2,
-									  sortKey);
-		if (compare != 0)
-			return compare;
+			compare = ApplySortComparator(datum1, isnull1,
+										  datum2, isnull2,
+										  sortKey);
+			if (compare != 0)
+				return compare;
 
-		if (isnull1)
-			equal_hasnull = true;
+			if (isnull1)
+				equal_hasnull = true;
+		}
 	}
 
 	if (arg->enforceUnique && !equal_hasnull)
@@ -496,15 +499,19 @@ tuplesort_begin_orioledb_primary_rebuild(OIndexDescr *idx,
 
 	for (i = 0; i < sort_fields; i++)
 	{
-		SortSupport sortKey = &base->sortKeys[i];
+		if (!OIgnoreColumn(idx, i))
+		{
+			SortSupport sortKey = &base->sortKeys[i];
 
-		sortKey->ssup_cxt = CurrentMemoryContext;
-		sortKey->ssup_collation = idx->fields[i].collation;
-		sortKey->ssup_nulls_first = idx->fields[i].nullfirst;
-		sortKey->ssup_attno = i + 1;
-		sortKey->abbreviate = (i == 0);
-		sortKey->ssup_reverse = !idx->fields[i].ascending;
-		o_finish_sort_support_function(idx->fields[i].comparator, sortKey);
+			sortKey->ssup_cxt = CurrentMemoryContext;
+			sortKey->ssup_collation = idx->fields[i].collation;
+			sortKey->ssup_nulls_first = idx->fields[i].nullfirst;
+			sortKey->ssup_attno =
+				OIndexKeyAttnumToTupleAttnum(BTreeKeyNonLeafTuple, idx, i + 1);
+			sortKey->abbreviate = (i == 0);
+			sortKey->ssup_reverse = !idx->fields[i].ascending;
+			o_finish_sort_support_function(idx->fields[i].comparator, sortKey);
+		}
 	}
 
 	MemoryContextSwitchTo(oldcontext);
