@@ -1310,8 +1310,8 @@ build_secondary_index_worker_sort(oIdxSpool *btspool, void *bt_shared, Sharedsor
 /* Get next tuple and store all its attributes to a slot */
 static inline
 bool
-scan_getnextslot_someattrs(BTreeSeqScan *scan, OTableDescr *descr,
-						  TupleTableSlot *slot, double *ntuples, int natts)
+scan_getnextslot_allattrs(BTreeSeqScan *scan, OTableDescr *descr,
+						  TupleTableSlot *slot, double *ntuples)
 {
 	OTuple		tup;
 	BTreeLocationHint hint;
@@ -1324,7 +1324,7 @@ scan_getnextslot_someattrs(BTreeSeqScan *scan, OTableDescr *descr,
 
 	tts_orioledb_store_tuple(slot, tup, descr, tupleCsn,
 							 PrimaryIndexNumber, true, &hint);
-	tts_orioledb_getsomeattrs(slot, natts);
+	slot_getallattrs(slot);
 	(*ntuples)++;
 	return true;
 }
@@ -1630,10 +1630,10 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 		(*index_tuples)[i] = 0;
 	}
 
-	while (scan_getnextslot_someattrs(sscan, old_descr, primarySlot, heap_tuples,
-									  GET_PRIMARY(descr)->maxTableAttnum))
+	while (scan_getnextslot_allattrs(sscan, old_descr, primarySlot, heap_tuples))
 	{
-		tts_orioledb_detoast_key_attrs(primarySlot, descr);
+		tts_orioledb_detoast(primarySlot);
+		tts_orioledb_toast(primarySlot, descr);
 		for (i = PrimaryIndexNumber; i < descr->nIndices; i++)
 		{
 			OTuple		newTup;
@@ -1663,11 +1663,22 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 			}
 			else
 			{
-				newTup = tts_orioledb_make_secondary_tuple(primarySlot, idx, true);
+				newTup = tts_orioledb_make_secondary_tuple(primarySlot,
+														   idx, true);
 			}
 			o_btree_check_size_of_tuple(o_tuple_size(newTup, &idx->leafSpec),
 										idx->name.data, true);
 			tuplesort_putotuple(sortstates[i], newTup);
+			pfree(newTup.data);
+		}
+
+		tts_orioledb_toast_sort_add(primarySlot, descr, sortstates[descr->nIndices]);
+
+		if (descr->bridge)
+		{
+			OTuple		newTup = tts_orioledb_make_secondary_tuple(primarySlot, descr->bridge, true);
+
+			tuplesort_putotuple(sortstates[descr->nIndices + 1], newTup);
 			pfree(newTup.data);
 		}
 
