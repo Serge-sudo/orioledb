@@ -24,6 +24,9 @@
 
 extern bool is_orioledb_rel(Relation rel);
 extern OIndexNumber find_tree_in_descr(OTableDescr *descr, ORelOids oids);
+extern void get_keys_from_rowid(OIndexDescr *id, Datum pkDatum, OBTreeKeyBound *key,
+								BTreeLocationHint *hint, CommitSeqNo *csn,
+								uint32 *version, ItemPointer *bridge_ctid);
 
 /* EXPLAIN ANALYZE functions call counter */
 typedef struct

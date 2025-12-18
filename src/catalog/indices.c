@@ -19,17 +19,20 @@
 #include "btree/io.h"
 #include "btree/undo.h"
 #include "btree/scan.h"
+#include "btree/iterator.h"
 #include "checkpoint/checkpoint.h"
 #include "catalog/indices.h"
 #include "catalog/o_sys_cache.h"
 #include "recovery/recovery.h"
 #include "recovery/internal.h"
 #include "recovery/wal.h"
+#include "tableam/handler.h"
 #include "tableam/operations.h"
 #include "transam/oxid.h"
 #include "tuple/slot.h"
 #include "tuple/sort.h"
 #include "tuple/toast.h"
+#include "tableam/tree.h"
 #include "utils/compress.h"
 #include "utils/planner.h"
 #include "utils/stopevent.h"
@@ -1558,7 +1561,12 @@ rebuild_indices_worker_sort(oIdxSpool *btspool, void *bt_shared,
 	btspool->sortstates = palloc0(sizeof(Pointer) * nallindices);
 	for (i = PrimaryIndexNumber; i < nIndices; i++)
 	{
-		btspool->sortstates[i] = tuplesort_begin_orioledb_index(btspool->descr->indices[i], work_mem, false, &(coordinate[i]));
+		if (i == PrimaryIndexNumber)
+			btspool->sortstates[i] = tuplesort_begin_orioledb_primary_rebuild(btspool->descr->indices[i],
+																			  btspool->old_descr->indices[PrimaryIndexNumber],
+																			  work_mem, false, &(coordinate[i]));
+		else
+			btspool->sortstates[i] = tuplesort_begin_orioledb_index(btspool->descr->indices[i], work_mem, false, &(coordinate[i]));
 	}
 	btspool->sortstates[nIndices] = tuplesort_begin_orioledb_toast(btspool->descr->toast,
 																   btspool->descr->indices[PrimaryIndexNumber],
@@ -1570,7 +1578,7 @@ rebuild_indices_worker_sort(oIdxSpool *btspool, void *bt_shared,
 
 	rebuild_indices_worker_heap_scan(btspool->old_descr, btspool->descr,
 									 poscan, btspool->sortstates, false,
-									 &heaptuples, &indtuples, NULL, NULL);
+									 &heaptuples, &indtuples);
 
 	/* Execute this worker's part of the sort */
 	if (progress)
@@ -1609,16 +1617,14 @@ rebuild_indices_worker_sort(oIdxSpool *btspool, void *bt_shared,
 static void
 rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 								 ParallelOScanDesc poscan, Tuplesortstate **sortstates,
-								 bool progress, double *heap_tuples, double *index_tuples[],
-								 uint64 *ctid, uint64 *bridge_ctid)
+								 bool progress, double *heap_tuples, double *index_tuples[])
 {
-	void	   *sscan;
 	OIndexDescr *idx;
 	int			i;
 	TupleTableSlot *primarySlot;
+	void	   *sscan;
 
 	primarySlot = MakeSingleTupleTableSlot(old_descr->tupdesc, &TTSOpsOrioleDB);
-
 
 	sscan = make_btree_seq_scan(&GET_PRIMARY(old_descr)->desc, &o_in_progress_snapshot, poscan);
 
@@ -1632,10 +1638,10 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 	{
 		tts_orioledb_detoast(primarySlot);
 		tts_orioledb_toast(primarySlot, descr);
-
 		for (i = PrimaryIndexNumber; i < descr->nIndices; i++)
 		{
 			OTuple		newTup;
+			OTuple		oldPkTup;
 
 			idx = descr->indices[i];
 
@@ -1647,29 +1653,14 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 
 			if (i == PrimaryIndexNumber)
 			{
-				if (idx->primaryIsCtid)
-				{
-					Assert(ctid);
-					primarySlot->tts_tid.ip_posid = (OffsetNumber) (*ctid + 1);
-					BlockIdSet(&primarySlot->tts_tid.ip_blkid,
-							   (uint32) ((*ctid + 1) >> 16));
-					(*ctid)++;
-				}
-				if (idx->bridging && bridge_ctid)
-				{
-					OTableSlot *o_slot = (OTableSlot *) primarySlot;
-					BlockNumber max_block_number = MaxBlockNumber;
-
-					if (BlockNumberIsValid(max_bridge_ctid_blkno))
-						max_block_number = max_bridge_ctid_blkno;
-
-					ItemPointerSet(&o_slot->bridge_ctid,
-								   (uint32) ((*bridge_ctid) / MaxHeapTuplesPerPage % max_block_number),
-								   (OffsetNumber) ((*bridge_ctid) % MaxHeapTuplesPerPage + FirstOffsetNumber));
-					(*bridge_ctid)++;
-				}
-
-				newTup = tts_orioledb_form_orphan_tuple(primarySlot, descr);
+				newTup = tts_orioledb_make_key(primarySlot, descr);
+				oldPkTup = tts_orioledb_make_key(primarySlot, old_descr);
+				o_btree_check_size_of_tuple(o_tuple_size(newTup, &idx->nonLeafSpec),
+											idx->name.data, true);
+				tuplesort_put_rebuild_primary(sortstates[i], newTup, oldPkTup);
+				pfree(newTup.data);
+				pfree(oldPkTup.data);
+				continue;
 			}
 			else
 			{
@@ -1697,6 +1688,89 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 
 	ExecDropSingleTupleTableSlot(primarySlot);
 	free_btree_seq_scan(sscan);
+}
+
+typedef struct
+{
+	Tuplesortstate *sortstate;
+	OTableDescr *old_descr;
+	OTableDescr *descr;
+	TupleTableSlot *slot;
+	uint64	   *ctid;
+	uint64	   *bridge_ctid;
+} ORebuildPrimaryWriteCtx;
+
+static bool
+rebuild_fetch_tuple_by_oldpk(ORebuildPrimaryWriteCtx *ctx, OTuple oldpk)
+{
+	OBTreeKeyBound pkey;
+	CommitSeqNo csn;
+	OSnapshot	oSnapshot;
+	CommitSeqNo tupleCsn;
+	OTuple		tuple;
+
+	o_fill_key_bound(GET_PRIMARY(ctx->old_descr), oldpk, BTreeKeyNonLeafKey, &pkey);
+	csn = COMMITSEQNO_INPROGRESS;
+	O_LOAD_SNAPSHOT_CSN(&oSnapshot, csn);
+
+	tuple = o_btree_find_tuple_by_key(&GET_PRIMARY(ctx->old_descr)->desc,
+									  (Pointer) &pkey,
+									  BTreeKeyBound,
+									  &oSnapshot, &tupleCsn,
+									  ctx->slot->tts_mcxt,
+									  NULL);
+
+	if (O_TUPLE_IS_NULL(tuple))
+		return false;
+
+	tts_orioledb_store_tuple(ctx->slot, tuple, ctx->old_descr, tupleCsn,
+							 PrimaryIndexNumber, true, NULL);
+	return true;
+}
+
+static bool
+rebuild_primary_next_tuple(OTuple *tuple, bool *should_free, void *arg)
+{
+	ORebuildPrimaryWriteCtx *ctx = (ORebuildPrimaryWriteCtx *) arg;
+	OTuple		oldpk;
+
+	if (!tuplesort_get_rebuild_oldpk(ctx->sortstate, &oldpk, true))
+		return false;
+
+	if (!rebuild_fetch_tuple_by_oldpk(ctx, oldpk))
+		elog(ERROR, "failed to fetch tuple by key during index rebuild");
+
+	tts_orioledb_detoast(ctx->slot);
+	tts_orioledb_toast(ctx->slot, ctx->descr);
+
+	if (ctx->descr->indices[PrimaryIndexNumber]->primaryIsCtid)
+	{
+		Assert(ctx->ctid);
+		ctx->slot->tts_tid.ip_posid = (OffsetNumber) (*ctx->ctid + 1);
+		BlockIdSet(&ctx->slot->tts_tid.ip_blkid,
+				   (uint32) ((*ctx->ctid + 1) >> 16));
+		(*ctx->ctid)++;
+	}
+
+	if (ctx->descr->indices[PrimaryIndexNumber]->bridging && ctx->bridge_ctid)
+	{
+		OTableSlot *o_slot = (OTableSlot *) ctx->slot;
+		BlockNumber max_block_number = MaxBlockNumber;
+
+		if (BlockNumberIsValid(max_bridge_ctid_blkno))
+			max_block_number = max_bridge_ctid_blkno;
+
+		ItemPointerSet(&o_slot->bridge_ctid,
+					   (uint32) ((*ctx->bridge_ctid) / MaxHeapTuplesPerPage % max_block_number),
+					   (OffsetNumber) ((*ctx->bridge_ctid) % MaxHeapTuplesPerPage + FirstOffsetNumber));
+		(*ctx->bridge_ctid)++;
+	}
+
+	*tuple = tts_orioledb_form_orphan_tuple(ctx->slot, ctx->descr);
+	ExecClearTuple(ctx->slot);
+	*should_free = true;
+
+	return true;
 }
 
 void
@@ -1787,7 +1861,12 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 	/* Begin serial/leader tuplesorts */
 	for (i = PrimaryIndexNumber; i < descr->nIndices; i++)
 	{
-		sortstates[i] = tuplesort_begin_orioledb_index(descr->indices[i], work_mem, false, coordinate[i]);
+		if (i == PrimaryIndexNumber)
+			sortstates[i] = tuplesort_begin_orioledb_primary_rebuild(descr->indices[i],
+																	 old_descr->indices[PrimaryIndexNumber],
+																	 work_mem, false, coordinate[i]);
+		else
+			sortstates[i] = tuplesort_begin_orioledb_index(descr->indices[i], work_mem, false, coordinate[i]);
 	}
 
 	btree_open_smgr(&descr->toast->desc);
@@ -1806,9 +1885,7 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 	{
 		/* Serial build */
 		rebuild_indices_worker_heap_scan(old_descr, descr, NULL, sortstates,
-										 false, &heap_tuples, &index_tuples,
-										 &ctid,
-										 (descr->bridge && !old_descr->bridge) ? &bridge_ctid : NULL);
+										 false, &heap_tuples, &index_tuples);
 	}
 	else
 	{
@@ -1819,16 +1896,35 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 	}
 
 	o_set_syscache_hooks();
+	ORebuildPrimaryWriteCtx primary_ctx = {
+		.sortstate = sortstates[PrimaryIndexNumber],
+		.old_descr = old_descr,
+		.descr = descr,
+		.slot = MakeSingleTupleTableSlot(old_descr->tupdesc, &TTSOpsOrioleDB),
+		.ctid = &ctid,
+		.bridge_ctid = (descr->bridge && !old_descr->bridge) ? &bridge_ctid : NULL
+	};
 	for (i = PrimaryIndexNumber; i < nallindices; i++)
 	{
 		tuplesort_performsort(sortstates[i]);
 		if (i < descr->nIndices)	/* Indices sort states */
 		{
-			btree_write_index_data(&descr->indices[i]->desc, descr->indices[i]->leafTupdesc,
-								   sortstates[i],
-								   (i == PrimaryIndexNumber && descr->indices[PrimaryIndexNumber]->primaryIsCtid) ? ctid : 0,
-								   (i == PrimaryIndexNumber) ? bridge_ctid : 0,
-								   &fileHeaders[i]);
+			if (i == PrimaryIndexNumber)
+			{
+				btree_write_index_data_callback(&descr->indices[i]->desc, descr->indices[i]->leafTupdesc,
+												rebuild_primary_next_tuple, &primary_ctx,
+												0,
+												0,
+												&fileHeaders[i]);
+			}
+			else
+			{
+				btree_write_index_data(&descr->indices[i]->desc, descr->indices[i]->leafTupdesc,
+									   sortstates[i],
+									   0,
+									   0,
+									   &fileHeaders[i]);
+			}
 		}
 		else if (i == descr->nIndices)	/* TOAST sort state */
 		{
@@ -1843,6 +1939,11 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 		}
 		tuplesort_end(sortstates[i]);
 	}
+	if (descr->indices[PrimaryIndexNumber]->primaryIsCtid)
+		fileHeaders[PrimaryIndexNumber].ctid = ctid;
+	if (descr->indices[PrimaryIndexNumber]->bridging)
+		fileHeaders[PrimaryIndexNumber].bridgeCtid = bridge_ctid;
+	ExecDropSingleTupleTableSlot(primary_ctx.slot);
 	o_unset_syscache_hooks();
 
 	pfree((void *) sortstates);
