@@ -1377,7 +1377,7 @@ primary_build_can_skip_sort(OTableDescr *old_descr, OTableDescr *descr)
 
 /*
  * Make a local heapscan in a worker, in a leader, or sequentially
- * for building secomndary index. Put result into provided sortstate
+ * for building secondary index. Put result into provided sortstate
  */
 static void
 build_secondary_index_worker_heap_scan(OTableDescr *descr, OIndexDescr *idx,
@@ -1773,6 +1773,7 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 	BTreeDescr *old_td;
 	BTreeMetaPage *meta;
 	int			nallindices = descr->nIndices + 1;
+	bool		can_stream_primary;
 	bool		primary_direct_build = false;
 	OBTreeBuildState *primary_build_state = NULL;
 
@@ -1793,13 +1794,14 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 	else
 		bridge_ctid = 0;
 
-	primary_direct_build = primary_build_can_skip_sort(old_descr, descr) &&
-		!in_dedicated_recovery_worker &&
+	can_stream_primary = !in_dedicated_recovery_worker &&
 		max_parallel_maintenance_workers == 0;
+	primary_direct_build = primary_build_can_skip_sort(old_descr, descr) &&
+		can_stream_primary;
 
 	if (primary_direct_build)
 		primary_build_state = btree_build_state_start(&descr->indices[PrimaryIndexNumber]->desc,
-													  0, bridge_ctid);
+													  ctid, bridge_ctid);
 
 	buildstate.btleader = NULL;
 
@@ -1888,6 +1890,8 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 	o_set_syscache_hooks();
 	for (i = PrimaryIndexNumber; i < nallindices; i++)
 	{
+		Tuplesortstate *sortstate = sortstates[i];
+
 		if (primary_direct_build && i == PrimaryIndexNumber)
 		{
 			btree_build_state_set_positions(primary_build_state, ctid, bridge_ctid);
@@ -1896,28 +1900,32 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 			primary_build_state = NULL;
 			continue;
 		}
-		tuplesort_performsort(sortstates[i]);
+		if (sortstate == NULL)
+		{
+			Assert(primary_direct_build && i == PrimaryIndexNumber);
+			continue;
+		}
+		tuplesort_performsort(sortstate);
 		if (i < descr->nIndices)	/* Indices sort states */
 		{
-			btree_write_index_data(&descr->indices[i]->desc, descr->indices[i]->leafTupdesc,
-								   sortstates[i],
+			btree_write_index_data(&descr->indices[i]->desc, descr->indices[i]->leafTupdesc, sortstate,
 								   (i == PrimaryIndexNumber && descr->indices[PrimaryIndexNumber]->primaryIsCtid) ? ctid : 0,
 								   (i == PrimaryIndexNumber) ? bridge_ctid : 0,
 								   &fileHeaders[i]);
 		}
 		else if (i == descr->nIndices)	/* TOAST sort state */
 		{
-			btree_write_index_data(&descr->toast->desc, descr->toast->leafTupdesc,
-								   sortstates[descr->nIndices], 0, 0, &fileHeaders[i]);
+			btree_write_index_data(&descr->toast->desc, descr->toast->leafTupdesc, sortstate,
+								   0, 0, &fileHeaders[i]);
 		}
 		else if (i == descr->nIndices + 1 && descr->bridge) /* bridge_index sort
 															 * state */
 		{
-			btree_write_index_data(&descr->bridge->desc, descr->bridge->leafTupdesc,
-								   sortstates[descr->nIndices + 1], 0, 0, &fileHeaders[i]);
+			btree_write_index_data(&descr->bridge->desc, descr->bridge->leafTupdesc, sortstate,
+								   0, 0, &fileHeaders[i]);
 		}
-		if (sortstates[i])
-			tuplesort_end(sortstates[i]);
+		/* Primary sortstate can be NULL when streaming build is enabled. */
+		tuplesort_end(sortstate);
 	}
 	o_unset_syscache_hooks();
 

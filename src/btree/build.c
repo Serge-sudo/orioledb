@@ -300,13 +300,17 @@ put_tuple_to_stack(BTreeDescr *desc, OIndexBuildStackItem *stack,
 
 void
 btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
-					   Tuplesortstate *sortstate,
-					   uint64 ctid, uint64 bridge_ctid,
-					   CheckpointFileHeader *file_header)
+					   Tuplesortstate *sortstate, uint64 ctid,
+					   uint64 bridge_ctid, CheckpointFileHeader *file_header)
 {
 	OTuple		idx_tup;
 	OBTreeBuildState *state;
 
+	/*
+	 * tupdesc is maintained for API compatibility and future-proofing; callers
+	 * already provide the leaf tuple descriptor alongside the tuplesort even
+	 * though it is not required by the streaming builder today.
+	 */
 	(void) tupdesc;
 
 	state = btree_build_state_start(desc, ctid, bridge_ctid);
@@ -436,7 +440,7 @@ btree_build_state_add_tuple(OBTreeBuildState *state, OTuple tuple)
 void
 btree_build_state_set_positions(OBTreeBuildState *state, uint64 ctid, uint64 bridge_ctid)
 {
-	Assert(state);
+	Assert(state && !state->finished);
 	pg_atomic_write_u64(&state->metaPageBlkno.ctid, ctid);
 	pg_atomic_write_u64(&state->metaPageBlkno.bridge_ctid, bridge_ctid);
 }
