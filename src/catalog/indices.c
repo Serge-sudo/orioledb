@@ -1628,6 +1628,7 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 
 	primarySlot = MakeSingleTupleTableSlot(old_descr->tupdesc, &TTSOpsOrioleDB);
 
+	o_btree_load_shmem(&GET_PRIMARY(old_descr)->desc);
 	it = o_btree_iterator_create(&GET_PRIMARY(old_descr)->desc, NULL, BTreeKeyNone,
 								 &o_in_progress_snapshot, ForwardScanDirection);
 	o_btree_iterator_set_tuple_ctx(it, CurrentMemoryContext);
