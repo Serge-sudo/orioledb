@@ -1712,13 +1712,14 @@ rebuild_fetch_tuple_by_oldpk(ORebuildPrimaryWriteCtx *ctx, OTuple oldpk,
 	OSnapshot	oSnapshot;
 	CommitSeqNo tupleCsn;
 	OTuple		tuple;
-	BTreeLocationHint local_hint;
+	BTreeLocationHint local_hint = {OInvalidInMemoryBlkno, 0};
 
 	o_fill_key_bound(GET_PRIMARY(ctx->old_descr), oldpk, BTreeKeyNonLeafKey, &pkey);
 	csn = COMMITSEQNO_INPROGRESS;
 	O_LOAD_SNAPSHOT_CSN(&oSnapshot, csn);
 
-	local_hint = *hint;
+	if (hint)
+		local_hint = *hint;
 	if (local_hint.blkno == OInvalidInMemoryBlkno && ctx->has_hint)
 		local_hint = ctx->last_hint;
 
