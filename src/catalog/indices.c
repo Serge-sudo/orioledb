@@ -19,7 +19,7 @@
 #include "btree/io.h"
 #include "btree/undo.h"
 #include "btree/scan.h"
-#include "btree/btree.h"
+#include "btree/iterator.h"
 #include "checkpoint/checkpoint.h"
 #include "catalog/indices.h"
 #include "catalog/o_sys_cache.h"
@@ -1619,14 +1619,18 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 								 ParallelOScanDesc poscan, Tuplesortstate **sortstates,
 								 bool progress, double *heap_tuples, double *index_tuples[])
 {
-	void	   *sscan;
+	BTreeIterator *it;
 	OIndexDescr *idx;
 	int			i;
 	TupleTableSlot *primarySlot;
+	BTreeLocationHint hint;
+	CommitSeqNo tupleCsn;
 
 	primarySlot = MakeSingleTupleTableSlot(old_descr->tupdesc, &TTSOpsOrioleDB);
 
-	sscan = make_btree_seq_scan(&GET_PRIMARY(old_descr)->desc, &o_in_progress_snapshot, poscan);
+	it = o_btree_iterator_create(&GET_PRIMARY(old_descr)->desc, NULL, BTreeKeyNone,
+								 &o_in_progress_snapshot, ForwardScanDirection);
+	o_btree_iterator_set_tuple_ctx(it, CurrentMemoryContext);
 
 	*heap_tuples = 0;
 	for (i = PrimaryIndexNumber; i < descr->nIndices; i++)
@@ -1634,8 +1638,19 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 		(*index_tuples)[i] = 0;
 	}
 
-	while (scan_getnextslot_allattrs(sscan, old_descr, primarySlot, heap_tuples))
+	do
 	{
+		OTuple		tup;
+
+		tup = o_btree_iterator_fetch(it, &tupleCsn, NULL, BTreeKeyNone, false, &hint);
+		if (O_TUPLE_IS_NULL(tup))
+			break;
+
+		tts_orioledb_store_tuple(primarySlot, tup, old_descr, tupleCsn,
+								 PrimaryIndexNumber, true, &hint);
+		slot_getallattrs(primarySlot);
+		(*heap_tuples)++;
+
 		tts_orioledb_detoast(primarySlot);
 		tts_orioledb_toast(primarySlot, descr);
 		for (i = PrimaryIndexNumber; i < descr->nIndices; i++)
@@ -1657,8 +1672,7 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 				oldPkTup = tts_orioledb_make_key(primarySlot, old_descr);
 				o_btree_check_size_of_tuple(o_tuple_size(newTup, &idx->nonLeafSpec),
 											idx->name.data, true);
-				tuplesort_put_rebuild_primary(sortstates[i], newTup, oldPkTup,
-											  &((OTableSlot *) primarySlot)->hint);
+				tuplesort_put_rebuild_primary(sortstates[i], newTup, oldPkTup);
 				pfree(newTup.data);
 				pfree(oldPkTup.data);
 				continue;
@@ -1685,10 +1699,10 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 		}
 
 		ExecClearTuple(primarySlot);
-	}
+	} while (true);
 
 	ExecDropSingleTupleTableSlot(primarySlot);
-	free_btree_seq_scan(sscan);
+	btree_iterator_free(it);
 }
 
 typedef struct
@@ -1699,45 +1713,33 @@ typedef struct
 	TupleTableSlot *slot;
 	uint64	   *ctid;
 	uint64	   *bridge_ctid;
-	BTreeLocationHint last_hint;
-	bool		has_hint;
 } ORebuildPrimaryWriteCtx;
 
 static bool
-rebuild_fetch_tuple_by_oldpk(ORebuildPrimaryWriteCtx *ctx, OTuple oldpk,
-							 BTreeLocationHint *hint)
+rebuild_fetch_tuple_by_oldpk(ORebuildPrimaryWriteCtx *ctx, OTuple oldpk)
 {
 	OBTreeKeyBound pkey;
 	CommitSeqNo csn;
 	OSnapshot	oSnapshot;
 	CommitSeqNo tupleCsn;
 	OTuple		tuple;
-	BTreeLocationHint local_hint = {OInvalidInMemoryBlkno, 0};
 
 	o_fill_key_bound(GET_PRIMARY(ctx->old_descr), oldpk, BTreeKeyNonLeafKey, &pkey);
 	csn = COMMITSEQNO_INPROGRESS;
 	O_LOAD_SNAPSHOT_CSN(&oSnapshot, csn);
-
-	if (hint)
-		local_hint = *hint;
-	if (local_hint.blkno == OInvalidInMemoryBlkno && ctx->has_hint)
-		local_hint = ctx->last_hint;
 
 	tuple = o_btree_find_tuple_by_key(&GET_PRIMARY(ctx->old_descr)->desc,
 									  (Pointer) &pkey,
 									  BTreeKeyBound,
 									  &oSnapshot, &tupleCsn,
 									  ctx->slot->tts_mcxt,
-									  &local_hint);
+									  NULL);
 
 	if (O_TUPLE_IS_NULL(tuple))
 		return false;
 
-	ctx->last_hint = local_hint;
-	ctx->has_hint = true;
-
 	tts_orioledb_store_tuple(ctx->slot, tuple, ctx->old_descr, tupleCsn,
-							 PrimaryIndexNumber, true, &local_hint);
+							 PrimaryIndexNumber, true, NULL);
 	return true;
 }
 
@@ -1746,12 +1748,11 @@ rebuild_primary_next_tuple(OTuple *tuple, bool *should_free, void *arg)
 {
 	ORebuildPrimaryWriteCtx *ctx = (ORebuildPrimaryWriteCtx *) arg;
 	OTuple		oldpk;
-	BTreeLocationHint hint;
 
-	if (!tuplesort_get_rebuild_oldpk(ctx->sortstate, &oldpk, &hint, true))
+	if (!tuplesort_get_rebuild_oldpk(ctx->sortstate, &oldpk, true))
 		return false;
 
-	if (!rebuild_fetch_tuple_by_oldpk(ctx, oldpk, &hint))
+	if (!rebuild_fetch_tuple_by_oldpk(ctx, oldpk))
 		elog(ERROR, "failed to fetch tuple by key during index rebuild");
 
 	tts_orioledb_detoast(ctx->slot);

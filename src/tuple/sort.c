@@ -15,7 +15,6 @@
 
 #include "orioledb.h"
 
-#include "btree/btree.h"
 #include "tableam/descr.h"
 #include "tuple/format.h"
 #include "tuple/sort.h"
@@ -160,23 +159,19 @@ comparetup_orioledb_index(const SortTuple *a, const SortTuple *b, Tuplesortstate
 
 static void
 read_rebuild_entry(void *ptr, OIndexDescr *newIdx, OIndexDescr *oldIdx,
-				   OTuple *key, OTuple *oldpk, BTreeLocationHint *hint)
+				   OTuple *key, OTuple *oldpk)
 {
 	Pointer		p = (Pointer) ptr;
-	int			oldlen;
 
 	key->formatFlags = *((uint8 *) p);
 	p += MAXIMUM_ALIGNOF;
 	key->data = p;
 	p += o_tuple_size(*key, &newIdx->nonLeafSpec);
-	oldlen = *((int *) p);
+	(void) *((int *) p);
 	p += sizeof(int);
 	oldpk->formatFlags = *((uint8 *) p);
 	p += MAXIMUM_ALIGNOF;
 	oldpk->data = p;
-	p += oldlen;
-	p += MAXALIGN(oldlen) - oldlen;
-	memcpy(hint, p, sizeof(BTreeLocationHint));
 }
 
 static int
@@ -189,8 +184,6 @@ comparetup_orioledb_primary_rebuild(const SortTuple *a, const SortTuple *b,
 	OTuple		rtup;
 	OTuple		loldpk;
 	OTuple		roldpk;
-	BTreeLocationHint lhint,
-				rhint;
 	TupleDesc	tupDesc;
 	TupleDesc	oldTupDesc;
 	bool		equal_hasnull = false;
@@ -211,8 +204,8 @@ comparetup_orioledb_primary_rebuild(const SortTuple *a, const SortTuple *b,
 	if (compare != 0)
 		return compare;
 
-	read_rebuild_entry(a->tuple, arg->newIdx, arg->oldIdx, &ltup, &loldpk, &lhint);
-	read_rebuild_entry(b->tuple, arg->newIdx, arg->oldIdx, &rtup, &roldpk, &rhint);
+	read_rebuild_entry(a->tuple, arg->newIdx, arg->oldIdx, &ltup, &loldpk);
+	read_rebuild_entry(b->tuple, arg->newIdx, arg->oldIdx, &rtup, &roldpk);
 	tupDesc = arg->newTupDesc;
 	oldTupDesc = arg->oldTupDesc;
 
@@ -277,8 +270,7 @@ comparetup_orioledb_primary_rebuild(const SortTuple *a, const SortTuple *b,
 		lv = o_fastgetattr(loldpk, nkey + 1, oldTupDesc, oldspec, &lnull);
 		rv = o_fastgetattr(roldpk, nkey + 1, oldTupDesc, oldspec, &rnull);
 
-		compare = o_call_comparator(arg->oldIdx->fields[nkey].comparator,
-									lv, rv);
+		compare = ApplySortComparator(lv, lnull, rv, rnull, base->sortKeys);
 		if (compare != 0)
 			return compare;
 	}
@@ -369,9 +361,8 @@ removeabbrev_orioledb_primary_rebuild(Tuplesortstate *state, SortTuple *stups,
 		SortTuple  *stup = &stups[i];
 		OTuple		tup;
 		OTuple		oldpk;
-		BTreeLocationHint hint;
 
-		read_rebuild_entry(stup->tuple, arg->newIdx, arg->oldIdx, &tup, &oldpk, &hint);
+		read_rebuild_entry(stup->tuple, arg->newIdx, arg->oldIdx, &tup, &oldpk);
 
 		stup->datum1 = o_fastgetattr(tup,
 									 base->sortKeys[0].ssup_attno,
@@ -385,17 +376,12 @@ static int
 rebuild_tuple_data_size(OIndexRebuildPkSortArg *arg, void *ptr)
 {
 	OTuple		tup;
+	OTuple		oldpk;
 	int			oldpk_len;
-	Pointer		p = (Pointer) ptr;
 
-	tup.formatFlags = *((uint8 *) p);
-	p += MAXIMUM_ALIGNOF;
-	tup.data = p;
-	p += o_tuple_size(tup, &arg->newIdx->nonLeafSpec);
-	oldpk_len = *((int *) p);
-	return o_tuple_size(tup, &arg->newIdx->nonLeafSpec) +
-		sizeof(int) + MAXIMUM_ALIGNOF + MAXALIGN(oldpk_len) +
-		sizeof(BTreeLocationHint);
+	read_rebuild_entry(ptr, arg->newIdx, arg->oldIdx, &tup, &oldpk);
+	oldpk_len = o_tuple_size(oldpk, &arg->oldIdx->nonLeafSpec);
+	return o_tuple_size(tup, &arg->newIdx->nonLeafSpec) + sizeof(int) + MAXIMUM_ALIGNOF + oldpk_len;
 }
 
 static void
@@ -433,11 +419,7 @@ readtup_orioledb_primary_rebuild(Tuplesortstate *state, SortTuple *stup,
 	if (base->sortopt & TUPLESORT_RANDOMACCESS)
 		LogicalTapeReadExact(tape, &tuplen, sizeof(tuplen));
 	stup->tuple = (void *) tup;
-	{
-		BTreeLocationHint	h;
-
-		read_rebuild_entry(tup, arg->newIdx, arg->oldIdx, &key, &oldpk, &h);
-	}
+	read_rebuild_entry(tup, arg->newIdx, arg->oldIdx, &key, &oldpk);
 	stup->datum1 = o_fastgetattr(key,
 								 base->sortKeys[0].ssup_attno,
 								 arg->newTupDesc,
@@ -711,8 +693,7 @@ tuplesort_putotuple(Tuplesortstate *state, OTuple tup)
 }
 
 void
-tuplesort_put_rebuild_primary(Tuplesortstate *state, OTuple key, OTuple oldpk,
-							  BTreeLocationHint *hint)
+tuplesort_put_rebuild_primary(Tuplesortstate *state, OTuple key, OTuple oldpk)
 {
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	OIndexRebuildPkSortArg *arg = (OIndexRebuildPkSortArg *) base->arg;
@@ -730,7 +711,7 @@ tuplesort_put_rebuild_primary(Tuplesortstate *state, OTuple key, OTuple oldpk,
 	keysize = o_tuple_size(key, spec);
 	oldpksize = o_tuple_size(oldpk, oldspec);
 	stup.tuple = MemoryContextAlloc(base->tuplecontext,
-									MAXIMUM_ALIGNOF + keysize + sizeof(int) + MAXIMUM_ALIGNOF + MAXALIGN(oldpksize) + sizeof(BTreeLocationHint));
+									MAXIMUM_ALIGNOF + keysize + sizeof(int) + MAXIMUM_ALIGNOF + oldpksize);
 	ptr = (Pointer) stup.tuple;
 
 	*((uint8 *) ptr) = key.formatFlags;
@@ -742,15 +723,6 @@ tuplesort_put_rebuild_primary(Tuplesortstate *state, OTuple key, OTuple oldpk,
 	*((uint8 *) ptr) = oldpk.formatFlags;
 	ptr += MAXIMUM_ALIGNOF;
 	memcpy(ptr, oldpk.data, oldpksize);
-	ptr += oldpksize;
-	if (oldpksize != MAXALIGN(oldpksize))
-	{
-		int			pad = MAXALIGN(oldpksize) - oldpksize;
-
-		memset(ptr, 0, pad);
-		ptr += pad;
-	}
-	memcpy(ptr, hint, sizeof(BTreeLocationHint));
 
 	stup.datum1 = o_fastgetattr(key,
 								base->sortKeys[0].ssup_attno,
@@ -773,8 +745,7 @@ tuplesort_put_rebuild_primary(Tuplesortstate *state, OTuple key, OTuple oldpk,
 }
 
 bool
-tuplesort_get_rebuild_oldpk(Tuplesortstate *state, OTuple *oldpk,
-							BTreeLocationHint *hint, bool forward)
+tuplesort_get_rebuild_oldpk(Tuplesortstate *state, OTuple *oldpk, bool forward)
 {
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	MemoryContext oldcontext;
@@ -789,7 +760,7 @@ tuplesort_get_rebuild_oldpk(Tuplesortstate *state, OTuple *oldpk,
 		return false;
 	}
 
-	read_rebuild_entry(stup.tuple, arg->newIdx, arg->oldIdx, &key, oldpk, hint);
+	read_rebuild_entry(stup.tuple, arg->newIdx, arg->oldIdx, &key, oldpk);
 	MemoryContextSwitchTo(oldcontext);
 	return true;
 }
