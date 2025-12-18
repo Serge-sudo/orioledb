@@ -1736,7 +1736,7 @@ rebuild_fetch_tuple_by_oldpk(ORebuildPrimaryWriteCtx *ctx, OTuple oldpk,
 	ctx->has_hint = true;
 
 	tts_orioledb_store_tuple(ctx->slot, tuple, ctx->old_descr, tupleCsn,
-							 PrimaryIndexNumber, true, NULL);
+							 PrimaryIndexNumber, true, &local_hint);
 	return true;
 }
 
