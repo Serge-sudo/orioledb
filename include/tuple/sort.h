@@ -14,6 +14,7 @@
 #ifndef __TUPLE_SORT_H
 #define __TUPLE_SORT_H
 
+#include "btree/btree.h"
 #include "tableam/descr.h"
 
 extern Tuplesortstate *tuplesort_begin_orioledb_index(OIndexDescr *idx,
@@ -33,8 +34,9 @@ extern Tuplesortstate *tuplesort_begin_orioledb_toast(OIndexDescr *toast,
 extern OTuple tuplesort_getotuple(Tuplesortstate *state, bool forward);
 extern void tuplesort_putotuple(Tuplesortstate *state, OTuple tup);
 extern void tuplesort_put_rebuild_primary(Tuplesortstate *state, OTuple key,
-										  OTuple old_primary_key);
+										  OTuple old_primary_key,
+										  BTreeLocationHint *hint);
 extern bool tuplesort_get_rebuild_oldpk(Tuplesortstate *state, OTuple *oldpk,
-										bool forward);
+										BTreeLocationHint *hint, bool forward);
 
 #endif							/* __TUPLE_SORT_H */

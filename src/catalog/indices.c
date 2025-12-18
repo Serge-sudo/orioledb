@@ -19,6 +19,7 @@
 #include "btree/io.h"
 #include "btree/undo.h"
 #include "btree/scan.h"
+#include "btree/btree.h"
 #include "checkpoint/checkpoint.h"
 #include "catalog/indices.h"
 #include "catalog/o_sys_cache.h"
@@ -1656,7 +1657,8 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 				oldPkTup = tts_orioledb_make_key(primarySlot, old_descr);
 				o_btree_check_size_of_tuple(o_tuple_size(newTup, &idx->nonLeafSpec),
 											idx->name.data, true);
-				tuplesort_put_rebuild_primary(sortstates[i], newTup, oldPkTup);
+				tuplesort_put_rebuild_primary(sortstates[i], newTup, oldPkTup,
+											  &((OTableSlot *) primarySlot)->hint);
 				pfree(newTup.data);
 				pfree(oldPkTup.data);
 				continue;
@@ -1700,7 +1702,8 @@ typedef struct
 } ORebuildPrimaryWriteCtx;
 
 static bool
-rebuild_fetch_tuple_by_oldpk(ORebuildPrimaryWriteCtx *ctx, OTuple oldpk)
+rebuild_fetch_tuple_by_oldpk(ORebuildPrimaryWriteCtx *ctx, OTuple oldpk,
+							 BTreeLocationHint *hint)
 {
 	OBTreeKeyBound pkey;
 	CommitSeqNo csn;
@@ -1717,7 +1720,7 @@ rebuild_fetch_tuple_by_oldpk(ORebuildPrimaryWriteCtx *ctx, OTuple oldpk)
 									  BTreeKeyBound,
 									  &oSnapshot, &tupleCsn,
 									  ctx->slot->tts_mcxt,
-									  NULL);
+									  hint);
 
 	if (O_TUPLE_IS_NULL(tuple))
 		return false;
@@ -1732,11 +1735,12 @@ rebuild_primary_next_tuple(OTuple *tuple, bool *should_free, void *arg)
 {
 	ORebuildPrimaryWriteCtx *ctx = (ORebuildPrimaryWriteCtx *) arg;
 	OTuple		oldpk;
+	BTreeLocationHint hint;
 
-	if (!tuplesort_get_rebuild_oldpk(ctx->sortstate, &oldpk, true))
+	if (!tuplesort_get_rebuild_oldpk(ctx->sortstate, &oldpk, &hint, true))
 		return false;
 
-	if (!rebuild_fetch_tuple_by_oldpk(ctx, oldpk))
+	if (!rebuild_fetch_tuple_by_oldpk(ctx, oldpk, &hint))
 		elog(ERROR, "failed to fetch tuple by key during index rebuild");
 
 	tts_orioledb_detoast(ctx->slot);
