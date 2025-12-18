@@ -136,7 +136,9 @@ static void rebuild_indices_worker_sort(oIdxSpool *btspool, void *bt_shared,
 										bool progress);
 static void rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr, ParallelOScanDesc poscan,
 											 Tuplesortstate **sortstates, bool progress, double *heap_tuples,
-											 double *index_tuples[], uint64 *ctid, uint64 *bridge_ctid);
+											 double *index_tuples[], uint64 *ctid, uint64 *bridge_ctid,
+											 OBTreeBuildState *primary_build);
+static bool primary_build_can_skip_sort(OTableDescr *old_descr, OTableDescr *descr);
 
 
 /* copied from tablecmds.c */
@@ -1328,6 +1330,51 @@ scan_getnextslot_allattrs(BTreeSeqScan *scan, OTableDescr *descr,
 	return true;
 }
 
+static bool
+primary_build_can_skip_sort(OTableDescr *old_descr, OTableDescr *descr)
+{
+	OIndexDescr *old_primary;
+	OIndexDescr *primary;
+	int			i;
+
+	if (old_descr == NULL || descr == NULL)
+		return false;
+
+	old_primary = GET_PRIMARY(old_descr);
+	primary = GET_PRIMARY(descr);
+
+	if (old_primary->primaryIsCtid != primary->primaryIsCtid)
+		return false;
+	if (old_primary->bridging != primary->bridging)
+		return false;
+	if (old_primary->nFields != primary->nFields ||
+		old_primary->nKeyFields != primary->nKeyFields ||
+		old_primary->nPrimaryFields != primary->nPrimaryFields)
+		return false;
+
+	for (i = 0; i < primary->nKeyFields; i++)
+	{
+		OIndexField *old_field = &old_primary->fields[i];
+		OIndexField *field = &primary->fields[i];
+
+		if (old_field->inputtype != field->inputtype ||
+			old_field->opfamily != field->opfamily ||
+			old_field->opclass != field->opclass ||
+			old_field->collation != field->collation ||
+			old_field->ascending != field->ascending ||
+			old_field->nullfirst != field->nullfirst)
+			return false;
+	}
+
+	for (i = 0; i < primary->nPrimaryFields; i++)
+	{
+		if (old_primary->primaryFieldsAttnums[i] != primary->primaryFieldsAttnums[i])
+			return false;
+	}
+
+	return true;
+}
+
 /*
  * Make a local heapscan in a worker, in a leader, or sequentially
  * for building secomndary index. Put result into provided sortstate
@@ -1570,7 +1617,8 @@ rebuild_indices_worker_sort(oIdxSpool *btspool, void *bt_shared,
 
 	rebuild_indices_worker_heap_scan(btspool->old_descr, btspool->descr,
 									 poscan, btspool->sortstates, false,
-									 &heaptuples, &indtuples, NULL, NULL);
+									 &heaptuples, &indtuples, NULL, NULL,
+									 NULL);
 
 	/* Execute this worker's part of the sort */
 	if (progress)
@@ -1610,7 +1658,8 @@ static void
 rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 								 ParallelOScanDesc poscan, Tuplesortstate **sortstates,
 								 bool progress, double *heap_tuples, double *index_tuples[],
-								 uint64 *ctid, uint64 *bridge_ctid)
+								 uint64 *ctid, uint64 *bridge_ctid,
+								 OBTreeBuildState *primary_build)
 {
 	void	   *sscan;
 	OIndexDescr *idx;
@@ -1678,7 +1727,10 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 			}
 			o_btree_check_size_of_tuple(o_tuple_size(newTup, &idx->leafSpec),
 										idx->name.data, true);
-			tuplesort_putotuple(sortstates[i], newTup);
+			if (primary_build != NULL && i == PrimaryIndexNumber)
+				btree_build_state_add_tuple(primary_build, newTup);
+			else
+				tuplesort_putotuple(sortstates[i], newTup);
 			pfree(newTup.data);
 		}
 
@@ -1721,6 +1773,8 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 	BTreeDescr *old_td;
 	BTreeMetaPage *meta;
 	int			nallindices = descr->nIndices + 1;
+	bool		primary_direct_build = false;
+	OBTreeBuildState *primary_build_state = NULL;
 
 	if (descr->bridge)
 		nallindices += 1;
@@ -1739,10 +1793,19 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 	else
 		bridge_ctid = 0;
 
+	primary_direct_build = primary_build_can_skip_sort(old_descr, descr) &&
+		!in_dedicated_recovery_worker &&
+		max_parallel_maintenance_workers == 0;
+
+	if (primary_direct_build)
+		primary_build_state = btree_build_state_start(&descr->indices[PrimaryIndexNumber]->desc,
+													  0, bridge_ctid);
+
 	buildstate.btleader = NULL;
 
 	/* Attempt to launch parallel worker scan when required */
-	if ((in_dedicated_recovery_worker || (ActiveSnapshotSet() && max_parallel_maintenance_workers > 0)) &&
+	if (!primary_direct_build &&
+		(in_dedicated_recovery_worker || (ActiveSnapshotSet() && max_parallel_maintenance_workers > 0)) &&
 		!descr->indices[PrimaryIndexNumber]->primaryIsCtid &&
 		!(descr->bridge && !old_descr->bridge))
 	{
@@ -1787,7 +1850,10 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 	/* Begin serial/leader tuplesorts */
 	for (i = PrimaryIndexNumber; i < descr->nIndices; i++)
 	{
-		sortstates[i] = tuplesort_begin_orioledb_index(descr->indices[i], work_mem, false, coordinate[i]);
+		if (primary_direct_build && i == PrimaryIndexNumber)
+			sortstates[i] = NULL;
+		else
+			sortstates[i] = tuplesort_begin_orioledb_index(descr->indices[i], work_mem, false, coordinate[i]);
 	}
 
 	btree_open_smgr(&descr->toast->desc);
@@ -1808,7 +1874,8 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 		rebuild_indices_worker_heap_scan(old_descr, descr, NULL, sortstates,
 										 false, &heap_tuples, &index_tuples,
 										 &ctid,
-										 (descr->bridge && !old_descr->bridge) ? &bridge_ctid : NULL);
+										 (descr->bridge && !old_descr->bridge) ? &bridge_ctid : NULL,
+										 primary_build_state);
 	}
 	else
 	{
@@ -1821,6 +1888,14 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 	o_set_syscache_hooks();
 	for (i = PrimaryIndexNumber; i < nallindices; i++)
 	{
+		if (primary_direct_build && i == PrimaryIndexNumber)
+		{
+			btree_build_state_set_positions(primary_build_state, ctid, bridge_ctid);
+			btree_build_state_finish(primary_build_state, &fileHeaders[i]);
+			btree_build_state_free(primary_build_state);
+			primary_build_state = NULL;
+			continue;
+		}
 		tuplesort_performsort(sortstates[i]);
 		if (i < descr->nIndices)	/* Indices sort states */
 		{
@@ -1841,7 +1916,8 @@ rebuild_indices(OTable *old_o_table, OTableDescr *old_descr,
 			btree_write_index_data(&descr->bridge->desc, descr->bridge->leafTupdesc,
 								   sortstates[descr->nIndices + 1], 0, 0, &fileHeaders[i]);
 		}
-		tuplesort_end(sortstates[i]);
+		if (sortstates[i])
+			tuplesort_end(sortstates[i]);
 	}
 	o_unset_syscache_hooks();
 

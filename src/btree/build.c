@@ -47,6 +47,15 @@ typedef struct OIndexBuildStackItem
 	int			keysize;
 } OIndexBuildStackItem;
 
+struct OBTreeBuildState
+{
+	BTreeDescr *desc;
+	OIndexBuildStackItem *stack;
+	int			root_level;
+	BTreeMetaPage metaPageBlkno;
+	bool		finished;
+};
+
 static bool put_item_to_stack(BTreeDescr *desc, OIndexBuildStackItem *stack,
 							  int level, OTuple tuple, int tuplesize,
 							  Pointer tupleheader, LocationIndex header_size,
@@ -296,114 +305,21 @@ btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
 					   CheckpointFileHeader *file_header)
 {
 	OTuple		idx_tup;
-	OIndexBuildStackItem *stack;
-	int			root_level = 0,
-				saved_root_level;
-	Page		root_page;
-	uint64		downlink;
-	BTreePageHeader *root_page_header;
-	FileExtent	extent;
-	BTreeMetaPage metaPageBlkno = {0};
-	int			i;
-	Datum	   *values;
-	bool	   *isnull;
-	uint32		chkpNum;
+	OBTreeBuildState *state;
 
-	btree_open_smgr(desc);
+	(void) tupdesc;
 
-	stack = (OIndexBuildStackItem *) palloc0(sizeof(OIndexBuildStackItem) * ORIOLEDB_MAX_DEPTH);
-	values = (Datum *) palloc(sizeof(Datum) * tupdesc->natts);
-	isnull = (bool *) palloc(sizeof(bool) * tupdesc->natts);
-
-	pg_atomic_init_u64(&metaPageBlkno.datafileLength[0], 0);
-	pg_atomic_init_u64(&metaPageBlkno.datafileLength[1], 0);
-	pg_atomic_init_u64(&metaPageBlkno.numFreeBlocks, 0);
-	pg_atomic_init_u32(&metaPageBlkno.leafPagesNum, 0);
-	pg_atomic_init_u64(&metaPageBlkno.ctid, ctid);
-	pg_atomic_init_u64(&metaPageBlkno.bridge_ctid, bridge_ctid);
-	for (i = 0; i < ORIOLEDB_MAX_DEPTH; i++)
-	{
-		/* init_page_first_chunk() needs leaf flag to be set */
-		if (i == 0)
-			((BTreePageHeader *) stack[i].img)->flags = O_BTREE_FLAG_LEAF;
-		init_page_first_chunk(desc, stack[i].img, 0);
-		BTREE_PAGE_LOCATOR_FIRST(stack[i].img, &stack[i].loc);
-	}
+	state = btree_build_state_start(desc, ctid, bridge_ctid);
 
 	idx_tup = tuplesort_getotuple(sortstate, true);
 	while (!O_TUPLE_IS_NULL(idx_tup))
 	{
-		Assert(o_tuple_size(idx_tup, &((OIndexDescr *) desc->arg)->leafSpec) <= O_BTREE_MAX_TUPLE_SIZE);
-		put_tuple_to_stack(desc, stack, idx_tup, &root_level, &metaPageBlkno);
+		btree_build_state_add_tuple(state, idx_tup);
 		idx_tup = tuplesort_getotuple(sortstate, true);
 	}
 
-	pfree(values);
-	pfree(isnull);
-
-	saved_root_level = root_level;
-	for (i = 0; i < saved_root_level; i++)
-	{
-		if (i != 0)
-			PAGE_SET_N_ONDISK(stack[i].img, BTREE_PAGE_ITEMS_COUNT(stack[i].img));
-
-		extent.len = InvalidFileExtentLen;
-		extent.off = InvalidFileExtentOff;
-
-		VALGRIND_CHECK_MEM_IS_DEFINED(stack[i].img, ORIOLEDB_BLCKSZ);
-
-		split_page_by_chunks(desc, stack[i].img);
-		downlink = perform_page_io_build(desc, stack[i].img, &extent, &metaPageBlkno);
-		if (i == 0)
-			pg_atomic_add_fetch_u32(&metaPageBlkno.leafPagesNum, 1);
-
-		put_downlink_to_stack(desc, stack, i + 1, downlink,
-							  stack[i].key.tuple, stack[i].keysize,
-							  &root_level, &metaPageBlkno);
-	}
-
-	root_page = stack[root_level].img;
-
-	root_page_header = (BTreePageHeader *) root_page;
-	if (root_level == 0)
-		root_page_header->flags = O_BTREE_FLAGS_ROOT_INIT;
-	root_page_header->rightLink = InvalidRightLink;
-	root_page_header->csn = COMMITSEQNO_FROZEN;
-	root_page_header->undoLocation = InvalidUndoLocation;
-	root_page_header->o_header.checkpointNum = 0;
-	root_page_header->prevInsertOffset = MaxOffsetNumber;
-
-	if (!O_PAGE_IS(root_page, LEAF))
-	{
-		PAGE_SET_N_ONDISK(root_page, BTREE_PAGE_ITEMS_COUNT(root_page));
-		PAGE_SET_LEVEL(root_page, root_level);
-	}
-
-	extent.len = InvalidFileExtentLen;
-	extent.off = InvalidFileExtentOff;
-
-	VALGRIND_CHECK_MEM_IS_DEFINED(root_page, ORIOLEDB_BLCKSZ);
-
-	split_page_by_chunks(desc, root_page);
-	downlink = perform_page_io_build(desc, root_page, &extent, &metaPageBlkno);
-	if (root_level == 0)
-		pg_atomic_add_fetch_u32(&metaPageBlkno.leafPagesNum, 1);
-
-	btree_close_smgr(desc);
-	pfree(stack);
-
-	if (orioledb_s3_mode)
-		chkpNum = S3_GET_CHKP_NUM(DOWNLINK_GET_DISK_OFF(downlink));
-	else
-		chkpNum = 0;
-
-	memset(file_header, 0, sizeof(*file_header));
-	file_header->rootDownlink = downlink;
-	file_header->datafileLength = pg_atomic_read_u64(&metaPageBlkno.datafileLength[chkpNum % 2]);
-	file_header->numFreeBlocks = pg_atomic_read_u64(&metaPageBlkno.numFreeBlocks);
-	file_header->leafPagesNum = pg_atomic_read_u32(&metaPageBlkno.leafPagesNum);
-	file_header->ctid = pg_atomic_read_u64(&metaPageBlkno.ctid);
-	file_header->bridgeCtid = pg_atomic_read_u64(&metaPageBlkno.bridge_ctid);
+	btree_build_state_finish(state, file_header);
+	btree_build_state_free(state);
 }
 
 S3TaskLocation
@@ -474,4 +390,144 @@ btree_write_file_header(BTreeDescr *desc, CheckpointFileHeader *file_header)
 	}
 
 	return result;
+}
+
+OBTreeBuildState *
+btree_build_state_start(BTreeDescr *desc, uint64 ctid, uint64 bridge_ctid)
+{
+	OBTreeBuildState *state;
+	int			i;
+
+	state = (OBTreeBuildState *) palloc0(sizeof(OBTreeBuildState));
+	state->desc = desc;
+
+	btree_open_smgr(desc);
+
+	state->stack = (OIndexBuildStackItem *) palloc0(sizeof(OIndexBuildStackItem) * ORIOLEDB_MAX_DEPTH);
+	state->root_level = 0;
+
+	pg_atomic_init_u64(&state->metaPageBlkno.datafileLength[0], 0);
+	pg_atomic_init_u64(&state->metaPageBlkno.datafileLength[1], 0);
+	pg_atomic_init_u64(&state->metaPageBlkno.numFreeBlocks, 0);
+	pg_atomic_init_u32(&state->metaPageBlkno.leafPagesNum, 0);
+	pg_atomic_init_u64(&state->metaPageBlkno.ctid, ctid);
+	pg_atomic_init_u64(&state->metaPageBlkno.bridge_ctid, bridge_ctid);
+
+	for (i = 0; i < ORIOLEDB_MAX_DEPTH; i++)
+	{
+		if (i == 0)
+			((BTreePageHeader *) state->stack[i].img)->flags = O_BTREE_FLAG_LEAF;
+		init_page_first_chunk(desc, state->stack[i].img, 0);
+		BTREE_PAGE_LOCATOR_FIRST(state->stack[i].img, &state->stack[i].loc);
+	}
+
+	return state;
+}
+
+void
+btree_build_state_add_tuple(OBTreeBuildState *state, OTuple tuple)
+{
+	Assert(state && !state->finished);
+	Assert(o_tuple_size(tuple, &((OIndexDescr *) state->desc->arg)->leafSpec) <= O_BTREE_MAX_TUPLE_SIZE);
+	put_tuple_to_stack(state->desc, state->stack, tuple, &state->root_level,
+					   &state->metaPageBlkno);
+}
+
+void
+btree_build_state_set_positions(OBTreeBuildState *state, uint64 ctid, uint64 bridge_ctid)
+{
+	Assert(state);
+	pg_atomic_write_u64(&state->metaPageBlkno.ctid, ctid);
+	pg_atomic_write_u64(&state->metaPageBlkno.bridge_ctid, bridge_ctid);
+}
+
+void
+btree_build_state_finish(OBTreeBuildState *state, CheckpointFileHeader *file_header)
+{
+	int			saved_root_level;
+	uint64		downlink;
+	uint32		chkpNum;
+	Page		root_page;
+	BTreePageHeader *root_page_header;
+	FileExtent	extent;
+	int			i;
+
+	Assert(state && !state->finished);
+
+	saved_root_level = state->root_level;
+	for (i = 0; i < saved_root_level; i++)
+	{
+		if (i != 0)
+			PAGE_SET_N_ONDISK(state->stack[i].img, BTREE_PAGE_ITEMS_COUNT(state->stack[i].img));
+
+		extent.len = InvalidFileExtentLen;
+		extent.off = InvalidFileExtentOff;
+
+		VALGRIND_CHECK_MEM_IS_DEFINED(state->stack[i].img, ORIOLEDB_BLCKSZ);
+
+		split_page_by_chunks(state->desc, state->stack[i].img);
+		downlink = perform_page_io_build(state->desc, state->stack[i].img,
+										 &extent, &state->metaPageBlkno);
+		if (i == 0)
+			pg_atomic_add_fetch_u32(&state->metaPageBlkno.leafPagesNum, 1);
+
+		put_downlink_to_stack(state->desc, state->stack, i + 1, downlink,
+							  state->stack[i].key.tuple, state->stack[i].keysize,
+							  &state->root_level, &state->metaPageBlkno);
+	}
+
+	root_page = state->stack[state->root_level].img;
+
+	root_page_header = (BTreePageHeader *) root_page;
+	if (state->root_level == 0)
+		root_page_header->flags = O_BTREE_FLAGS_ROOT_INIT;
+	root_page_header->rightLink = InvalidRightLink;
+	root_page_header->csn = COMMITSEQNO_FROZEN;
+	root_page_header->undoLocation = InvalidUndoLocation;
+	root_page_header->o_header.checkpointNum = 0;
+	root_page_header->prevInsertOffset = MaxOffsetNumber;
+
+	if (!O_PAGE_IS(root_page, LEAF))
+	{
+		PAGE_SET_N_ONDISK(root_page, BTREE_PAGE_ITEMS_COUNT(root_page));
+		PAGE_SET_LEVEL(root_page, state->root_level);
+	}
+
+	extent.len = InvalidFileExtentLen;
+	extent.off = InvalidFileExtentOff;
+
+	VALGRIND_CHECK_MEM_IS_DEFINED(root_page, ORIOLEDB_BLCKSZ);
+
+	split_page_by_chunks(state->desc, root_page);
+	downlink = perform_page_io_build(state->desc, root_page, &extent,
+									 &state->metaPageBlkno);
+	if (state->root_level == 0)
+		pg_atomic_add_fetch_u32(&state->metaPageBlkno.leafPagesNum, 1);
+
+	btree_close_smgr(state->desc);
+
+	if (orioledb_s3_mode)
+		chkpNum = S3_GET_CHKP_NUM(DOWNLINK_GET_DISK_OFF(downlink));
+	else
+		chkpNum = 0;
+
+	memset(file_header, 0, sizeof(*file_header));
+	file_header->rootDownlink = downlink;
+	file_header->datafileLength = pg_atomic_read_u64(&state->metaPageBlkno.datafileLength[chkpNum % 2]);
+	file_header->numFreeBlocks = pg_atomic_read_u64(&state->metaPageBlkno.numFreeBlocks);
+	file_header->leafPagesNum = pg_atomic_read_u32(&state->metaPageBlkno.leafPagesNum);
+	file_header->ctid = pg_atomic_read_u64(&state->metaPageBlkno.ctid);
+	file_header->bridgeCtid = pg_atomic_read_u64(&state->metaPageBlkno.bridge_ctid);
+
+	state->finished = true;
+}
+
+void
+btree_build_state_free(OBTreeBuildState *state)
+{
+	if (!state)
+		return;
+	if (state->stack)
+		pfree(state->stack);
+	pfree(state);
 }
