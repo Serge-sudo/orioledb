@@ -175,6 +175,7 @@ read_rebuild_entry(void *ptr, OIndexDescr *newIdx, OIndexDescr *oldIdx,
 	p += MAXIMUM_ALIGNOF;
 	oldpk->data = p;
 	p += oldlen;
+	p += MAXALIGN(oldlen) - oldlen;
 	memcpy(hint, p, sizeof(BTreeLocationHint));
 }
 
@@ -393,7 +394,7 @@ rebuild_tuple_data_size(OIndexRebuildPkSortArg *arg, void *ptr)
 	p += o_tuple_size(tup, &arg->newIdx->nonLeafSpec);
 	oldpk_len = *((int *) p);
 	return o_tuple_size(tup, &arg->newIdx->nonLeafSpec) +
-		sizeof(int) + MAXIMUM_ALIGNOF + oldpk_len +
+		sizeof(int) + MAXIMUM_ALIGNOF + MAXALIGN(oldpk_len) +
 		sizeof(BTreeLocationHint);
 }
 
@@ -729,7 +730,7 @@ tuplesort_put_rebuild_primary(Tuplesortstate *state, OTuple key, OTuple oldpk,
 	keysize = o_tuple_size(key, spec);
 	oldpksize = o_tuple_size(oldpk, oldspec);
 	stup.tuple = MemoryContextAlloc(base->tuplecontext,
-									MAXIMUM_ALIGNOF + keysize + sizeof(int) + MAXIMUM_ALIGNOF + oldpksize + sizeof(BTreeLocationHint));
+									MAXIMUM_ALIGNOF + keysize + sizeof(int) + MAXIMUM_ALIGNOF + MAXALIGN(oldpksize) + sizeof(BTreeLocationHint));
 	ptr = (Pointer) stup.tuple;
 
 	*((uint8 *) ptr) = key.formatFlags;
@@ -742,6 +743,13 @@ tuplesort_put_rebuild_primary(Tuplesortstate *state, OTuple key, OTuple oldpk,
 	ptr += MAXIMUM_ALIGNOF;
 	memcpy(ptr, oldpk.data, oldpksize);
 	ptr += oldpksize;
+	if (oldpksize != MAXALIGN(oldpksize))
+	{
+		int			pad = MAXALIGN(oldpksize) - oldpksize;
+
+		memset(ptr, 0, pad);
+		ptr += pad;
+	}
 	memcpy(ptr, hint, sizeof(BTreeLocationHint));
 
 	stup.datum1 = o_fastgetattr(key,
