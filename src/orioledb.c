@@ -150,6 +150,7 @@ int			rewind_max_time = 0;
 int			rewind_max_transactions = 0;
 int			logical_xid_buffers_guc = 64;
 bool		orioledb_strict_mode = false;
+bool		orioledb_seqscan_load_leaf_pages_to_shmem = false;
 
 /* Previous values of hooks to chain call them */
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -862,6 +863,17 @@ _PG_init(void)
 							 &orioledb_strict_mode,
 							 false,
 							 PGC_POSTMASTER,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("orioledb.seqscan_load_leaf_pages_to_shmem",
+							 "Load leaf pages into shared memory during sequential scan.",
+							 NULL,
+							 &orioledb_seqscan_load_leaf_pages_to_shmem,
+							 false,
+							 PGC_USERSET,
 							 0,
 							 NULL,
 							 NULL,
