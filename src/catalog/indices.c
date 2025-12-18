@@ -1699,6 +1699,8 @@ typedef struct
 	TupleTableSlot *slot;
 	uint64	   *ctid;
 	uint64	   *bridge_ctid;
+	BTreeLocationHint last_hint;
+	bool		has_hint;
 } ORebuildPrimaryWriteCtx;
 
 static bool
@@ -1710,20 +1712,28 @@ rebuild_fetch_tuple_by_oldpk(ORebuildPrimaryWriteCtx *ctx, OTuple oldpk,
 	OSnapshot	oSnapshot;
 	CommitSeqNo tupleCsn;
 	OTuple		tuple;
+	BTreeLocationHint local_hint;
 
 	o_fill_key_bound(GET_PRIMARY(ctx->old_descr), oldpk, BTreeKeyNonLeafKey, &pkey);
 	csn = COMMITSEQNO_INPROGRESS;
 	O_LOAD_SNAPSHOT_CSN(&oSnapshot, csn);
+
+	local_hint = *hint;
+	if (local_hint.blkno == OInvalidInMemoryBlkno && ctx->has_hint)
+		local_hint = ctx->last_hint;
 
 	tuple = o_btree_find_tuple_by_key(&GET_PRIMARY(ctx->old_descr)->desc,
 									  (Pointer) &pkey,
 									  BTreeKeyBound,
 									  &oSnapshot, &tupleCsn,
 									  ctx->slot->tts_mcxt,
-									  hint);
+									  &local_hint);
 
 	if (O_TUPLE_IS_NULL(tuple))
 		return false;
+
+	ctx->last_hint = local_hint;
+	ctx->has_hint = true;
 
 	tts_orioledb_store_tuple(ctx->slot, tuple, ctx->old_descr, tupleCsn,
 							 PrimaryIndexNumber, true, NULL);
