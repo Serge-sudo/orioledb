@@ -1619,19 +1619,14 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 								 ParallelOScanDesc poscan, Tuplesortstate **sortstates,
 								 bool progress, double *heap_tuples, double *index_tuples[])
 {
-	BTreeIterator *it;
 	OIndexDescr *idx;
 	int			i;
 	TupleTableSlot *primarySlot;
-	BTreeLocationHint hint;
-	CommitSeqNo tupleCsn;
+	void	   *sscan;
 
 	primarySlot = MakeSingleTupleTableSlot(old_descr->tupdesc, &TTSOpsOrioleDB);
 
-	o_btree_load_shmem(&GET_PRIMARY(old_descr)->desc);
-	it = o_btree_iterator_create(&GET_PRIMARY(old_descr)->desc, NULL, BTreeKeyNone,
-								 &o_in_progress_snapshot, ForwardScanDirection);
-	o_btree_iterator_set_tuple_ctx(it, CurrentMemoryContext);
+	sscan = make_btree_seq_scan(&GET_PRIMARY(old_descr)->desc, &o_in_progress_snapshot, poscan);
 
 	*heap_tuples = 0;
 	for (i = PrimaryIndexNumber; i < descr->nIndices; i++)
@@ -1639,21 +1634,8 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 		(*index_tuples)[i] = 0;
 	}
 
-	do
+	while (scan_getnextslot_allattrs(sscan, old_descr, primarySlot, heap_tuples))
 	{
-		OTuple		tup;
-
-		hint.blkno = OInvalidInMemoryBlkno;
-		hint.pageChangeCount = 0;
-		tup = o_btree_iterator_fetch(it, &tupleCsn, NULL, BTreeKeyNone, false, &hint);
-		if (O_TUPLE_IS_NULL(tup))
-			break;
-
-		tts_orioledb_store_tuple(primarySlot, tup, old_descr, tupleCsn,
-								 PrimaryIndexNumber, true, &hint);
-		slot_getallattrs(primarySlot);
-		(*heap_tuples)++;
-
 		tts_orioledb_detoast(primarySlot);
 		tts_orioledb_toast(primarySlot, descr);
 		for (i = PrimaryIndexNumber; i < descr->nIndices; i++)
@@ -1702,10 +1684,10 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 		}
 
 		ExecClearTuple(primarySlot);
-	} while (true);
+	}
 
 	ExecDropSingleTupleTableSlot(primarySlot);
-	btree_iterator_free(it);
+	free_btree_seq_scan(sscan);
 }
 
 typedef struct
