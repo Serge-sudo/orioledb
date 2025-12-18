@@ -50,6 +50,7 @@
 #include "btree/page_chunks.h"
 #include "btree/scan.h"
 #include "btree/undo.h"
+#include "utils/page_pool.h"
 #include "transam/oxid.h"
 #include "tuple/slot.h"
 #include "utils/sampling.h"
@@ -1009,8 +1010,28 @@ load_next_disk_leaf_page(BTreeSeqScan *scan)
 
 	BTREE_PAGE_LOCATOR_FIRST(scan->leafImg, &scan->leafLoc);
 	scan->downlinkIndex++;
-	scan->hint.blkno = OInvalidInMemoryBlkno;
-	scan->hint.pageChangeCount = InvalidOPageChangeCount;
+	/*
+	 * Load the leaf image into shared buffers to form a usable hint for
+	 * downstream fetches.  Eviction is handled by the page pool itself; hints
+	 * remain best-effort.
+	 */
+	ppool_reserve_pages(scan->desc->ppool, PPOOL_RESERVE_FIND, 1);
+	{
+		OInMemoryBlkno blkno = ppool_get_page(scan->desc->ppool, PPOOL_RESERVE_FIND);
+		OrioleDBPageDesc *page_desc = O_GET_IN_MEMORY_PAGEDESC(blkno);
+
+		put_page_image(blkno, scan->leafImg);
+		page_desc->flags = 0;
+		page_desc->type = scan->desc->type;
+		page_desc->oids = scan->desc->oids;
+		page_desc->fileExtent = extent;
+		page_desc->leftBlkno = OInvalidInMemoryBlkno;
+		page_change_usage_count(&scan->desc->ppool->ucm, blkno,
+								(pg_atomic_read_u32(scan->desc->ppool->ucm.epoch) + 2) % UCM_USAGE_LEVELS);
+
+		scan->hint.blkno = blkno;
+		scan->hint.pageChangeCount = O_PAGE_GET_CHANGE_COUNT(O_GET_IN_MEMORY_PAGE(blkno));
+	}
 	O_TUPLE_SET_NULL(scan->nextKey.tuple);
 	load_first_historical_page(scan);
 	return true;
