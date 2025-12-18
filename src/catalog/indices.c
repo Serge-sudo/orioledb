@@ -1642,6 +1642,8 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 	{
 		OTuple		tup;
 
+		hint.blkno = OInvalidInMemoryBlkno;
+		hint.pageChangeCount = 0;
 		tup = o_btree_iterator_fetch(it, &tupleCsn, NULL, BTreeKeyNone, false, &hint);
 		if (O_TUPLE_IS_NULL(tup))
 			break;
