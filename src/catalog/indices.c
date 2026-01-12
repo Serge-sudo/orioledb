@@ -1616,6 +1616,7 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 	OIndexDescr *idx;
 	int			i;
 	TupleTableSlot *primarySlot;
+	/* Skip toast processing when table descriptors have no toastable attrs */
 	bool		need_detoast = old_descr->ntoastable > 0;
 	bool		need_toast = descr->ntoastable > 0;
 
