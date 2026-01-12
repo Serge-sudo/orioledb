@@ -1616,6 +1616,8 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 	OIndexDescr *idx;
 	int			i;
 	TupleTableSlot *primarySlot;
+	bool		need_detoast = old_descr->ntoastable > 0;
+	bool		need_toast = descr->ntoastable > 0;
 
 	primarySlot = MakeSingleTupleTableSlot(old_descr->tupdesc, &TTSOpsOrioleDB);
 
@@ -1630,8 +1632,10 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 
 	while (scan_getnextslot_allattrs(sscan, old_descr, primarySlot, heap_tuples))
 	{
-		tts_orioledb_detoast(primarySlot);
-		tts_orioledb_toast(primarySlot, descr);
+		if (need_detoast)
+			tts_orioledb_detoast(primarySlot);
+		if (need_toast)
+			tts_orioledb_toast(primarySlot, descr);
 
 		for (i = PrimaryIndexNumber; i < descr->nIndices; i++)
 		{
@@ -1682,7 +1686,8 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 			pfree(newTup.data);
 		}
 
-		tts_orioledb_toast_sort_add(primarySlot, descr, sortstates[descr->nIndices]);
+		if (need_toast)
+			tts_orioledb_toast_sort_add(primarySlot, descr, sortstates[descr->nIndices]);
 
 		if (descr->bridge)
 		{
