@@ -26,6 +26,19 @@ sidebar_label: Index rebuild pipeline
 5. **Header finalization under meta lock**. With `o_tables_table_meta_lock()` held, `btree_write_file_header()` writes headers for each tree (primary/secondary/toast/bridge), removes shared-root placeholders, and records the highest S3 task location so checkpoints see consistent trees.
 6. **Statistics & cleanup**. Outside recovery, the function updates heap and index statistics via `index_update_stats()`, advances command counters, frees temporary state, and ends parallel contexts with `_o_index_end_parallel()`.
 
+## How `btree_write_index_data()` materializes the trees
+
+`btree_write_index_data()` receives a sorted stream from tuplesort and turns it into on-disk B-tree pages. Key parts of the algorithm:
+
+- **In-memory stack of pages**. A per-level stack (`OIndexBuildStackItem`) holds the page image, current insertion locator, and high key for each level. Level 0 is the leaf; higher levels are constructed lazily as splits propagate upward.
+- **Fillfactor-aware insert**. `put_item_to_stack()` attempts to place the next tuple into the current page. When free space would drop below the configured fillfactor, `stack_page_split()` produces a new rightmost page, recomputes the left high key, and writes the old page to disk.
+- **Split write-out**. When a split happens, `perform_page_io_build()` writes the left page immediately and returns its disk downlink. The downlink plus the page’s previous high key are inserted into the parent via `put_downlink_to_stack()`, which may recursively split upper levels. Root splits bump `root_level`.
+- **Sequential leaf build**. For leaf tuples, `put_tuple_to_stack()` attaches a leaf header (marking non-deleted state and frozen CSN) and enforces tuple size limits (`O_BTREE_MAX_TUPLE_SIZE`) before insertion.
+- **Post-scan flushing**. After the stream is exhausted, remaining in-memory pages at every level are chunked (`split_page_by_chunks()`), marked with on-disk tuple counts and levels, and written with `perform_page_io_build()`, pushing downlinks upward until the root is finalized.
+- **Root/page flags**. Right/leftmost and leaf/root flags are maintained during splits; the root gets `O_BTREE_FLAGS_ROOT_INIT`, invalid rightlink, frozen CSN, zero checkpoint number, and max `prevInsertOffset`.
+- **Metadata aggregation**. A temporary `BTreeMetaPage` tracks leaf page count, datafile length, free blocks, and running `ctid` / `bridge_ctid` counters (seeded from the caller). These are captured into the `CheckpointFileHeader` (root downlink, sizes, counts, ctid/bridge_ctid) returned to `rebuild_indices()`.
+- **S3 awareness**. In S3 mode the checkpoint number is derived from the root downlink’s disk offset so the caller can queue uploads before removing shared-root placeholders.
+
 ## Parallel coordination details
 
 - `oIdxSpool` carries descriptors for the old and new tables into workers, while `oIdxShared` is the shared-memory state used for coordination (tuplesort pointers, participant counters, and statistics).
