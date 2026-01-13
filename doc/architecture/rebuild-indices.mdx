@@ -1,0 +1,45 @@
+---
+id: rebuild-indices
+sidebar_label: Index rebuild pipeline
+---
+
+# `rebuild_indices()` pipeline
+
+`rebuild_indices()` is the central routine that regenerates all on-disk trees for an OrioleDB table when its relfilenode numbers change (for example, after `assign_new_oids()`, primary key replacement, or catalog-driven rebuilds). The function lives in `src/catalog/indices.c` and orchestrates the full lifecycle of the new trees: protecting them from the checkpointer, scanning and sorting data, writing pages, and finalizing metadata.
+
+## High-level stages
+
+1. **Placeholder installation**. Callers first use `rebuild_indices_insert_placeholders()` to add shared-root placeholders for every index, toast tree, and (if present) the bridge tree. This prevents the checkpointer from traversing the new trees until headers are written and checkpoint numbers are valid.
+2. **Setup & metadata collection**. `rebuild_indices()` allocates tuplesort states for every target tree (primary and secondary indexes, toast, and optional bridge), loads the old primary B-tree metadata, and captures initial `ctid`/`bridge_ctid` counters from the old meta page when needed.
+3. **Heap scan & tuple production (serial or parallel)**.
+   - `_o_index_begin_parallel()` launches workers when either a dedicated recovery worker is allowed or parallel maintenance workers are available.
+   - Parallel execution also requires both of the following: the primary is not `ctid`-based (the table does not use the synthetic `ctid` column as its primary key) and there is no new bridge tree to create.
+   - If any of these conditions fail, the scan runs serially.
+   - Each worker/leader executes `rebuild_indices_worker_heap_scan()` which sequentially scans the old primary tree with `make_btree_seq_scan()`.
+   - For every tuple, it performs detoasting/retoasting, checks partial-index predicates, and forms output tuples:
+     - **Primary index**: either clones the row or assigns sequential `ctid` values when the primary is `ctid`-based; bridge-aware primaries also generate `bridge_ctid`.
+     - **Secondary indexes**: build secondary tuples with `tts_orioledb_make_secondary_tuple()` when predicates hold.
+     - **Toast**: adds toast payloads via `tts_orioledb_toast_sort_add()`.
+     - **Bridge**: emits bridge tuples when a bridge index exists.
+   - Tuples are fed into per-tree tuplesort states, and workers accumulate `reltuples` / `indtuples` counters inside shared `oIdxShared`.
+4. **Sorting & data write-out**. After the scan, each tuplesort is completed (`tuplesort_performsort()`), and `btree_write_index_data()` writes sorted leaf/non-leaf pages for every tree. Primary sorts receive the computed `ctid`/`bridge_ctid` sequences when required.
+5. **Header finalization under meta lock**. With `o_tables_table_meta_lock()` held, `btree_write_file_header()` writes headers for each tree (primary/secondary/toast/bridge), removes shared-root placeholders, and records the highest S3 task location so checkpoints see consistent trees.
+6. **Statistics & cleanup**. Outside recovery, the function updates heap and index statistics via `index_update_stats()`, advances command counters, frees temporary state, and ends parallel contexts with `_o_index_end_parallel()`.
+
+## Parallel coordination details
+
+- `oIdxSpool` carries descriptors for the old and new tables into workers, while `oIdxShared` is the shared-memory state used for coordination (tuplesort pointers, participant counters, and statistics).
+- Workers build partial tuplesorts using `SortCoordinate` records shared through leader-managed shared memory. Each worker produces a sorted run for every target tree. Completion is signaled through `oIdxShared` counters and condition variables. The leader merges the sorted runs without re-scanning the heap.
+- Recovery workers can join the same parallel context; `recoveryjoinedcv`/`workersdonecv` coordinate their participation.
+
+## Bridge and toast handling nuances
+
+- When the table has a bridge index, `nallindices` includes it so the bridge is rebuilt alongside the primary/secondary indexes and toast tree.
+- If the old table lacked a bridge but the new one needs it, rebuild runs serially to ensure bridge `ctid` assignment is deterministic.
+- Toast tuples are rebuilt in lockstep with the primary scan to keep toast OIDs aligned with the freshly generated primary tuples.
+
+## Integration with checkpoints and recovery
+
+- The three-phase approach (placeholders → data write → header write) keeps new trees invisible to the checkpointer until metadata is complete, guaranteeing correct checkpoint numbers in headers.
+- In S3 mode, `s3_queue_wait_for_location()` waits for all uploaded segments referenced by the new headers.
+- During recovery, `rebuild_indices()` can execute in dedicated workers without updating stats, but it still writes headers and removes placeholders so subsequent checkpoints can process the rebuilt trees.

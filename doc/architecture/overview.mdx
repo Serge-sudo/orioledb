@@ -23,6 +23,7 @@ The data structure behind the `vegetables` table is given below. Both primary an
 ![Indexes of vegetables table](../images/vegetables_indexes.svg)
 
 The primary index and secondary index are not tied together; they are only connected by logical values persisting in table rows. OrioleDB automatically creates a primary index on the virtual `ctid` column when no primary index is given.
+See [index rebuild pipeline](rebuild-indices.mdx) for how OrioleDB reconstructs these trees when relfilenodes change.
 
 ## Dual pointers
 
