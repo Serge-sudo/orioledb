@@ -1095,6 +1095,27 @@ orioledb_index_build_range_scan(Relation heapRelation,
 	return 0.0;
 }
 
+static bool
+orioledb_validate_next_index_tid(Tuplesortstate *tuplesort,
+								 Datum *rowidDatum,
+								 double *itups)
+{
+	Datum		tidAbbrev = 0;
+	bool		tidIsNull = false;
+
+	while (tuplesort_getdatum(tuplesort, true, false,
+							  rowidDatum, &tidIsNull, &tidAbbrev))
+	{
+		if (tidIsNull)
+			continue;
+
+		(*itups)++;
+		return true;
+	}
+
+	return false;
+}
+
 static void
 orioledb_index_validate_scan(Relation heapRelation,
 							 Relation indexRelation,
@@ -1104,58 +1125,120 @@ orioledb_index_validate_scan(Relation heapRelation,
 {
 	OTableDescr *descr;
 	BTreeSeqScan *seq_scan;
-	TupleTableSlot *slot;
+	TupleTableSlot *primarySlot;
+	OTableSlot *oslot;
 	OTuple		tup;
 	BTreeLocationHint hint;
 	CommitSeqNo tupleCsn;
-	double		tuples_scanned = 0;
+	ExprState  *predicate;
+	EState	   *estate;
+	ExprContext *econtext;
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	Datum		indexRowIdDatum = 0;
+	Datum		heapRowIdDatum;
+	bool		indexRowIdValid = false;
+	bool		indexDone = false;
+	IndexUniqueCheck checkUnique;
 	OSnapshot	oSnapshot;
 
-	/* Get table descriptor */
+	Assert(state != NULL);
+	Assert(state->tuplesort != NULL);
+
+	estate = CreateExecutorState();
+	econtext = GetPerTupleExprContext(estate);
+	predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
+
 	descr = relation_get_descr(heapRelation);
 	Assert(descr != NULL);
 
-	/* Initialize snapshot for scan */
-	if (snapshot == SnapshotAny)
-		oSnapshot = o_in_progress_snapshot;
-	else
-		oSnapshot = o_snapshot_from_snapshot(snapshot);
-
-	/* Create sequential scan */
+	O_LOAD_SNAPSHOT(&oSnapshot, snapshot);
 	seq_scan = make_btree_seq_scan(&GET_PRIMARY(descr)->desc, &oSnapshot, NULL);
-	slot = MakeSingleTupleTableSlot(descr->tupdesc, &TTSOpsOrioleDB);
+	primarySlot = MakeSingleTupleTableSlot(descr->tupdesc, &TTSOpsOrioleDB);
+	econtext->ecxt_scantuple = primarySlot;
 
-	/* Scan all tuples in the heap */
-	while (!O_TUPLE_IS_NULL(tup = btree_seq_scan_getnext(seq_scan, slot->tts_mcxt, &tupleCsn, &hint)))
+	checkUnique = indexInfo->ii_Unique ? UNIQUE_CHECK_YES : UNIQUE_CHECK_NO;
+
+	tuplesort_rescan(state->tuplesort);
+
+	while (!O_TUPLE_IS_NULL(tup = btree_seq_scan_getnext(seq_scan, primarySlot->tts_mcxt, &tupleCsn, &hint)))
 	{
-		Datum		rowIdDatum;
-		bool		isnull;
+		bool		rowIdIsNull;
 
-		/* Store tuple in slot */
-		tts_orioledb_store_tuple(slot, tup, descr, tupleCsn, PrimaryIndexNumber, true, &hint);
+		oslot = (OTableSlot *) primarySlot;
 
-		/* Get rowid from slot - this is what identifies the tuple */
-		rowIdDatum = slot_getsysattr(slot, RowIdAttributeNumber, &isnull);
-		Assert(!isnull);
+		tts_orioledb_store_tuple(primarySlot, tup, descr, tupleCsn, PrimaryIndexNumber, true, &hint);
+		slot_getallattrs(primarySlot);
+		state->htups++;
 
-		/*
-		 * Store the rowid datum in the tuplesort for later validation.
-		 * During validation, tuples from the index will be compared with
-		 * these rowids to ensure all heap tuples are present in the index.
-		 * 
-		 * Note: When retrieving from tuplesort, use DatumGetItemPointer(rowIdDatum)
-		 * to get the ItemPointer for comparison.
-		 */
-		tuplesort_putdatum(state->tuplesort, rowIdDatum, false);
+		MemoryContextReset(econtext->ecxt_per_tuple_memory);
 
-		tuples_scanned++;
+		if (predicate != NULL)
+		{
+			if (!ExecQual(predicate, econtext))
+			{
+				ExecClearTuple(primarySlot);
+				continue;
+			}
+		}
 
-		/* Clear slot for next iteration */
-		ExecClearTuple(slot);
+		FormIndexDatum(indexInfo,
+					   primarySlot,
+					   estate,
+					   values,
+					   isnull);
+
+		/* Get heap tuple's rowid for comparison */
+		heapRowIdDatum = slot_getsysattr(primarySlot, RowIdAttributeNumber, &rowIdIsNull);
+		Assert(!rowIdIsNull);
+
+		for (;;)
+		{
+			int32		cmp;
+
+			if (!indexRowIdValid && !indexDone)
+			{
+				indexRowIdValid = orioledb_validate_next_index_tid(state->tuplesort,
+																   &indexRowIdDatum,
+																   &state->itups);
+				if (!indexRowIdValid)
+					indexDone = true;
+			}
+
+			if (indexDone)
+			{
+				if (index_insert(indexRelation, values, isnull, heapRowIdDatum,
+								 heapRelation, checkUnique, false, indexInfo))
+					state->tups_inserted++;
+				break;
+			}
+
+			/* Merge index rowids with the heap scan to detect missing entries. */
+			cmp = datum_image_cmp(indexRowIdDatum, heapRowIdDatum, BYTEAOID, NULL, false);
+			if (cmp < 0)
+			{
+				indexRowIdValid = false;
+				continue;
+			}
+
+			if (cmp > 0)
+			{
+				if (index_insert(indexRelation, values, isnull, heapRowIdDatum,
+								 heapRelation, checkUnique, false, indexInfo))
+					state->tups_inserted++;
+			}
+			else
+			{
+				indexRowIdValid = false;
+			}
+			break;
+		}
+
+		ExecClearTuple(primarySlot);
 	}
 
-	/* Clean up */
-	ExecDropSingleTupleTableSlot(slot);
+	ExecDropSingleTupleTableSlot(primarySlot);
+	FreeExecutorState(estate);
 	free_btree_seq_scan(seq_scan);
 }
 
