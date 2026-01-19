@@ -1115,14 +1115,17 @@ orioledb_index_validate_scan(Relation heapRelation,
 	ExprContext *econtext;
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
-	Datum		tidDatum = 0;
-	Datum		tidAbbrev = 0;
+	Datum		tidDatum = InvalidDatum;
+	Datum		tidAbbrev = InvalidDatum;
 	bool		tidIsNull = false;
 	ItemPointerData indexTid;
 	bool		indexTidValid = false;
 	bool		indexDone = false;
 	IndexUniqueCheck checkUnique;
 	OSnapshot	oSnapshot;
+
+	if (state == NULL || state->tuplesort == NULL)
+		return;
 
 	estate = CreateExecutorState();
 	econtext = GetPerTupleExprContext(estate);
@@ -1137,9 +1140,6 @@ orioledb_index_validate_scan(Relation heapRelation,
 	econtext->ecxt_scantuple = primarySlot;
 
 	checkUnique = indexInfo->ii_Unique ? UNIQUE_CHECK_YES : UNIQUE_CHECK_NO;
-
-	if (state == NULL || state->tuplesort == NULL)
-		return;
 
 	tuplesort_rescan(state->tuplesort);
 
@@ -1168,25 +1168,27 @@ orioledb_index_validate_scan(Relation heapRelation,
 					   values,
 					   isnull);
 
-		while (true)
+		for (;;)
 		{
 			int32		cmp;
 
-			while (!indexTidValid && !indexDone)
+			if (!indexTidValid && !indexDone)
 			{
 				if (!tuplesort_getdatum(state->tuplesort, true, false,
 										&tidDatum, &tidIsNull, &tidAbbrev))
 				{
 					indexDone = true;
-					break;
 				}
-
-				if (tidIsNull)
+				else if (tidIsNull)
+				{
 					continue;
-
-				ItemPointerCopy(DatumGetItemPointer(tidDatum), &indexTid);
-				indexTidValid = true;
-				state->itups++;
+				}
+				else
+				{
+					ItemPointerCopy(DatumGetItemPointer(tidDatum), &indexTid);
+					indexTidValid = true;
+					state->itups++;
+				}
 			}
 
 			if (indexDone)
