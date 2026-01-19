@@ -1115,8 +1115,8 @@ orioledb_index_validate_scan(Relation heapRelation,
 	ExprContext *econtext;
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
-	Datum		tidDatum = (Datum) 0;
-	Datum		tidAbbrev = (Datum) 0;
+	Datum		tidDatum = 0;
+	Datum		tidAbbrev = 0;
 	bool		tidIsNull = false;
 	ItemPointerData indexTid;
 	bool		indexTidValid = false;
@@ -1138,8 +1138,10 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 	checkUnique = indexInfo->ii_Unique ? UNIQUE_CHECK_YES : UNIQUE_CHECK_NO;
 
-	if (state->tuplesort)
-		tuplesort_rescan(state->tuplesort);
+	if (state == NULL || state->tuplesort == NULL)
+		return;
+
+	tuplesort_rescan(state->tuplesort);
 
 	while (!O_TUPLE_IS_NULL(tup = btree_seq_scan_getnext(seq_scan, primarySlot->tts_mcxt, &tupleCsn, &hint)))
 	{
