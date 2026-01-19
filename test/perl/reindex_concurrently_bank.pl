@@ -25,7 +25,9 @@ INSERT INTO o_bank VALUES (1, 0);
 });
 
 my $updates = 20;
+my $lock_key = 4242;
 my ($fh, $filename) = tempfile('bank_updates_XXXX', SUFFIX => '.sql', UNLINK => 1);
+print $fh "SELECT pg_advisory_lock($lock_key);\n";
 for (1 .. $updates)
 {
 print $fh <<'SQL';
@@ -35,6 +37,7 @@ COMMIT;
 SELECT pg_sleep(0.02);
 SQL
 }
+print $fh "SELECT pg_advisory_unlock($lock_key);\n";
 close $fh;
 
 my $pid = fork();
@@ -42,11 +45,28 @@ die "fork failed: $!" unless defined $pid;
 if ($pid == 0)
 {
 	exec 'psql', '-X', '-q', '-d', $node->connstr('postgres'), '-f',
-		$filename;
+		$filename
+		or die "exec psql failed: $!";
 	exit 1;
 }
 
-sleep 0.1;
+my $started = 0;
+for (1 .. 100)
+{
+	my $locked = $node->safe_psql('postgres',
+		"SELECT pg_try_advisory_lock($lock_key);");
+	chomp $locked;
+	if ($locked eq 't')
+	{
+		$node->safe_psql('postgres',
+			"SELECT pg_advisory_unlock($lock_key);");
+		select undef, undef, undef, 0.02;
+		next;
+	}
+	$started = 1;
+	last;
+}
+ok($started, 'update workload started');
 $node->safe_psql('postgres', 'REINDEX INDEX CONCURRENTLY o_bank_pkey;');
 waitpid($pid, 0);
 is($?, 0, 'update workload finished');
