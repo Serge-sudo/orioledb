@@ -1197,15 +1197,18 @@ orioledb_utility_command(PlannedStmt *pstmt,
 				break;
 		}
 
-		if (has_orioledb && concurrently && tablespacename != NULL)
+		if (has_orioledb && concurrently)
 		{
-			Oid			tablespaceOid = get_tablespace_oid(tablespacename, false);
+			if (tablespacename != NULL)
+			{
+				Oid			tablespaceOid = get_tablespace_oid(tablespacename, false);
 
-			if (tablespaceOid == GLOBALTABLESPACE_OID)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("cannot move non-shared relation to tablespace \"%s\"",
-								get_tablespace_name(tablespaceOid))));
+				if (tablespaceOid == GLOBALTABLESPACE_OID)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot move non-shared relation to tablespace \"%s\"",
+									get_tablespace_name(tablespaceOid))));
+			}
 		}
 	}
 	else if (IsA(pstmt->utilityStmt, TransactionStmt))
