@@ -17,6 +17,7 @@
 
 #include "orioledb.h"
 
+#include "btree/iterator.h"
 #include "btree/modify.h"
 #include "catalog/indices.h"
 #include "catalog/o_tables.h"
@@ -24,6 +25,7 @@
 #include "tableam/index_scan.h"
 #include "tableam/operations.h"
 #include "tableam/tree.h"
+#include "tuple/format.h"
 #include "tuple/slot.h"
 #include "utils/compress.h"
 #include "utils/planner.h"
@@ -939,16 +941,127 @@ orioledb_amdelete(Relation rel, Datum *values, bool *isnull,
 	return result.success;
 }
 
+/*
+ * orioledb_ambulkdelete() -- bulk deletion of index entries
+ *
+ * Note: This function does NOT actually delete any tuples from the index.
+ * It is primarily used during concurrent index creation validation phase,
+ * where the callback gathers tuple identifiers (TIDs) from the index
+ * and always returns false (meaning "do not delete").
+ *
+ * For each tuple in the index, we call the provided callback with the
+ * tuple's ItemPointer. If the callback returns true (requesting deletion),
+ * we throw an error since deletion is not supported.
+ */
 IndexBulkDeleteResult *
 orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 					  IndexBulkDeleteCallback callback, void *callback_state)
 {
 	OBTOptions *options = (OBTOptions *) info->index->rd_options;
+	ORelOids	oids;
+	OIndexDescr *index_descr;
+	OTableDescr *descr;
+	BTreeIterator *it;
+	OSnapshot	oSnapshot;
+	OTuple		tuple;
+	double		num_tuples = 0;
+	ItemPointerData	itemptr;
+	bool		should_delete;
 
 	if (options && !options->orioledb_index)
 		return btbulkdelete(info, stats, callback, callback_state);
 
-	elog(ERROR, "Not implemented: %s", PG_FUNCNAME_MACRO);
+	/* Get index descriptor */
+	ORelOidsSetFromRel(oids, info->index);
+	index_descr = o_fetch_index_descr(oids, oIndexInvalid, false, NULL);
+	if (index_descr == NULL)
+		elog(ERROR, "index descriptor not found for index %u", info->index->rd_id);
+	
+	descr = o_fetch_table_descr(index_descr->tableOids);
+	if (descr == NULL)
+		elog(ERROR, "table descriptor not found for index %u", info->index->rd_id);
+
+	/* Initialize snapshot for iteration */
+	oSnapshot = o_in_progress_snapshot;
+
+	/* Create iterator to scan all tuples in the index */
+	it = o_btree_iterator_create(&index_descr->desc, NULL, BTreeKeyNone,
+								 &oSnapshot, ForwardScanDirection);
+
+	/* Iterate through all tuples in the index */
+	while (true)
+	{
+		/* Fetch next tuple */
+		tuple = o_btree_iterator_fetch(it, NULL, NULL, BTreeKeyNone, false, NULL);
+		
+		if (O_TUPLE_IS_NULL(tuple))
+			break;
+
+		num_tuples++;
+
+		/*
+		 * Extract ItemPointer from the tuple. For orioledb secondary indexes,
+		 * the "TID" is stored as part of the tuple data. For primaryIsCtid
+		 * indexes, we need to extract it from the last field.
+		 */
+		if (index_descr->primaryIsCtid && index_descr->leafTupdesc->natts > 0)
+		{
+			bool		isnull;
+			Datum		ctid_datum;
+			
+			/* Get CTID from the last attribute */
+			ctid_datum = o_fastgetattr(tuple, 
+										index_descr->leafTupdesc->natts,
+										index_descr->leafTupdesc,
+										&index_descr->leafSpec,
+										&isnull);
+			
+			if (!isnull)
+			{
+				ItemPointer ctid_ptr = (ItemPointer) DatumGetPointer(ctid_datum);
+				itemptr = *ctid_ptr;
+			}
+			else
+			{
+				/* Use a dummy value if null */
+				ItemPointerSetInvalid(&itemptr);
+			}
+		}
+		else
+		{
+			/*
+			 * For non-CTID indexes, we don't have a real ItemPointer.
+			 * Use a dummy value. The callback in concurrent index validation
+			 * typically doesn't need the actual TID value.
+			 */
+			ItemPointerSetInvalid(&itemptr);
+		}
+
+		/* Call the callback with the tuple's ItemPointer */
+		should_delete = callback(&itemptr, callback_state);
+
+		/*
+		 * If callback returns true (requesting deletion), throw an error.
+		 * Deletion is not supported in orioledb_ambulkdelete.
+		 */
+		if (should_delete)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("bulk deletion is not supported for orioledb indexes"),
+					 errdetail("Index: %s", RelationGetRelationName(info->index))));
+	}
+
+	/* Clean up iterator */
+	btree_iterator_free(it);
+
+	/* Allocate and initialize stats if not provided */
+	if (stats == NULL)
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+
+	/* Update statistics */
+	stats->num_index_tuples = num_tuples;
+	stats->estimated_count = false;
+
 	return stats;
 }
 
