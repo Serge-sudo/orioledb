@@ -1081,6 +1081,7 @@ orioledb_utility_command(PlannedStmt *pstmt,
 		ReindexStmt *stmt = (ReindexStmt *) pstmt->utilityStmt;
 		char	   *tablespacename = NULL;
 		bool		concurrently = false;
+		bool		has_orioledb = false;
 		ListCell   *lc;
 
 		foreach(lc, stmt->params)
@@ -1124,7 +1125,7 @@ orioledb_utility_command(PlannedStmt *pstmt,
 
 					if (get_rel_relkind(indOid) == RELKIND_PARTITIONED_INDEX)
 					{
-						(void) ReindexPartitions(indOid, concurrently);
+						has_orioledb = ReindexPartitions(indOid, concurrently);
 						break;
 					}
 
@@ -1140,6 +1141,8 @@ orioledb_utility_command(PlannedStmt *pstmt,
 
 						ix_name = makeString(pstrdup(iRel->rd_rel->relname.data));
 						reindex_list = list_append_unique(reindex_list, ix_name);
+						if (concurrently)
+							has_orioledb = true;
 					}
 					relation_close(tbl, AccessShareLock);
 					relation_close(iRel, AccessShareLock);
@@ -1154,7 +1157,7 @@ orioledb_utility_command(PlannedStmt *pstmt,
 
 					if (get_rel_relkind(tblOid) == RELKIND_PARTITIONED_TABLE)
 					{
-						(void) ReindexPartitions(tblOid, concurrently);
+						has_orioledb = ReindexPartitions(tblOid, concurrently);
 						break;
 					}
 					tbl = relation_open(tblOid, AccessShareLock);
@@ -1175,6 +1178,8 @@ orioledb_utility_command(PlannedStmt *pstmt,
 								reindex_list = list_append_unique(reindex_list, ix_name);
 							}
 							relation_close(ind, AccessShareLock);
+							if (concurrently)
+								has_orioledb = true;
 						}
 					}
 					relation_close(tbl, AccessShareLock);
@@ -1184,7 +1189,7 @@ orioledb_utility_command(PlannedStmt *pstmt,
 			case REINDEX_OBJECT_SYSTEM:
 			case REINDEX_OBJECT_DATABASE:
 				if (concurrently)
-					(void) check_multiple_tables(stmt->name, stmt->kind, concurrently);
+					has_orioledb = check_multiple_tables(stmt->name, stmt->kind, concurrently);
 				break;
 			default:
 				elog(ERROR, "unrecognized object type: %d",
@@ -1192,7 +1197,7 @@ orioledb_utility_command(PlannedStmt *pstmt,
 				break;
 		}
 
-		if (tablespacename != NULL)
+		if (has_orioledb && concurrently && tablespacename != NULL)
 		{
 			Oid			tablespaceOid = get_tablespace_oid(tablespacename, false);
 

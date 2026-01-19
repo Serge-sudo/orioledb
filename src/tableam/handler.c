@@ -1124,6 +1124,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 	IndexUniqueCheck checkUnique;
 	OSnapshot	oSnapshot;
 
+	/* Guard against validate_index callers without tuplesort state. */
 	if (state == NULL || state->tuplesort == NULL)
 		return;
 
@@ -1174,16 +1175,17 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 			if (!indexTidValid && !indexDone)
 			{
-				if (!tuplesort_getdatum(state->tuplesort, true, false,
-										&tidDatum, &tidIsNull, &tidAbbrev))
+				do
 				{
-					indexDone = true;
-				}
-				else if (tidIsNull)
-				{
-					continue;
-				}
-				else
+					if (!tuplesort_getdatum(state->tuplesort, true, false,
+											&tidDatum, &tidIsNull, &tidAbbrev))
+					{
+						indexDone = true;
+						break;
+					}
+				} while (tidIsNull);
+
+				if (!indexDone && !tidIsNull)
 				{
 					ItemPointerCopy(DatumGetItemPointer(tidDatum), &indexTid);
 					indexTidValid = true;
