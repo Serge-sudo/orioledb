@@ -948,7 +948,7 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	if (options && !options->orioledb_index)
 		return btbulkdelete(info, stats, callback, callback_state);
 
-	/* OrioleDB indexes do not support callback-driven bulk deletions, so unused. */
+	/* OrioleDB indexes do not support callback-driven bulk deletions, so these parameters are unused. */
 	(void) callback;
 	(void) callback_state;
 
@@ -957,8 +957,9 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 	/*
 	 * OrioleDB index storage doesn't support the callback-driven bulk delete
-	 * operation. Return estimated stats and mark estimated_count so callers
-	 * can treat them as approximate.
+	 * operation. Actual tuple deletions are handled elsewhere in OrioleDB's
+	 * internal mechanisms. Return estimated stats and mark estimated_count so
+	 * callers can treat them as approximate.
 	 */
 	stats->estimated_count = true;
 	stats->num_index_tuples = info->index->rd_rel->reltuples;
