@@ -1096,6 +1096,29 @@ orioledb_index_build_range_scan(Relation heapRelation,
 	return 0.0;
 }
 
+static bool
+orioledb_validate_next_index_tid(Tuplesortstate *tuplesort,
+								 ItemPointerData *indexTid,
+								 double *itups)
+{
+	Datum		tidDatum = InvalidDatum;
+	Datum		tidAbbrev = InvalidDatum;
+	bool		tidIsNull = false;
+
+	while (tuplesort_getdatum(tuplesort, true, false,
+							  &tidDatum, &tidIsNull, &tidAbbrev))
+	{
+		if (tidIsNull)
+			continue;
+
+		ItemPointerCopy(DatumGetItemPointer(tidDatum), indexTid);
+		(*itups)++;
+		return true;
+	}
+
+	return false;
+}
+
 static void
 orioledb_index_validate_scan(Relation heapRelation,
 							 Relation indexRelation,
@@ -1115,18 +1138,14 @@ orioledb_index_validate_scan(Relation heapRelation,
 	ExprContext *econtext;
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
-	Datum		tidDatum = InvalidDatum;
-	Datum		tidAbbrev = InvalidDatum;
-	bool		tidIsNull = false;
 	ItemPointerData indexTid;
 	bool		indexTidValid = false;
 	bool		indexDone = false;
 	IndexUniqueCheck checkUnique;
 	OSnapshot	oSnapshot;
 
-	/* Guard against validate_index callers without tuplesort state. */
-	if (state == NULL || state->tuplesort == NULL)
-		return;
+	Assert(state != NULL);
+	Assert(state->tuplesort != NULL);
 
 	estate = CreateExecutorState();
 	econtext = GetPerTupleExprContext(estate);
@@ -1175,22 +1194,11 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 			if (!indexTidValid && !indexDone)
 			{
-				do
-				{
-					if (!tuplesort_getdatum(state->tuplesort, true, false,
-											&tidDatum, &tidIsNull, &tidAbbrev))
-					{
-						indexDone = true;
-						break;
-					}
-				} while (tidIsNull);
-
-				if (!indexDone && !tidIsNull)
-				{
-					ItemPointerCopy(DatumGetItemPointer(tidDatum), &indexTid);
-					indexTidValid = true;
-					state->itups++;
-				}
+				indexTidValid = orioledb_validate_next_index_tid(state->tuplesort,
+																 &indexTid,
+																 &state->itups);
+				if (!indexTidValid)
+					indexDone = true;
 			}
 
 			if (indexDone)
@@ -1201,6 +1209,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 				break;
 			}
 
+			/* Merge index TIDs with the heap scan to detect missing entries. */
 			cmp = ItemPointerCompare(&indexTid, &oslot->bridge_ctid);
 			if (cmp < 0)
 			{
