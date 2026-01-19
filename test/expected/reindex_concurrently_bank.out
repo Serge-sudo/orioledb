@@ -3,7 +3,7 @@ Parsed test spec with 3 sessions
 starting permutation: begin_1 update_1 reindex begin_3 update_3 commit_3 commit_1 check_sum
 step begin_1: BEGIN;
 step update_1: UPDATE o_bank SET balance = balance + 1 WHERE id = 1;
-step reindex: REINDEX INDEX CONCURRENTLY o_bank_id_idx; <waiting ...>
+step reindex: REINDEX INDEX CONCURRENTLY o_bank_pkey; <waiting ...>
 step begin_3: BEGIN;
 step update_3: UPDATE o_bank SET balance = balance + 1 WHERE id = 1;
 step commit_3: COMMIT;
@@ -14,4 +14,3 @@ step check_sum: SELECT sum(balance) FROM o_bank;
 -----
    2
 (1 row)
-

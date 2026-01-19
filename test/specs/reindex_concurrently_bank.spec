@@ -8,8 +8,6 @@ setup
 	) USING orioledb;
 
 	INSERT INTO o_bank VALUES (1, 0);
-
-	CREATE INDEX o_bank_id_idx ON o_bank (id);
 }
 
 teardown
@@ -24,7 +22,7 @@ step "commit_1" { COMMIT; }
 step "check_sum" { SELECT sum(balance) FROM o_bank; }
 
 session "s2"
-step "reindex" { REINDEX INDEX CONCURRENTLY o_bank_id_idx; }
+step "reindex" { REINDEX INDEX CONCURRENTLY o_bank_pkey; }
 
 session "s3"
 step "begin_3" { BEGIN; }
