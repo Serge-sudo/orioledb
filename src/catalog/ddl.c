@@ -1197,31 +1197,15 @@ orioledb_utility_command(PlannedStmt *pstmt,
 				break;
 		}
 
-		if (has_orioledb && concurrently)
+		if (has_orioledb && concurrently && tablespacename != NULL)
 		{
-			if (tablespacename != NULL)
-			{
-				Oid			tablespaceOid = get_tablespace_oid(tablespacename, false);
+			Oid			tablespaceOid = get_tablespace_oid(tablespacename, false);
 
-				if (tablespaceOid == GLOBALTABLESPACE_OID)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("cannot move non-shared relation to tablespace \"%s\"",
-									get_tablespace_name(tablespaceOid))));
-			}
-
-			if (orioledb_strict_mode)
-				elog(ERROR, "REINDEX CONCURRENTLY is not supported for orioledb tables yet");
-			else
-				elog(WARNING, "REINDEX CONCURRENTLY is not supported for orioledb tables yet, using a plain REINDEX instead");
-
-			foreach(lc, stmt->params)
-			{
-				DefElem    *opt = (DefElem *) lfirst(lc);
-
-				if (strcmp(opt->defname, "concurrently") == 0)
-					stmt->params = foreach_delete_current(stmt->params, lc);
-			}
+			if (tablespaceOid == GLOBALTABLESPACE_OID)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot move non-shared relation to tablespace \"%s\"",
+								get_tablespace_name(tablespaceOid))));
 		}
 	}
 	else if (IsA(pstmt->utilityStmt, TransactionStmt))
@@ -1340,11 +1324,6 @@ orioledb_utility_command(PlannedStmt *pstmt,
 										 NULL);
 			rel = table_open(relid, lockmode);
 
-			if (is_orioledb_rel(rel))
-			{
-				table_close(rel, lockmode);
-				elog(ERROR, "concurrent index creation is not supported for orioledb tables yet");
-			}
 			table_close(rel, lockmode);
 		}
 	}

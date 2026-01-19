@@ -24,7 +24,7 @@ CREATE TABLE o_tableam1
 	value text
 ) USING orioledb;
 
--- not supported
+-- concurrent index build
 CREATE INDEX CONCURRENTLY o_tableam1_ix_concurrently ON o_tableam1 (key);
 CREATE INDEX o_tableam1_ix_options ON o_tableam1 (value) WITH (compression = on);
 ALTER TABLE o_tableam1 ADD EXCLUDE USING btree (value WITH =);
