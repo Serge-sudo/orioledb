@@ -47,38 +47,26 @@ class NotSupportedYetTest(BaseTest):
 			SET SESSION search_path = 'ddl';
 			REINDEX (VERBOSE) TABLE CONCURRENTLY o_test_1;
 		""")
-		self.assertEqual(
-		    err.decode("utf-8").split("\n")[0],
-		    "WARNING:  REINDEX CONCURRENTLY is not supported for orioledb tables yet, using a plain REINDEX instead"
-		)
+		self.assertNotIn("not supported", err.decode("utf-8"))
 
 		# Using simple reindex instead of concurrent for orioledb indices
 		_, _, err = node.psql("""
 			SET SESSION search_path = 'ddl';
 			REINDEX (VERBOSE) INDEX CONCURRENTLY o_ind_1;
 		""")
-		self.assertEqual(
-		    err.decode("utf-8").split("\n")[0],
-		    "WARNING:  REINDEX CONCURRENTLY is not supported for orioledb tables yet, using a plain REINDEX instead"
-		)
+		self.assertNotIn("not supported", err.decode("utf-8"))
 
 		# Using simple reindex instead of concurrent for schema containing orioledb tables
 		_, _, err = node.psql("""
 			REINDEX (VERBOSE) SCHEMA CONCURRENTLY ddl;
 		""")
-		self.assertEqual(
-		    err.decode("utf-8").split("\n")[0],
-		    "WARNING:  REINDEX CONCURRENTLY is not supported for orioledb tables yet, using a plain REINDEX instead"
-		)
+		self.assertNotIn("not supported", err.decode("utf-8"))
 
 		# Using simple reindex instead of concurrent for database containing orioledb tables
 		_, _, err = node.psql("""
 			REINDEX (VERBOSE) DATABASE CONCURRENTLY postgres;
 		""")
-		self.assertEqual(
-		    err.decode("utf-8").split("\n")[0],
-		    "WARNING:  REINDEX CONCURRENTLY is not supported for orioledb tables yet, using a plain REINDEX instead"
-		)
+		self.assertNotIn("not supported", err.decode("utf-8"))
 
 		node.stop()
 
@@ -297,15 +285,9 @@ class NotSupportedYetTest(BaseTest):
 			) USING orioledb;
 		""")
 
-		with self.assertRaises(QueryException) as e:
-			node.safe_psql("""
-				CREATE INDEX CONCURRENTLY ON o_test (i);
-			""")
-
-		self.assertErrorMessageEquals(
-		    e,
-		    "concurrent index creation is not supported for orioledb tables yet"
-		)
+		node.safe_psql("""
+			CREATE INDEX CONCURRENTLY ON o_test (i);
+		""")
 
 		node.safe_psql("""
 			REINDEX TABLE o_test;

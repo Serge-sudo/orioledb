@@ -1081,7 +1081,6 @@ orioledb_utility_command(PlannedStmt *pstmt,
 		ReindexStmt *stmt = (ReindexStmt *) pstmt->utilityStmt;
 		char	   *tablespacename = NULL;
 		bool		concurrently = false;
-		bool		has_orioledb = false;
 		ListCell   *lc;
 
 		foreach(lc, stmt->params)
@@ -1125,7 +1124,7 @@ orioledb_utility_command(PlannedStmt *pstmt,
 
 					if (get_rel_relkind(indOid) == RELKIND_PARTITIONED_INDEX)
 					{
-						has_orioledb = ReindexPartitions(indOid, concurrently);
+						(void) ReindexPartitions(indOid, concurrently);
 						break;
 					}
 
@@ -1141,8 +1140,6 @@ orioledb_utility_command(PlannedStmt *pstmt,
 
 						ix_name = makeString(pstrdup(iRel->rd_rel->relname.data));
 						reindex_list = list_append_unique(reindex_list, ix_name);
-						if (concurrently)
-							has_orioledb = true;
 					}
 					relation_close(tbl, AccessShareLock);
 					relation_close(iRel, AccessShareLock);
@@ -1157,7 +1154,7 @@ orioledb_utility_command(PlannedStmt *pstmt,
 
 					if (get_rel_relkind(tblOid) == RELKIND_PARTITIONED_TABLE)
 					{
-						has_orioledb = ReindexPartitions(tblOid, concurrently);
+						(void) ReindexPartitions(tblOid, concurrently);
 						break;
 					}
 					tbl = relation_open(tblOid, AccessShareLock);
@@ -1178,8 +1175,6 @@ orioledb_utility_command(PlannedStmt *pstmt,
 								reindex_list = list_append_unique(reindex_list, ix_name);
 							}
 							relation_close(ind, AccessShareLock);
-							if (concurrently)
-								has_orioledb = true;
 						}
 					}
 					relation_close(tbl, AccessShareLock);
@@ -1189,7 +1184,7 @@ orioledb_utility_command(PlannedStmt *pstmt,
 			case REINDEX_OBJECT_SYSTEM:
 			case REINDEX_OBJECT_DATABASE:
 				if (concurrently)
-					has_orioledb = check_multiple_tables(stmt->name, stmt->kind, concurrently);
+					(void) check_multiple_tables(stmt->name, stmt->kind, concurrently);
 				break;
 			default:
 				elog(ERROR, "unrecognized object type: %d",
@@ -1197,31 +1192,15 @@ orioledb_utility_command(PlannedStmt *pstmt,
 				break;
 		}
 
-		if (has_orioledb && concurrently)
+		if (tablespacename != NULL)
 		{
-			if (tablespacename != NULL)
-			{
-				Oid			tablespaceOid = get_tablespace_oid(tablespacename, false);
+			Oid			tablespaceOid = get_tablespace_oid(tablespacename, false);
 
-				if (tablespaceOid == GLOBALTABLESPACE_OID)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("cannot move non-shared relation to tablespace \"%s\"",
-									get_tablespace_name(tablespaceOid))));
-			}
-
-			if (orioledb_strict_mode)
-				elog(ERROR, "REINDEX CONCURRENTLY is not supported for orioledb tables yet");
-			else
-				elog(WARNING, "REINDEX CONCURRENTLY is not supported for orioledb tables yet, using a plain REINDEX instead");
-
-			foreach(lc, stmt->params)
-			{
-				DefElem    *opt = (DefElem *) lfirst(lc);
-
-				if (strcmp(opt->defname, "concurrently") == 0)
-					stmt->params = foreach_delete_current(stmt->params, lc);
-			}
+			if (tablespaceOid == GLOBALTABLESPACE_OID)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot move non-shared relation to tablespace \"%s\"",
+								get_tablespace_name(tablespaceOid))));
 		}
 	}
 	else if (IsA(pstmt->utilityStmt, TransactionStmt))
@@ -1340,11 +1319,6 @@ orioledb_utility_command(PlannedStmt *pstmt,
 										 NULL);
 			rel = table_open(relid, lockmode);
 
-			if (is_orioledb_rel(rel))
-			{
-				table_close(rel, lockmode);
-				elog(ERROR, "concurrent index creation is not supported for orioledb tables yet");
-			}
 			table_close(rel, lockmode);
 		}
 	}
