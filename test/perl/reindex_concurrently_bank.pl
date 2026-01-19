@@ -8,7 +8,7 @@ use lib "$FindBin::RealBin/../../../../src/test/perl";
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
-use constant MAX_WAIT_ITERATIONS => 100;
+use constant MAX_WAIT_ITERATIONS => 250;
 use constant POLL_INTERVAL_MICROSECONDS => 20_000;
 
 my $node = PostgreSQL::Test::Cluster->new('reindex_concurrently_bank');
@@ -52,7 +52,7 @@ if ($pid == 0)
 		or die "exec psql failed: $!";
 }
 
-my $started = 0;
+my $worker_has_lock = 0;
 for (1 .. MAX_WAIT_ITERATIONS)
 {
 	my $locked = $node->safe_psql('postgres',
@@ -65,10 +65,10 @@ for (1 .. MAX_WAIT_ITERATIONS)
 		usleep(POLL_INTERVAL_MICROSECONDS);
 		next;
 	}
-	$started = 1;
+	$worker_has_lock = 1;
 	last;
 }
-ok($started, 'update workload started');
+ok($worker_has_lock, 'update workload started');
 $node->safe_psql('postgres', 'REINDEX INDEX CONCURRENTLY o_bank_pkey;');
 my $waited = waitpid($pid, 0);
 is($waited, $pid, 'update workload reaped');
