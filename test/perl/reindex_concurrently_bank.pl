@@ -3,6 +3,7 @@ use warnings FATAL => 'all';
 
 use File::Temp qw(tempfile);
 use FindBin;
+use Time::HiRes qw(usleep);
 use lib "$FindBin::RealBin/../../../../src/test/perl";
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -47,7 +48,6 @@ if ($pid == 0)
 	exec 'psql', '-X', '-q', '-d', $node->connstr('postgres'), '-f',
 		$filename
 		or die "exec psql failed: $!";
-	exit 1;
 }
 
 my $started = 0;
@@ -60,7 +60,7 @@ for (1 .. 100)
 	{
 		$node->safe_psql('postgres',
 			"SELECT pg_advisory_unlock($lock_key);");
-		select undef, undef, undef, 0.02;
+		usleep(20_000);
 		next;
 	}
 	$started = 1;
