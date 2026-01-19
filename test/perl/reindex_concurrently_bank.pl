@@ -8,6 +8,8 @@ use lib "$FindBin::RealBin/../../../../src/test/perl";
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use constant MAX_WAIT_ITERATIONS => 100;
+use constant POLL_INTERVAL_MICROSECONDS => 20_000;
 
 my $node = PostgreSQL::Test::Cluster->new('reindex_concurrently_bank');
 $node->init;
@@ -51,7 +53,7 @@ if ($pid == 0)
 }
 
 my $started = 0;
-for (1 .. 100)
+for (1 .. MAX_WAIT_ITERATIONS)
 {
 	my $locked = $node->safe_psql('postgres',
 		"SELECT pg_try_advisory_lock($lock_key);");
@@ -60,7 +62,7 @@ for (1 .. 100)
 	{
 		$node->safe_psql('postgres',
 			"SELECT pg_advisory_unlock($lock_key);");
-		usleep(20_000);
+		usleep(POLL_INTERVAL_MICROSECONDS);
 		next;
 	}
 	$started = 1;
@@ -68,7 +70,8 @@ for (1 .. 100)
 }
 ok($started, 'update workload started');
 $node->safe_psql('postgres', 'REINDEX INDEX CONCURRENTLY o_bank_pkey;');
-waitpid($pid, 0);
+my $waited = waitpid($pid, 0);
+is($waited, $pid, 'update workload reaped');
 is($?, 0, 'update workload finished');
 
 my $balance = $node->safe_psql('postgres', 'SELECT sum(balance) FROM o_bank;');
