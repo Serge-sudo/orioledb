@@ -955,6 +955,11 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	stats->num_index_tuples = info->num_heap_tuples;
 	stats->num_pages = info->index->rd_rel->relpages;
 	stats->tuples_removed = 0;
+#if PG_VERSION_NUM >= 170000
+	stats->pages_newly_deleted = 0;
+	stats->pages_deleted = 0;
+	stats->pages_free = 0;
+#endif
 
 	return stats;
 }
