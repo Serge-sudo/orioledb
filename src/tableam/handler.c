@@ -53,6 +53,7 @@
 #include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "common/relpath.h"
+#include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "optimizer/optimizer.h"
@@ -71,6 +72,7 @@
 #include "utils/lsyscache.h"
 #include "utils/sampling.h"
 #include "utils/syscache.h"
+#include "utils/tuplesort.h"
 
 bool		in_nontransactional_truncate = false;
 
@@ -1100,7 +1102,61 @@ orioledb_index_validate_scan(Relation heapRelation,
 							 Snapshot snapshot,
 							 ValidateIndexState *state)
 {
-	elog(ERROR, "Not implemented: %s", PG_FUNCNAME_MACRO);
+	OTableDescr *descr;
+	BTreeSeqScan *seq_scan;
+	TupleTableSlot *slot;
+	OTuple		tup;
+	BTreeLocationHint hint;
+	CommitSeqNo tupleCsn;
+	double		tuples_scanned = 0;
+	OSnapshot	oSnapshot;
+
+	/* Get table descriptor */
+	descr = relation_get_descr(heapRelation);
+	Assert(descr != NULL);
+
+	/* Initialize snapshot for scan */
+	if (snapshot == SnapshotAny)
+		oSnapshot = o_in_progress_snapshot;
+	else
+		oSnapshot = o_snapshot_from_snapshot(snapshot);
+
+	/* Create sequential scan */
+	seq_scan = make_btree_seq_scan(&GET_PRIMARY(descr)->desc, &oSnapshot, NULL);
+	slot = MakeSingleTupleTableSlot(descr->tupdesc, &TTSOpsOrioleDB);
+
+	/* Scan all tuples in the heap */
+	while (!O_TUPLE_IS_NULL(tup = btree_seq_scan_getnext(seq_scan, slot->tts_mcxt, &tupleCsn, &hint)))
+	{
+		Datum		rowIdDatum;
+		bool		isnull;
+
+		/* Store tuple in slot */
+		tts_orioledb_store_tuple(slot, tup, descr, tupleCsn, PrimaryIndexNumber, true, &hint);
+
+		/* Get rowid from slot - this is what identifies the tuple */
+		rowIdDatum = slot_getsysattr(slot, RowIdAttributeNumber, &isnull);
+		Assert(!isnull);
+
+		/*
+		 * Store the rowid datum in the tuplesort for later validation.
+		 * During validation, tuples from the index will be compared with
+		 * these rowids to ensure all heap tuples are present in the index.
+		 * 
+		 * Note: When retrieving from tuplesort, use DatumGetItemPointer(rowIdDatum)
+		 * to get the ItemPointer for comparison.
+		 */
+		tuplesort_putdatum(state->tuplesort, rowIdDatum, false);
+
+		tuples_scanned++;
+
+		/* Clear slot for next iteration */
+		ExecClearTuple(slot);
+	}
+
+	/* Clean up */
+	ExecDropSingleTupleTableSlot(slot);
+	free_btree_seq_scan(seq_scan);
 }
 
 
