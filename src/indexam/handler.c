@@ -36,6 +36,7 @@
 #include "access/relation.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
+#include "executor/executor.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
@@ -967,6 +968,8 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	double		num_tuples = 0;
 	ItemPointerData	itemptr;
 	bool		should_delete;
+	TupleTableSlot *slot;
+	MemoryContext oldcontext;
 
 	if (options && !options->orioledb_index)
 		return btbulkdelete(info, stats, callback, callback_state);
@@ -984,6 +987,11 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	/* Initialize snapshot for iteration */
 	oSnapshot = o_in_progress_snapshot;
 
+	/* Create a slot for extracting rowid - reuse it for all tuples */
+	oldcontext = MemoryContextSwitchTo(CurrentMemoryContext);
+	slot = MakeSingleTupleTableSlot(descr->tupdesc, &TTSOpsOrioleDB);
+	MemoryContextSwitchTo(oldcontext);
+
 	/* Create iterator to scan all tuples in the index */
 	it = o_btree_iterator_create(&index_descr->desc, NULL, BTreeKeyNone,
 								 &oSnapshot, ForwardScanDirection);
@@ -991,8 +999,12 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	/* Iterate through all tuples in the index */
 	while (true)
 	{
+		CommitSeqNo tupleCsn;
+		Datum		rowIdDatum;
+		bool		isnull;
+		
 		/* Fetch next tuple */
-		tuple = o_btree_iterator_fetch(it, NULL, NULL, BTreeKeyNone, false, NULL);
+		tuple = o_btree_iterator_fetch(it, &tupleCsn, NULL, BTreeKeyNone, false, NULL);
 		
 		if (O_TUPLE_IS_NULL(tuple))
 			break;
@@ -1000,58 +1012,65 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		num_tuples++;
 
 		/*
-		 * Extract ItemPointer from the tuple. For orioledb secondary indexes,
-		 * the "TID" is stored as part of the tuple data. For primaryIsCtid
-		 * indexes, we need to extract it from the last field.
+		 * Extract ItemPointer using the same logic as table operations.
+		 * We create a slot from the tuple and extract the rowid, then
+		 * get the ItemPointer from it.
 		 */
-		if (index_descr->primaryIsCtid && index_descr->leafTupdesc->natts > 0)
+		tts_orioledb_store_tuple(slot, tuple, descr, tupleCsn,
+								 PrimaryIndexNumber, false, NULL);
+
+		/* Get rowid from slot */
+		rowIdDatum = slot_getsysattr(slot, RowIdAttributeNumber, &isnull);
+		
+		if (!isnull)
 		{
-			bool		isnull;
-			Datum		ctid_datum;
+			bytea	   *rowid = DatumGetByteaP(rowIdDatum);
+			Pointer		p = (Pointer) rowid + MAXALIGN(VARHDRSZ);
 			
-			/* Get CTID from the last attribute */
-			ctid_datum = o_fastgetattr(tuple, 
-										index_descr->leafTupdesc->natts,
-										index_descr->leafTupdesc,
-										&index_descr->leafSpec,
-										&isnull);
-			
-			if (!isnull)
+			if (GET_PRIMARY(descr)->primaryIsCtid)
 			{
-				ItemPointer ctid_ptr = (ItemPointer) DatumGetPointer(ctid_datum);
-				itemptr = *ctid_ptr;
+				ORowIdAddendumCtid *addCtid = (ORowIdAddendumCtid *) p;
+				
+				p += MAXALIGN(sizeof(ORowIdAddendumCtid));
+				itemptr = *((ItemPointer) p);
 			}
 			else
 			{
-				/* Use a dummy value if null */
+				/* For non-CTID primary keys, use invalid ItemPointer */
 				ItemPointerSetInvalid(&itemptr);
 			}
 		}
 		else
 		{
-			/*
-			 * For non-CTID indexes, we don't have a real ItemPointer.
-			 * Use a dummy value. The callback in concurrent index validation
-			 * typically doesn't need the actual TID value.
-			 */
+			/* Use invalid ItemPointer if rowid is null */
 			ItemPointerSetInvalid(&itemptr);
 		}
 
 		/* Call the callback with the tuple's ItemPointer */
 		should_delete = callback(&itemptr, callback_state);
 
+		/* Clear slot for next iteration */
+		ExecClearTuple(slot);
+
 		/*
 		 * If callback returns true (requesting deletion), throw an error.
 		 * Deletion is not supported in orioledb_ambulkdelete.
 		 */
 		if (should_delete)
+		{
+			/* Clean up before erroring out */
+			ExecDropSingleTupleTableSlot(slot);
+			btree_iterator_free(it);
+			
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("bulk deletion is not supported for orioledb indexes"),
 					 errdetail("Index: %s", RelationGetRelationName(info->index))));
+		}
 	}
 
-	/* Clean up iterator */
+	/* Clean up */
+	ExecDropSingleTupleTableSlot(slot);
 	btree_iterator_free(it);
 
 	/* Allocate and initialize stats if not provided */
