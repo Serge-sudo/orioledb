@@ -948,7 +948,14 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	if (options && !options->orioledb_index)
 		return btbulkdelete(info, stats, callback, callback_state);
 
-	elog(ERROR, "Not implemented: %s", PG_FUNCNAME_MACRO);
+	if (stats == NULL)
+		stats = palloc0(sizeof(IndexBulkDeleteResult));
+
+	stats->estimated_count = true;
+	stats->num_index_tuples = info->num_heap_tuples;
+	stats->num_pages = info->index->rd_rel->relpages;
+	stats->tuples_removed = 0;
+
 	return stats;
 }
 
