@@ -1095,6 +1095,181 @@ orioledb_index_build_range_scan(Relation heapRelation,
 	return 0.0;
 }
 
+/*
+ * orioledb_index_validate - Validate an index for orioledb tables
+ *
+ * This function implements index validation for orioledb tables, similar to
+ * PostgreSQL's validate_index but adapted for rowid-based tuple identification.
+ * It performs the following steps:
+ * 1. Scans the index to collect all rowids into a tuplesort
+ * 2. Sorts the collected rowids
+ * 3. Scans the heap and performs a merge join with sorted index rowids
+ * 4. Inserts any missing tuples into the index
+ */
+static void
+orioledb_index_validate(Relation heapRelation,
+					   Relation indexRelation,
+					   Snapshot snapshot)
+{
+	IndexInfo  *indexInfo;
+	ValidateIndexState state;
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
+	OTableDescr *descr;
+	OIndexDescr *index_descr;
+	ORelOids	oids;
+	BTreeIterator *it;
+	OSnapshot	oSnapshot;
+	OTuple		tuple;
+	CommitSeqNo tupleCsn;
+	TupleTableSlot *slot;
+
+	{
+		const int	progress_index[] = {
+			PROGRESS_CREATEIDX_PHASE,
+			PROGRESS_CREATEIDX_TUPLES_DONE,
+			PROGRESS_CREATEIDX_TUPLES_TOTAL,
+			PROGRESS_SCAN_BLOCKS_DONE,
+			PROGRESS_SCAN_BLOCKS_TOTAL
+		};
+		const int64 progress_vals[] = {
+			PROGRESS_CREATEIDX_PHASE_VALIDATE_IDXSCAN,
+			0, 0, 0, 0
+		};
+
+		pgstat_progress_update_multi_param(5, progress_index, progress_vals);
+	}
+
+	/*
+	 * Switch to the table owner's userid, so that any index functions are run
+	 * as that user.  Also lock down security-restricted operations and
+	 * arrange to make GUC variable changes local to this command.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
+	RestrictSearchPath();
+
+	/*
+	 * Fetch info needed for index_insert.
+	 */
+	indexInfo = BuildIndexInfo(indexRelation);
+
+	/* mark build is concurrent just for consistency */
+	indexInfo->ii_Concurrent = true;
+
+	/*
+	 * Use BYTEAOID for tuplesort since we're storing rowid datums.
+	 * Rowids are bytea values that uniquely identify tuples in orioledb.
+	 */
+	state.tuplesort = tuplesort_begin_datum(BYTEAOID, 
+											F_BYTEAGT,  /* bytea > operator */
+											InvalidOid, 
+											false,
+											maintenance_work_mem,
+											NULL, 
+											TUPLESORT_NONE);
+	state.htups = state.itups = state.tups_inserted = 0;
+
+	/*
+	 * Scan the index and collect all rowids.
+	 * This is similar to what ambulkdelete does, but we collect rowids directly.
+	 */
+	descr = relation_get_descr(heapRelation);
+	Assert(descr != NULL);
+
+	ORelOidsSetFromRel(oids, indexRelation);
+	index_descr = o_fetch_index_descr(oids, oIndexInvalid, false, NULL);
+	if (index_descr == NULL)
+		elog(ERROR, "index descriptor not found for index %u", indexRelation->rd_id);
+
+	/* Initialize snapshot for iteration */
+	O_LOAD_SNAPSHOT(&oSnapshot, snapshot);
+
+	/* Create a slot for extracting rowid - reuse it for all tuples */
+	slot = MakeSingleTupleTableSlot(descr->tupdesc, &TTSOpsOrioleDB);
+
+	/* Create iterator to scan all tuples in the index */
+	it = o_btree_iterator_create(&index_descr->desc, NULL, BTreeKeyNone,
+								 &oSnapshot, ForwardScanDirection);
+
+	/* Iterate through all tuples in the index and collect rowids */
+	while (true)
+	{
+		Datum		rowIdDatum;
+		bool		isnull;
+
+		/* Fetch next tuple */
+		tuple = o_btree_iterator_fetch(it, &tupleCsn, NULL, BTreeKeyNone, false, NULL);
+
+		if (O_TUPLE_IS_NULL(tuple))
+			break;
+
+		/* Store tuple in slot to extract rowid */
+		tts_orioledb_store_tuple(slot, tuple, descr, tupleCsn,
+								 PrimaryIndexNumber, false, NULL);
+
+		/* Get rowid from slot */
+		rowIdDatum = slot_getsysattr(slot, RowIdAttributeNumber, &isnull);
+		Assert(!isnull);
+
+		/* Put rowid into tuplesort */
+		tuplesort_putdatum(state.tuplesort, rowIdDatum, false);
+
+		/* Clear slot for next iteration */
+		ExecClearTuple(slot);
+	}
+
+	/* Clean up index scan resources */
+	ExecDropSingleTupleTableSlot(slot);
+	btree_iterator_free(it);
+
+	/* Execute the sort */
+	{
+		const int	progress_index[] = {
+			PROGRESS_CREATEIDX_PHASE,
+			PROGRESS_SCAN_BLOCKS_DONE,
+			PROGRESS_SCAN_BLOCKS_TOTAL
+		};
+		const int64 progress_vals[] = {
+			PROGRESS_CREATEIDX_PHASE_VALIDATE_SORT,
+			0, 0
+		};
+
+		pgstat_progress_update_multi_param(3, progress_index, progress_vals);
+	}
+	tuplesort_performsort(state.tuplesort);
+
+	/*
+	 * Now scan the heap and "merge" it with the index
+	 */
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE,
+								 PROGRESS_CREATEIDX_PHASE_VALIDATE_TABLESCAN);
+	orioledb_index_validate_scan(heapRelation,
+								 indexRelation,
+								 indexInfo,
+								 snapshot,
+								 &state);
+
+	/* Done with tuplesort object */
+	tuplesort_end(state.tuplesort);
+
+	/* Make sure to release resources cached in indexInfo (if needed). */
+	index_insert_cleanup(indexRelation, indexInfo);
+
+	elog(DEBUG2,
+		 "orioledb_index_validate found %.0f heap tuples, %.0f index tuples; inserted %.0f missing tuples",
+		 state.htups, state.itups, state.tups_inserted);
+
+	/* Roll back any GUC changes executed by index functions */
+	AtEOXact_GUC(false, save_nestlevel);
+
+	/* Restore userid and security context */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
+}
+
 static bool
 orioledb_validate_next_index_tid(Tuplesortstate *tuplesort,
 								 Datum *rowidDatum,
@@ -1240,6 +1415,137 @@ orioledb_index_validate_scan(Relation heapRelation,
 	ExecDropSingleTupleTableSlot(primarySlot);
 	FreeExecutorState(estate);
 	free_btree_seq_scan(seq_scan);
+}
+
+/*
+ * orioledb_index_validate - Validate an index for orioledb tables
+ *
+ * This function implements index validation for orioledb tables, similar to
+ * PostgreSQL's validate_index but adapted for rowid-based tuple identification.
+ * It performs the following steps:
+ * 1. Scans the index to collect all rowids into a tuplesort
+ * 2. Sorts the collected rowids
+ * 3. Scans the heap and performs a merge join with sorted index rowids
+ * 4. Inserts any missing tuples into the index
+ */
+static void
+orioledb_index_validate(Relation heapRelation,
+					   Relation indexRelation,
+					   Snapshot snapshot)
+{
+	IndexInfo  *indexInfo;
+	IndexVacuumInfo ivinfo;
+	ValidateIndexState state;
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
+
+	{
+		const int	progress_index[] = {
+			PROGRESS_CREATEIDX_PHASE,
+			PROGRESS_CREATEIDX_TUPLES_DONE,
+			PROGRESS_CREATEIDX_TUPLES_TOTAL,
+			PROGRESS_SCAN_BLOCKS_DONE,
+			PROGRESS_SCAN_BLOCKS_TOTAL
+		};
+		const int64 progress_vals[] = {
+			PROGRESS_CREATEIDX_PHASE_VALIDATE_IDXSCAN,
+			0, 0, 0, 0
+		};
+
+		pgstat_progress_update_multi_param(5, progress_index, progress_vals);
+	}
+
+	/*
+	 * Switch to the table owner's userid, so that any index functions are run
+	 * as that user.  Also lock down security-restricted operations and
+	 * arrange to make GUC variable changes local to this command.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
+	RestrictSearchPath();
+
+	/*
+	 * Fetch info needed for index_insert.
+	 */
+	indexInfo = BuildIndexInfo(indexRelation);
+
+	/* mark build is concurrent just for consistency */
+	indexInfo->ii_Concurrent = true;
+
+	/*
+	 * Scan the index and gather up all the rowids into a tuplesort object.
+	 */
+	ivinfo.index = indexRelation;
+	ivinfo.heaprel = heapRelation;
+	ivinfo.analyze_only = false;
+	ivinfo.report_progress = true;
+	ivinfo.estimated_count = true;
+	ivinfo.message_level = DEBUG2;
+	ivinfo.num_heap_tuples = heapRelation->rd_rel->reltuples;
+	ivinfo.strategy = NULL;
+
+	/*
+	 * Use BYTEAOID for tuplesort since we're storing rowid datums.
+	 * Rowids are bytea values that uniquely identify tuples in orioledb.
+	 */
+	state.tuplesort = tuplesort_begin_datum(BYTEAOID, 
+											F_BYTEAGT,  /* bytea > operator */
+											InvalidOid, 
+											false,
+											maintenance_work_mem,
+											NULL, 
+											TUPLESORT_NONE);
+	state.htups = state.itups = state.tups_inserted = 0;
+
+	/* ambulkdelete updates progress metrics and collects rowids */
+	(void) index_bulk_delete(&ivinfo, NULL,
+							 validate_index_callback, (void *) &state);
+
+	/* Execute the sort */
+	{
+		const int	progress_index[] = {
+			PROGRESS_CREATEIDX_PHASE,
+			PROGRESS_SCAN_BLOCKS_DONE,
+			PROGRESS_SCAN_BLOCKS_TOTAL
+		};
+		const int64 progress_vals[] = {
+			PROGRESS_CREATEIDX_PHASE_VALIDATE_SORT,
+			0, 0
+		};
+
+		pgstat_progress_update_multi_param(3, progress_index, progress_vals);
+	}
+	tuplesort_performsort(state.tuplesort);
+
+	/*
+	 * Now scan the heap and "merge" it with the index
+	 */
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE,
+								 PROGRESS_CREATEIDX_PHASE_VALIDATE_TABLESCAN);
+	orioledb_index_validate_scan(heapRelation,
+								 indexRelation,
+								 indexInfo,
+								 snapshot,
+								 &state);
+
+	/* Done with tuplesort object */
+	tuplesort_end(state.tuplesort);
+
+	/* Make sure to release resources cached in indexInfo (if needed). */
+	index_insert_cleanup(indexRelation, indexInfo);
+
+	elog(DEBUG2,
+		 "orioledb_index_validate found %.0f heap tuples, %.0f index tuples; inserted %.0f missing tuples",
+		 state.htups, state.itups, state.tups_inserted);
+
+	/* Roll back any GUC changes executed by index functions */
+	AtEOXact_GUC(false, save_nestlevel);
+
+	/* Restore userid and security context */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
 }
 
 
@@ -2388,6 +2694,7 @@ static const TableAmRoutine orioledb_am_methods = {
 	.scan_analyze_next_tuple = orioledb_scan_analyze_next_tuple,
 	.index_build_range_scan = orioledb_index_build_range_scan,
 	.index_validate_scan = orioledb_index_validate_scan,
+	.index_validate = orioledb_index_validate,
 
 	.relation_size = orioledb_calculate_relation_size,
 	.relation_needs_toast_table = orioledb_relation_needs_toast_table,
