@@ -1245,62 +1245,24 @@ orioledb_index_validate(Relation heapRelation,
 static void
 debug_print_validate_tuple(OTuple tuple, OTableDescr *table_descr, OIndexDescr *index_descr)
 {
-	StringInfoData buf;
 	TupleTableSlot *slot;
 	OIndexDescr *primary = GET_PRIMARY(table_descr);
-	int			i;
-	
-	initStringInfo(&buf);
-	appendStringInfo(&buf, "validate_index: adding PK tuple to tuplesort: ");
+	char	   *keystr;
 	
 	/* Create a temporary slot to hold the tuple */
 	slot = MakeSingleTupleTableSlot(primary->nonLeafTupdesc, &TTSOpsOrioleDB);
+	
+	/* Store the tuple in the slot using PrimaryIndexNumber */
 	tts_orioledb_store_non_leaf_tuple(slot, tuple, table_descr, 
 									  COMMITSEQNO_INPROGRESS, 
-									  primary->desc.oids.datoid, false, NULL);
-	slot_getallattrs(slot);
+									  PrimaryIndexNumber, false, NULL);
 	
-	/* Print key values in readable format */
-	appendStringInfo(&buf, "(");
-	for (i = 0; i < primary->nUniqueFields; i++)
-	{
-		Datum		value;
-		bool		isnull;
-		int			attnum = primary->tableAttnums[i];
-		
-		if (attnum != EXPR_ATTNUM)
-		{
-			/* Get attribute from the slot */
-			value = slot->tts_values[i];
-			isnull = slot->tts_isnull[i];
-		}
-		else
-		{
-			/* Expression attribute - just mark as null for debug purposes */
-			isnull = true;
-		}
-		
-		if (i != 0)
-			appendStringInfo(&buf, ", ");
-			
-		if (isnull)
-			appendStringInfo(&buf, "null");
-		else
-		{
-			Oid			typoutput;
-			bool		typisvarlena;
-			char	   *res;
-			
-			getTypeOutputInfo(primary->nonLeafTupdesc->attrs[i].atttypid,
-							  &typoutput, &typisvarlena);
-			res = OidOutputFunctionCall(typoutput, value);
-			appendStringInfo(&buf, "'%s'", res);
-		}
-	}
-	appendStringInfo(&buf, ")");
+	/* Use the existing function to print the key in readable format */
+	keystr = tss_orioledb_print_idx_key(slot, primary);
 	
-	elog(DEBUG2, "%s", buf.data);
-	pfree(buf.data);
+	elog(DEBUG2, "validate_index: adding PK tuple to tuplesort: %s", keystr);
+	
+	pfree(keystr);
 	ExecDropSingleTupleTableSlot(slot);
 }
 
