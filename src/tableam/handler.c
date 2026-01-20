@@ -1278,34 +1278,54 @@ validate_index_callback(ItemPointer itemptr, void *callback_state)
 {
 	OValidateIndexState *state = (OValidateIndexState *) callback_state;
 	OTuple		pkTuple;
-	bool		allocated = false;
+	OIndexDescr *id = state->index_descr;
+	OTableDescr *table_descr = state->table_descr;
+	OIndexDescr *primary = GET_PRIMARY(table_descr);
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	int			i;
+	int			pk_from;
+	bool		pk_isnull;
 
 	/*
 	 * For orioledb, the actual tuple is stored in state->current_tuple
 	 * by orioledb_ambulkdelete. For secondary indexes, this tuple contains
 	 * both the indexed columns and the primary key fields. We need to extract
-	 * only the primary key portion using o_btree_tuple_make_key.
+	 * only the primary key portion, similar to o_fill_pindex_tuple_key_bound.
 	 */
 	if (!O_TUPLE_IS_NULL(state->current_tuple))
 	{
 		/*
-		 * Extract the primary key portion from the index tuple.
-		 * For primary indexes, this returns the tuple as-is.
-		 * For secondary indexes, this extracts just the PK fields.
+		 * Extract the primary key fields from the index tuple.
+		 * Similar to o_fill_pindex_tuple_key_bound, but we extract values
+		 * to form a tuple rather than filling a bound structure.
 		 */
-		pkTuple = o_btree_tuple_make_key(&state->index_descr->desc,
-										 state->current_tuple,
-										 NULL, false, &allocated);
+		if (id->desc.type == oIndexBridge)
+			pk_from = 1;
+		else
+			pk_from = id->nFields - id->nPrimaryFields;
+
+		for (i = 0; i < id->nPrimaryFields; i++)
+		{
+			AttrNumber	attnum = id->primaryFieldsAttnums[i];
+
+			values[i] = o_fastgetattr(state->current_tuple, attnum,
+									  id->leafTupdesc, &id->leafSpec, &pk_isnull);
+			isnull[i] = pk_isnull;
+		}
+
+		/* Form a tuple with only the primary key fields */
+		pkTuple = o_form_tuple(primary->leafTupdesc, &primary->leafSpec,
+							   0, values, isnull, NULL);
 		
 		/* Debug: Print tuple before adding to tuplesort */
-		debug_print_validate_tuple(pkTuple, state->index_descr->table_descr, state->index_descr);
+		debug_print_validate_tuple(pkTuple, table_descr, id);
 		
 		/* Put only the PK tuple into the tuplesort */
 		tuplesort_putotuple(state->tuplesort, pkTuple);
 		
-		/* Free the extracted key if it was allocated */
-		if (allocated)
-			pfree(pkTuple.data);
+		/* Free the formed tuple */
+		pfree(pkTuple.data);
 	}
 
 	/* Return false to indicate we don't want to delete this tuple */
