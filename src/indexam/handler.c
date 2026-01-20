@@ -22,6 +22,7 @@
 #include "catalog/indices.h"
 #include "catalog/o_tables.h"
 #include "indexam/handler.h"
+#include "tableam/handler.h"
 #include "tableam/index_scan.h"
 #include "tableam/operations.h"
 #include "tableam/tree.h"
@@ -48,9 +49,6 @@
 #include "nodes/pg_list.h"
 
 #include <math.h>
-
-/* Forward declaration for OValidateIndexState */
-typedef struct OValidateIndexState OValidateIndexState;
 
 #define DEFAULT_PAGE_CPU_MULTIPLIER 50.0
 

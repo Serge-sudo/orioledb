@@ -221,4 +221,20 @@ typedef ParallelOScanDescData *ParallelOScanDesc;
 
 extern bool in_nontransactional_truncate;
 
+/*
+ * State for orioledb index validation
+ * Extends PostgreSQL's ValidateIndexState with orioledb-specific fields
+ */
+typedef struct OValidateIndexState
+{
+	/* Fields matching PostgreSQL's ValidateIndexState */
+	Tuplesortstate *tuplesort;
+	double		htups;			/* # heap tuples processed */
+	double		itups;			/* # index tuples from ambulkdelete */
+	double		tups_inserted;	/* # missing tuples inserted */
+	
+	/* Orioledb-specific field */
+	OTuple		current_tuple;	/* Current tuple being processed by ambulkdelete */
+} OValidateIndexState;
+
 #endif
