@@ -1237,6 +1237,34 @@ orioledb_index_validate(Relation heapRelation,
 }
 
 /*
+ * debug_print_validate_tuple - Debug function to print tuple before adding to tuplesort
+ *
+ * This function prints the tuple data for debugging purposes during index validation.
+ */
+static void
+debug_print_validate_tuple(OTuple tuple, BTreeDescr *desc)
+{
+	StringInfoData buf;
+	int			i;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "validate_index: adding tuple to tuplesort: len=%d, data=",
+					 tuple.formatFlags);
+
+	/* Print first 32 bytes of tuple data (or less if tuple is smaller) */
+	for (i = 0; i < Min(32, o_btree_len(desc, tuple, OTupleLength)); i++)
+	{
+		appendStringInfo(&buf, "%02x", (unsigned char) tuple.data[i]);
+	}
+
+	if (o_btree_len(desc, tuple, OTupleLength) > 32)
+		appendStringInfo(&buf, "... (total %d bytes)", o_btree_len(desc, tuple, OTupleLength));
+
+	elog(DEBUG2, "%s", buf.data);
+	pfree(buf.data);
+}
+
+/*
  * validate_index_callback - Callback for index validation
  *
  * This callback is invoked by orioledb_ambulkdelete for each tuple in the index.
@@ -1266,6 +1294,9 @@ validate_index_callback(ItemPointer itemptr, void *callback_state)
 		pkTuple = o_btree_tuple_make_key(&state->index_descr->desc,
 										 state->current_tuple,
 										 NULL, false, &allocated);
+		
+		/* Debug: Print tuple before adding to tuplesort */
+		debug_print_validate_tuple(pkTuple, &GET_PRIMARY(state->index_descr->table_descr)->desc);
 		
 		/* Put only the PK tuple into the tuplesort */
 		tuplesort_putotuple(state->tuplesort, pkTuple);
