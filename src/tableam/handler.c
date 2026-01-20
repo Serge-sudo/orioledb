@@ -87,6 +87,22 @@ typedef struct OScanDescData
 typedef OScanDescData *OScanDesc;
 
 /*
+ * State for orioledb index validation
+ * Extends PostgreSQL's ValidateIndexState with orioledb-specific fields
+ */
+typedef struct OValidateIndexState
+{
+	/* Fields matching PostgreSQL's ValidateIndexState */
+	Tuplesortstate *tuplesort;
+	double		htups;			/* # heap tuples processed */
+	double		itups;			/* # index tuples from ambulkdelete */
+	double		tups_inserted;	/* # missing tuples inserted */
+	
+	/* Orioledb-specific field */
+	OTuple		current_tuple;	/* Current tuple being processed by ambulkdelete */
+} OValidateIndexState;
+
+/*
  * Operation with indices. It does not update TOAST BTree. Implementations
  * are in tableam_handler.c.
  */
@@ -1102,9 +1118,10 @@ orioledb_index_build_range_scan(Relation heapRelation,
  * This function implements index validation for orioledb tables, similar to
  * PostgreSQL's validate_index but adapted for rowid-based tuple identification.
  * It performs the following steps:
- * 1. Scans the index to collect all rowids into a tuplesort
- * 2. Sorts the collected rowids
- * 3. Scans the heap and performs a merge join with sorted index rowids
+ * 1. Calls index_bulk_delete (which invokes orioledb_ambulkdelete) with a callback
+ *    that collects all primary key tuples from the index into a tuplesort
+ * 2. Sorts the collected tuples in primary key order
+ * 3. Scans the heap and performs a merge join with sorted index tuples
  * 4. Inserts any missing tuples into the index
  */
 static void
@@ -1113,18 +1130,12 @@ orioledb_index_validate(Relation heapRelation,
 					   Snapshot snapshot)
 {
 	IndexInfo  *indexInfo;
-	ValidateIndexState state;
+	IndexVacuumInfo ivinfo;
+	OValidateIndexState state;
 	Oid			save_userid;
 	int			save_sec_context;
 	int			save_nestlevel;
 	OTableDescr *descr;
-	OIndexDescr *index_descr;
-	ORelOids	oids;
-	BTreeIterator *it;
-	OSnapshot	oSnapshot;
-	OTuple		tuple;
-	CommitSeqNo tupleCsn;
-	TupleTableSlot *slot;
 
 	{
 		const int	progress_index[] = {
@@ -1162,6 +1173,12 @@ orioledb_index_validate(Relation heapRelation,
 	indexInfo->ii_Concurrent = true;
 
 	/*
+	 * Get table descriptor to access primary index descriptor
+	 */
+	descr = relation_get_descr(heapRelation);
+	Assert(descr != NULL);
+
+	/*
 	 * Use tuplesort_begin_orioledb_index with the primary index descriptor.
 	 * This ensures tuples are sorted in the same order as the primary key,
 	 * which is essential for the merge join algorithm in validate_scan.
@@ -1171,45 +1188,25 @@ orioledb_index_validate(Relation heapRelation,
 													 false,
 													 NULL);
 	state.htups = state.itups = state.tups_inserted = 0;
+	state.current_tuple.data = NULL; /* Initialize */
 
 	/*
-	 * Scan the index and collect all rowids.
-	 * This is similar to what ambulkdelete does, but we collect rowids directly.
+	 * Scan the index and gather up all the primary key tuples into a tuplesort object.
+	 * This is done by calling index_bulk_delete with validate_index_callback,
+	 * which collects tuples instead of deleting them.
 	 */
-	descr = relation_get_descr(heapRelation);
-	Assert(descr != NULL);
+	ivinfo.index = indexRelation;
+	ivinfo.heaprel = heapRelation;
+	ivinfo.analyze_only = false;
+	ivinfo.report_progress = true;
+	ivinfo.estimated_count = true;
+	ivinfo.message_level = DEBUG2;
+	ivinfo.num_heap_tuples = heapRelation->rd_rel->reltuples;
+	ivinfo.strategy = NULL;
 
-	ORelOidsSetFromRel(oids, indexRelation);
-	index_descr = o_fetch_index_descr(oids, oIndexInvalid, false, NULL);
-	if (index_descr == NULL)
-		elog(ERROR, "index descriptor not found for index %u", indexRelation->rd_id);
-
-	/* Initialize snapshot for iteration */
-	O_LOAD_SNAPSHOT(&oSnapshot, snapshot);
-
-	/* Create iterator to scan all tuples in the index */
-	it = o_btree_iterator_create(&index_descr->desc, NULL, BTreeKeyNone,
-								 &oSnapshot, ForwardScanDirection);
-
-	/* Iterate through all tuples in the index and collect tuples for sorting */
-	while (true)
-	{
-		/* Fetch next tuple from the index */
-		tuple = o_btree_iterator_fetch(it, &tupleCsn, NULL, BTreeKeyNone, false, NULL);
-
-		if (O_TUPLE_IS_NULL(tuple))
-			break;
-
-		/*
-		 * Put the tuple into the tuplesort. The tuplesort will sort these
-		 * tuples according to the primary key order, which is necessary for
-		 * the merge join in validate_scan.
-		 */
-		tuplesort_putotuple(state.tuplesort, tuple);
-	}
-
-	/* Clean up index scan resources */
-	btree_iterator_free(it);
+	/* ambulkdelete updates progress metrics and collects tuples via callback */
+	(void) index_bulk_delete(&ivinfo, NULL,
+							 validate_index_callback, (void *) &state);
 
 	/* Execute the sort */
 	{
@@ -1255,6 +1252,31 @@ orioledb_index_validate(Relation heapRelation,
 	SetUserIdAndSecContext(save_userid, save_sec_context);
 }
 
+/*
+ * validate_index_callback - Callback for index validation
+ *
+ * This callback is invoked by orioledb_ambulkdelete for each tuple in the index.
+ * It collects the primary key tuple into the tuplesort for later comparison
+ * with heap tuples.
+ */
+static bool
+validate_index_callback(ItemPointer itemptr, void *callback_state)
+{
+	OValidateIndexState *state = (ValidateIndexState *) callback_state;
+
+	/*
+	 * For orioledb, the actual tuple is stored in state->current_tuple
+	 * by orioledb_ambulkdelete. We put this tuple into the tuplesort.
+	 */
+	if (!O_TUPLE_IS_NULL(state->current_tuple))
+	{
+		tuplesort_putotuple(state->tuplesort, state->current_tuple);
+	}
+
+	/* Return false to indicate we don't want to delete this tuple */
+	return false;
+}
+
 static bool
 orioledb_validate_next_index_tid(Tuplesortstate *tuplesort,
 								 OTuple *indexTuple,
@@ -1274,7 +1296,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 							 Relation indexRelation,
 							 IndexInfo *indexInfo,
 							 Snapshot snapshot,
-							 ValidateIndexState *state)
+							 OValidateIndexState *state)
 {
 	OTableDescr *descr;
 	BTreeSeqScan *seq_scan;
@@ -1422,7 +1444,7 @@ orioledb_index_validate(Relation heapRelation,
 {
 	IndexInfo  *indexInfo;
 	IndexVacuumInfo ivinfo;
-	ValidateIndexState state;
+	OValidateIndexState state;
 	Oid			save_userid;
 	int			save_sec_context;
 	int			save_nestlevel;

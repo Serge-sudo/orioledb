@@ -49,6 +49,9 @@
 
 #include <math.h>
 
+/* Forward declaration for OValidateIndexState */
+typedef struct OValidateIndexState OValidateIndexState;
+
 #define DEFAULT_PAGE_CPU_MULTIPLIER 50.0
 
 static IndexBuildResult *orioledb_ambuild(Relation heap, Relation index, IndexInfo *indexInfo);
@@ -947,12 +950,16 @@ orioledb_amdelete(Relation rel, Datum *values, bool *isnull,
  *
  * Note: This function does NOT actually delete any tuples from the index.
  * It is primarily used during concurrent index creation validation phase,
- * where the callback gathers tuple identifiers (TIDs) from the index
- * and always returns false (meaning "do not delete").
+ * where the callback gathers primary key tuples from the index and always
+ * returns false (meaning "do not delete").
  *
- * For each tuple in the index, we call the provided callback with the
- * tuple's ItemPointer. If the callback returns true (requesting deletion),
- * we throw an error since deletion is not supported.
+ * For orioledb, instead of passing ItemPointers like vanilla PostgreSQL,
+ * we pass the actual primary key tuples to the callback by storing them
+ * in the callback_state. The callback (e.g., validate_index_callback) can
+ * then collect these tuples into a tuplesort for later validation.
+ *
+ * If the callback returns true (requesting deletion), we throw an error since
+ * deletion is not supported.
  */
 IndexBulkDeleteResult *
 orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
@@ -968,8 +975,6 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	double		num_tuples = 0;
 	ItemPointerData	itemptr;
 	bool		should_delete;
-	TupleTableSlot *slot;
-	MemoryContext oldcontext;
 
 	if (options && !options->orioledb_index)
 		return btbulkdelete(info, stats, callback, callback_state);
@@ -987,11 +992,6 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	/* Initialize snapshot for iteration */
 	oSnapshot = o_in_progress_snapshot;
 
-	/* Create a slot for extracting rowid - reuse it for all tuples */
-	oldcontext = MemoryContextSwitchTo(CurrentMemoryContext);
-	slot = MakeSingleTupleTableSlot(descr->tupdesc, &TTSOpsOrioleDB);
-	MemoryContextSwitchTo(oldcontext);
-
 	/* Create iterator to scan all tuples in the index */
 	it = o_btree_iterator_create(&index_descr->desc, NULL, BTreeKeyNone,
 								 &oSnapshot, ForwardScanDirection);
@@ -1000,8 +1000,6 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	while (true)
 	{
 		CommitSeqNo tupleCsn;
-		Datum		rowIdDatum;
-		bool		isnull;
 		
 		/* Fetch next tuple */
 		tuple = o_btree_iterator_fetch(it, &tupleCsn, NULL, BTreeKeyNone, false, NULL);
@@ -1012,45 +1010,18 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		num_tuples++;
 
 		/*
-		 * Extract ItemPointer using the same logic as table operations.
-		 * We create a slot from the tuple and extract the rowid, then
-		 * get the ItemPointer from it.
+		 * For orioledb, we pass the primary key tuple itself to the callback
+		 * instead of just an ItemPointer. The callback can then collect these
+		 * tuples (e.g., into a tuplesort) for validation purposes.
+		 * 
+		 * We store the tuple in callback_state for the callback to access.
 		 */
-		tts_orioledb_store_tuple(slot, tuple, descr, tupleCsn,
-								 PrimaryIndexNumber, false, NULL);
+		if (callback_state)
+			((OValidateIndexState *) callback_state)->current_tuple = tuple;
 
-		/* Get rowid from slot */
-		rowIdDatum = slot_getsysattr(slot, RowIdAttributeNumber, &isnull);
-		
-		if (!isnull)
-		{
-			bytea	   *rowid = DatumGetByteaP(rowIdDatum);
-			Pointer		p = (Pointer) rowid + MAXALIGN(VARHDRSZ);
-			
-			if (GET_PRIMARY(descr)->primaryIsCtid)
-			{
-				ORowIdAddendumCtid *addCtid = (ORowIdAddendumCtid *) p;
-				
-				p += MAXALIGN(sizeof(ORowIdAddendumCtid));
-				itemptr = *((ItemPointer) p);
-			}
-			else
-			{
-				/* For non-CTID primary keys, use invalid ItemPointer */
-				ItemPointerSetInvalid(&itemptr);
-			}
-		}
-		else
-		{
-			/* Use invalid ItemPointer if rowid is null */
-			ItemPointerSetInvalid(&itemptr);
-		}
-
-		/* Call the callback with the tuple's ItemPointer */
+		/* Call the callback with a dummy ItemPointer */
+		ItemPointerSetInvalid(&itemptr);
 		should_delete = callback(&itemptr, callback_state);
-
-		/* Clear slot for next iteration */
-		ExecClearTuple(slot);
 
 		/*
 		 * If callback returns true (requesting deletion), throw an error.
@@ -1059,7 +1030,6 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		if (should_delete)
 		{
 			/* Clean up before erroring out */
-			ExecDropSingleTupleTableSlot(slot);
 			btree_iterator_free(it);
 			
 			ereport(ERROR,
@@ -1070,7 +1040,6 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	}
 
 	/* Clean up */
-	ExecDropSingleTupleTableSlot(slot);
 	btree_iterator_free(it);
 
 	/* Allocate and initialize stats if not provided */
