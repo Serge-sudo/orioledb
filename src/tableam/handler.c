@@ -1239,29 +1239,69 @@ orioledb_index_validate(Relation heapRelation,
 /*
  * debug_print_validate_tuple - Debug function to print tuple before adding to tuplesort
  *
- * This function prints the tuple data for debugging purposes during index validation.
+ * This function prints the tuple data in readable format for debugging purposes 
+ * during index validation, similar to tss_orioledb_print_idx_key.
  */
 static void
-debug_print_validate_tuple(OTuple tuple, BTreeDescr *desc)
+debug_print_validate_tuple(OTuple tuple, OTableDescr *table_descr, OIndexDescr *index_descr)
 {
 	StringInfoData buf;
+	TupleTableSlot *slot;
+	OIndexDescr *primary = GET_PRIMARY(table_descr);
 	int			i;
-
+	
 	initStringInfo(&buf);
-	appendStringInfo(&buf, "validate_index: adding tuple to tuplesort: len=%d, data=",
-					 tuple.formatFlags);
-
-	/* Print first 32 bytes of tuple data (or less if tuple is smaller) */
-	for (i = 0; i < Min(32, o_btree_len(desc, tuple, OTupleLength)); i++)
+	appendStringInfo(&buf, "validate_index: adding PK tuple to tuplesort: ");
+	
+	/* Create a temporary slot to hold the tuple */
+	slot = MakeSingleTupleTableSlot(primary->nonLeafTupdesc, &TTSOpsOrioleDB);
+	tts_orioledb_store_non_leaf_tuple(slot, tuple, table_descr, 
+									  COMMITSEQNO_INPROGRESS, 
+									  primary->desc.oids.datoid, false, NULL);
+	slot_getallattrs(slot);
+	
+	/* Print key values in readable format */
+	appendStringInfo(&buf, "(");
+	for (i = 0; i < primary->nUniqueFields; i++)
 	{
-		appendStringInfo(&buf, "%02x", (unsigned char) tuple.data[i]);
+		Datum		value;
+		bool		isnull;
+		int			attnum = primary->tableAttnums[i];
+		
+		if (attnum != EXPR_ATTNUM)
+		{
+			/* Get attribute from the slot */
+			value = slot->tts_values[i];
+			isnull = slot->tts_isnull[i];
+		}
+		else
+		{
+			/* Expression attribute - just mark as null for debug purposes */
+			isnull = true;
+		}
+		
+		if (i != 0)
+			appendStringInfo(&buf, ", ");
+			
+		if (isnull)
+			appendStringInfo(&buf, "null");
+		else
+		{
+			Oid			typoutput;
+			bool		typisvarlena;
+			char	   *res;
+			
+			getTypeOutputInfo(primary->nonLeafTupdesc->attrs[i].atttypid,
+							  &typoutput, &typisvarlena);
+			res = OidOutputFunctionCall(typoutput, value);
+			appendStringInfo(&buf, "'%s'", res);
+		}
 	}
-
-	if (o_btree_len(desc, tuple, OTupleLength) > 32)
-		appendStringInfo(&buf, "... (total %d bytes)", o_btree_len(desc, tuple, OTupleLength));
-
+	appendStringInfo(&buf, ")");
+	
 	elog(DEBUG2, "%s", buf.data);
 	pfree(buf.data);
+	ExecDropSingleTupleTableSlot(slot);
 }
 
 /*
@@ -1296,7 +1336,7 @@ validate_index_callback(ItemPointer itemptr, void *callback_state)
 										 NULL, false, &allocated);
 		
 		/* Debug: Print tuple before adding to tuplesort */
-		debug_print_validate_tuple(pkTuple, &GET_PRIMARY(state->index_descr->table_descr)->desc);
+		debug_print_validate_tuple(pkTuple, state->index_descr->table_descr, state->index_descr);
 		
 		/* Put only the PK tuple into the tuplesort */
 		tuplesort_putotuple(state->tuplesort, pkTuple);
