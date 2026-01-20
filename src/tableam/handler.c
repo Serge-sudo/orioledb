@@ -34,6 +34,7 @@
 #include "tableam/vacuum.h"
 #include "transam/oxid.h"
 #include "tuple/slot.h"
+#include "tuple/sort.h"
 #include "utils/compress.h"
 #include "utils/rel.h"
 #include "utils/stopevent.h"
@@ -1161,16 +1162,14 @@ orioledb_index_validate(Relation heapRelation,
 	indexInfo->ii_Concurrent = true;
 
 	/*
-	 * Use BYTEAOID for tuplesort since we're storing rowid datums.
-	 * Rowids are bytea values that uniquely identify tuples in orioledb.
+	 * Use tuplesort_begin_orioledb_index with the primary index descriptor.
+	 * This ensures tuples are sorted in the same order as the primary key,
+	 * which is essential for the merge join algorithm in validate_scan.
 	 */
-	state.tuplesort = tuplesort_begin_datum(BYTEAOID, 
-											F_BYTEAGT,  /* bytea > operator */
-											InvalidOid, 
-											false,
-											maintenance_work_mem,
-											NULL, 
-											TUPLESORT_NONE);
+	state.tuplesort = tuplesort_begin_orioledb_index(GET_PRIMARY(descr),
+													 maintenance_work_mem,
+													 false,
+													 NULL);
 	state.htups = state.itups = state.tups_inserted = 0;
 
 	/*
@@ -1188,42 +1187,28 @@ orioledb_index_validate(Relation heapRelation,
 	/* Initialize snapshot for iteration */
 	O_LOAD_SNAPSHOT(&oSnapshot, snapshot);
 
-	/* Create a slot for extracting rowid - reuse it for all tuples */
-	slot = MakeSingleTupleTableSlot(descr->tupdesc, &TTSOpsOrioleDB);
-
 	/* Create iterator to scan all tuples in the index */
 	it = o_btree_iterator_create(&index_descr->desc, NULL, BTreeKeyNone,
 								 &oSnapshot, ForwardScanDirection);
 
-	/* Iterate through all tuples in the index and collect rowids */
+	/* Iterate through all tuples in the index and collect tuples for sorting */
 	while (true)
 	{
-		Datum		rowIdDatum;
-		bool		isnull;
-
-		/* Fetch next tuple */
+		/* Fetch next tuple from the index */
 		tuple = o_btree_iterator_fetch(it, &tupleCsn, NULL, BTreeKeyNone, false, NULL);
 
 		if (O_TUPLE_IS_NULL(tuple))
 			break;
 
-		/* Store tuple in slot to extract rowid */
-		tts_orioledb_store_tuple(slot, tuple, descr, tupleCsn,
-								 PrimaryIndexNumber, false, NULL);
-
-		/* Get rowid from slot */
-		rowIdDatum = slot_getsysattr(slot, RowIdAttributeNumber, &isnull);
-		Assert(!isnull);
-
-		/* Put rowid into tuplesort */
-		tuplesort_putdatum(state.tuplesort, rowIdDatum, false);
-
-		/* Clear slot for next iteration */
-		ExecClearTuple(slot);
+		/*
+		 * Put the tuple into the tuplesort. The tuplesort will sort these
+		 * tuples according to the primary key order, which is necessary for
+		 * the merge join in validate_scan.
+		 */
+		tuplesort_putotuple(state.tuplesort, tuple);
 	}
 
 	/* Clean up index scan resources */
-	ExecDropSingleTupleTableSlot(slot);
 	btree_iterator_free(it);
 
 	/* Execute the sort */
@@ -1272,23 +1257,16 @@ orioledb_index_validate(Relation heapRelation,
 
 static bool
 orioledb_validate_next_index_tid(Tuplesortstate *tuplesort,
-								 Datum *rowidDatum,
+								 OTuple *indexTuple,
 								 double *itups)
 {
-	Datum		tidAbbrev = 0;
-	bool		tidIsNull = false;
+	*indexTuple = tuplesort_getotuple(tuplesort, true);
+	
+	if (O_TUPLE_IS_NULL(*indexTuple))
+		return false;
 
-	while (tuplesort_getdatum(tuplesort, true, false,
-							  rowidDatum, &tidIsNull, &tidAbbrev))
-	{
-		if (tidIsNull)
-			continue;
-
-		(*itups)++;
-		return true;
-	}
-
-	return false;
+	(*itups)++;
+	return true;
 }
 
 static void
@@ -1310,12 +1288,14 @@ orioledb_index_validate_scan(Relation heapRelation,
 	ExprContext *econtext;
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
-	Datum		indexRowIdDatum = 0;
-	Datum		heapRowIdDatum;
-	bool		indexRowIdValid = false;
+	OTuple		indexTuple = {0};
+	OTuple		heapTuple;
+	bool		indexTupleValid = false;
 	bool		indexDone = false;
 	IndexUniqueCheck checkUnique;
 	OSnapshot	oSnapshot;
+	Datum		heapRowIdDatum;
+	bool		rowIdIsNull;
 
 	Assert(state != NULL);
 	Assert(state->tuplesort != NULL);
@@ -1338,8 +1318,6 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 	while (!O_TUPLE_IS_NULL(tup = btree_seq_scan_getnext(seq_scan, primarySlot->tts_mcxt, &tupleCsn, &hint)))
 	{
-		bool		rowIdIsNull;
-
 		oslot = (OTableSlot *) primarySlot;
 
 		tts_orioledb_store_tuple(primarySlot, tup, descr, tupleCsn, PrimaryIndexNumber, true, &hint);
@@ -1363,20 +1341,23 @@ orioledb_index_validate_scan(Relation heapRelation,
 					   values,
 					   isnull);
 
-		/* Get heap tuple's rowid for comparison */
+		/* Get heap tuple's rowid for comparison and insertion */
 		heapRowIdDatum = slot_getsysattr(primarySlot, RowIdAttributeNumber, &rowIdIsNull);
 		Assert(!rowIdIsNull);
+		
+		/* The heap tuple for comparison is the current primary key tuple */
+		heapTuple = tup;
 
 		for (;;)
 		{
 			int32		cmp;
 
-			if (!indexRowIdValid && !indexDone)
+			if (!indexTupleValid && !indexDone)
 			{
-				indexRowIdValid = orioledb_validate_next_index_tid(state->tuplesort,
-																   &indexRowIdDatum,
+				indexTupleValid = orioledb_validate_next_index_tid(state->tuplesort,
+																   &indexTuple,
 																   &state->itups);
-				if (!indexRowIdValid)
+				if (!indexTupleValid)
 					indexDone = true;
 			}
 
@@ -1388,11 +1369,17 @@ orioledb_index_validate_scan(Relation heapRelation,
 				break;
 			}
 
-			/* Merge index rowids with the heap scan to detect missing entries. */
-			cmp = datum_image_cmp(indexRowIdDatum, heapRowIdDatum, BYTEAOID, NULL, false);
+			/* 
+			 * Compare index tuple with heap tuple using the primary index's 
+			 * comparison function. This ensures we're comparing in the correct
+			 * primary key order.
+			 */
+			cmp = o_btree_cmp(&GET_PRIMARY(descr)->desc,
+							  indexTuple.data, BTreeKeyNonLeafKey,
+							  heapTuple.data, BTreeKeyNonLeafKey);
 			if (cmp < 0)
 			{
-				indexRowIdValid = false;
+				indexTupleValid = false;
 				continue;
 			}
 
@@ -1404,7 +1391,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 			}
 			else
 			{
-				indexRowIdValid = false;
+				indexTupleValid = false;
 			}
 			break;
 		}
