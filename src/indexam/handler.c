@@ -1012,10 +1012,14 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		 * instead of just an ItemPointer. The callback can then collect these
 		 * tuples (e.g., into a tuplesort) for validation purposes.
 		 * 
-		 * We store the tuple in callback_state for the callback to access.
+		 * We store the tuple and index descriptor in callback_state for the 
+		 * callback to access and extract the PK fields.
 		 */
 		if (callback_state)
+		{
 			((OValidateIndexState *) callback_state)->current_tuple = tuple;
+			((OValidateIndexState *) callback_state)->index_descr = index_descr;
+		}
 
 		/* Call the callback with a dummy ItemPointer */
 		ItemPointerSetInvalid(&itemptr);

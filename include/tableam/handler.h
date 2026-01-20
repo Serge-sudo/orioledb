@@ -233,8 +233,9 @@ typedef struct OValidateIndexState
 	double		itups;			/* # index tuples from ambulkdelete */
 	double		tups_inserted;	/* # missing tuples inserted */
 	
-	/* Orioledb-specific field */
+	/* Orioledb-specific fields */
 	OTuple		current_tuple;	/* Current tuple being processed by ambulkdelete */
+	OIndexDescr *index_descr;	/* Index descriptor for extracting PK from tuples */
 } OValidateIndexState;
 
 #endif
