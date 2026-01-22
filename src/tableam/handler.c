@@ -1405,7 +1405,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 		oslot = (OTableSlot *) primarySlot;
 
 		/* Fetch next tuple from iterator in PK order */
-		tup = o_btree_iterator_fetch(iterator, &tupleCsn, &hint, BTreeKeyNone, true, NULL);
+		tup = o_btree_iterator_fetch(iterator, &tupleCsn, NULL, BTreeKeyNone, true, &hint);
 		
 		if (O_TUPLE_IS_NULL(tup))
 			break;
