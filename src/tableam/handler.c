@@ -1258,7 +1258,6 @@ orioledb_index_validate_cleanup_old_concurrent(Relation heapRelation,
 											   Relation indexRelation)
 {
 	OTableDescr *descr;
-	OIndexNumber ix_num;
 	Oid			current_relfilenode;
 	int			i;
 	
@@ -1283,7 +1282,7 @@ orioledb_index_validate_cleanup_old_concurrent(Relation heapRelation,
 		if (idx_descr->desc.oids.reloid == indexRelation->rd_id &&
 			idx_descr->desc.oids.relnode != current_relfilenode)
 		{
-			ix_num = i;
+			OIndexNumber ix_num = i;
 			
 			elog(DEBUG1, "orioledb: cleaning up old concurrent index structure "
 				 "for index %s (old relfilenode %u, new relfilenode %u)",
