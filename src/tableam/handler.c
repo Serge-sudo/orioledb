@@ -1246,8 +1246,8 @@ orioledb_index_validate(Relation heapRelation,
  * explicit cleanup.
  *
  * This function finds and removes the old index structure that has a different
- * relfilenode than what's currently in pg_class. It should be called after
- * index validation completes successfully.
+ * relfilenode than what's currently in pg_class. It follows the same pattern
+ * as o_define_index's reindex path, scanning through indices by reloid.
  *
  * Parameters:
  *   heapRelation - The table relation
@@ -1257,45 +1257,54 @@ void
 orioledb_index_validate_cleanup_old_concurrent(Relation heapRelation,
 											   Relation indexRelation)
 {
-	OTableDescr *descr;
+	OTable	   *o_table;
+	ORelOids	oids;
 	Oid			current_relfilenode;
+	OIndexNumber ix_num;
 	int			i;
-	
-	/* Get the table descriptor */
-	descr = relation_get_descr(heapRelation);
-	if (descr == NULL)
-		return; /* Not an orioledb table */
-	
-	/* Get the current relfilenode from pg_class for this index */
+
+	/* Only process orioledb tables */
+	if (!is_orioledb_rel(heapRelation))
+		return;
+
+	ORelOidsSetFromRel(oids, heapRelation);
+	o_table = o_tables_get(oids);
+	if (o_table == NULL)
+		return;
+
+	/* Get the current relfilenode from pg_class for the validated index */
 	current_relfilenode = indexRelation->rd_rel->relfilenode;
-	
+
 	/*
-	 * Scan through all indices in the table descriptor to find any index
-	 * with the same reloid but different relfilenode. This would be the
-	 * old concurrent index structure that needs cleanup.
+	 * Scan through all indices to find the old one.
+	 * Similar logic to o_define_index's reindex path.
 	 */
-	for (i = 0; i < descr->nIndices; i++)
+	ix_num = InvalidIndexNumber;
+	for (i = 0; i < o_table->nindices; i++)
 	{
-		OIndexDescr *idx_descr = descr->indices[i];
-		
-		/* Check if this index has the same OID but different relfilenode */
-		if (idx_descr->desc.oids.reloid == indexRelation->rd_id &&
-			idx_descr->desc.oids.relnode != current_relfilenode)
+		/* Found an index with same reloid but different relfilenode - this is the old one */
+		if (o_table->indices[i].oids.reloid == indexRelation->rd_rel->oid &&
+			o_table->indices[i].oids.relnode != current_relfilenode)
 		{
-			OIndexNumber ix_num = i;
-			
-			elog(DEBUG1, "orioledb: cleaning up old concurrent index structure "
-				 "for index %s (old relfilenode %u, new relfilenode %u)",
-				 NameStr(indexRelation->rd_rel->relname),
-				 idx_descr->desc.oids.relnode,
-				 current_relfilenode);
-			
-			/* Drop the old index structure */
-			o_index_drop(heapRelation, ix_num);
-			
+			ix_num = i;
 			break;
 		}
 	}
+
+	if (ix_num != InvalidIndexNumber)
+	{
+		elog(DEBUG1, "orioledb_index_validate_cleanup_old_concurrent: "
+			 "dropping old concurrent index structure for reloid %u, "
+			 "old relfilenode %u, new relfilenode %u",
+			 o_table->indices[ix_num].oids.reloid,
+			 o_table->indices[ix_num].oids.relnode,
+			 current_relfilenode);
+
+		/* Drop the old index structure */
+		o_index_drop(heapRelation, ix_num);
+	}
+
+	o_table_free(o_table);
 }
 
 /*
