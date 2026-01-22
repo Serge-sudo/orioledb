@@ -312,6 +312,9 @@ orioledb_ambuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	{
 		ORelOids	tbl_oids;
 		OTable	   *o_table;
+		Form_pg_index original_rd_index = NULL;
+		Form_pg_index modified_rd_index = NULL;
+		bool		is_concurrent_primary_replacement = false;
 
 		ORelOidsSetFromRel(tbl_oids, heap);
 		o_table = o_tables_get(tbl_oids);
@@ -324,10 +327,72 @@ orioledb_ambuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		}
 		else
 		{
+			/*
+			 * For REINDEX CONCURRENTLY: PostgreSQL creates a temporary
+			 * concurrent index (e.g., name_ccnew) that is not marked as
+			 * primary. However, if this concurrent index is replacing a
+			 * primary index, we need to build it with all table columns,
+			 * not just the key columns.
+			 *
+			 * Detect this case by checking:
+			 * 1. Index is not marked as primary (!indisprimary)
+			 * 2. Table has a primary index (has_primary)
+			 * 3. Index name ends with "_ccnew" (concurrent index suffix)
+			 * 4. Base name matches the primary index name
+			 */
+			if (!index->rd_index->indisprimary && o_table->has_primary)
+			{
+				const char *index_name = NameStr(index->rd_rel->relname);
+				size_t		index_name_len = strlen(index_name);
+				const char *suffix = "_ccnew";
+				size_t		suffix_len = strlen(suffix);
+
+				/* Check if index name ends with "_ccnew" */
+				if (index_name_len > suffix_len &&
+					strcmp(index_name + index_name_len - suffix_len, suffix) == 0)
+				{
+					/* Get the base name without "_ccnew" suffix */
+					char	   *base_name = pnstrdup(index_name, index_name_len - suffix_len);
+					const char *primary_name = NameStr(o_table->indices[PrimaryIndexNumber].name);
+
+					/* Check if base name matches primary index name */
+					if (strcmp(base_name, primary_name) == 0)
+					{
+						is_concurrent_primary_replacement = true;
+
+						/*
+						 * Create a modified copy of Form_pg_index with indnatts
+						 * set to the number of table columns (like a primary index)
+						 * instead of just the key columns.
+						 */
+						modified_rd_index = (Form_pg_index) palloc(sizeof(FormData_pg_index));
+						memcpy(modified_rd_index, index->rd_index, sizeof(FormData_pg_index));
+						modified_rd_index->indnatts = heap->rd_att->natts;
+						modified_rd_index->indnkeyatts = heap->rd_att->natts;
+
+						/* Temporarily replace index->rd_index */
+						original_rd_index = index->rd_index;
+						index->rd_index = modified_rd_index;
+					}
+
+					pfree(base_name);
+				}
+			}
+
 			if (!in_nontransactional_truncate)
 				o_define_index_validate(tbl_oids, index, indexInfo, NULL);
 			o_define_index(heap, index, InvalidOid, reindex, InvalidIndexNumber, false, result);
+
+			/* Restore original index->rd_index if we modified it */
+			if (is_concurrent_primary_replacement && original_rd_index != NULL)
+			{
+				index->rd_index = original_rd_index;
+				pfree(modified_rd_index);
+			}
 		}
+
+		if (o_table)
+			o_table_free(o_table);
 	}
 
 	return result;
