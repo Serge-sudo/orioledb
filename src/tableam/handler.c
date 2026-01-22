@@ -1354,7 +1354,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 							 OValidateIndexState *state)
 {
 	OTableDescr *descr;
-	BTreeSeqScan *seq_scan;
+	BTreeIterator *iterator;
 	TupleTableSlot *primarySlot;
 	OTableSlot *oslot;
 	OTuple		tup;
@@ -1385,7 +1385,14 @@ orioledb_index_validate_scan(Relation heapRelation,
 	Assert(descr != NULL);
 
 	O_LOAD_SNAPSHOT(&oSnapshot, snapshot);
-	seq_scan = make_btree_seq_scan(&GET_PRIMARY(descr)->desc, &oSnapshot, NULL);
+	
+	/* 
+	 * Use iterator instead of sequential scan to ensure tuples are returned
+	 * in primary key order. This is essential for the merge join algorithm.
+	 */
+	iterator = o_btree_iterator_create(&GET_PRIMARY(descr)->desc, NULL, BTreeKeyNone,
+									   &oSnapshot, ForwardScanDirection);
+	
 	primarySlot = MakeSingleTupleTableSlot(descr->tupdesc, &TTSOpsOrioleDB);
 	econtext->ecxt_scantuple = primarySlot;
 
@@ -1393,9 +1400,15 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 	tuplesort_rescan(state->tuplesort);
 
-	while (!O_TUPLE_IS_NULL(tup = btree_seq_scan_getnext(seq_scan, primarySlot->tts_mcxt, &tupleCsn, &hint)))
+	while (true)
 	{
 		oslot = (OTableSlot *) primarySlot;
+
+		/* Fetch next tuple from iterator in PK order */
+		tup = o_btree_iterator_fetch(iterator, &tupleCsn, &hint, BTreeKeyNone, true, NULL);
+		
+		if (O_TUPLE_IS_NULL(tup))
+			break;
 
 		tts_orioledb_store_tuple(primarySlot, tup, descr, tupleCsn, PrimaryIndexNumber, true, &hint);
 		slot_getallattrs(primarySlot);
@@ -1408,6 +1421,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 			if (!ExecQual(predicate, econtext))
 			{
 				ExecClearTuple(primarySlot);
+				pfree(tup.data);
 				continue;
 			}
 		}
@@ -1474,11 +1488,12 @@ orioledb_index_validate_scan(Relation heapRelation,
 		}
 
 		ExecClearTuple(primarySlot);
+		pfree(tup.data);
 	}
 
 	ExecDropSingleTupleTableSlot(primarySlot);
 	FreeExecutorState(estate);
-	free_btree_seq_scan(seq_scan);
+	btree_iterator_free(iterator);
 }
 
 
