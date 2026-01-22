@@ -222,6 +222,12 @@ typedef ParallelOScanDescData *ParallelOScanDesc;
 extern bool in_nontransactional_truncate;
 
 /*
+ * Cleanup old concurrent index structure after validation
+ */
+extern void orioledb_index_validate_cleanup_old_concurrent(Relation heapRelation,
+														   Relation indexRelation);
+
+/*
  * State for orioledb index validation
  * Extends PostgreSQL's ValidateIndexState with orioledb-specific fields
  */

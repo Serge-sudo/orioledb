@@ -1237,6 +1237,69 @@ orioledb_index_validate(Relation heapRelation,
 }
 
 /*
+ * orioledb_index_validate_cleanup_old_concurrent - Cleanup old concurrent index
+ *
+ * During concurrent index creation (REINDEX CONCURRENTLY), PostgreSQL creates
+ * a new index with a temporary name suffix (_ccnew). After validation succeeds,
+ * the new index gets the original relfilenode and the old index structure should
+ * be removed. However, orioledb maintains its own index structures that need
+ * explicit cleanup.
+ *
+ * This function finds and removes the old index structure that has a different
+ * relfilenode than what's currently in pg_class. It should be called after
+ * index validation completes successfully.
+ *
+ * Parameters:
+ *   heapRelation - The table relation
+ *   indexRelation - The new (validated) index relation with updated relfilenode
+ */
+void
+orioledb_index_validate_cleanup_old_concurrent(Relation heapRelation,
+											   Relation indexRelation)
+{
+	OTableDescr *descr;
+	OIndexNumber ix_num;
+	Oid			current_relfilenode;
+	int			i;
+	
+	/* Get the table descriptor */
+	descr = relation_get_descr(heapRelation);
+	if (descr == NULL)
+		return; /* Not an orioledb table */
+	
+	/* Get the current relfilenode from pg_class for this index */
+	current_relfilenode = indexRelation->rd_rel->relfilenode;
+	
+	/*
+	 * Scan through all indices in the table descriptor to find any index
+	 * with the same reloid but different relfilenode. This would be the
+	 * old concurrent index structure that needs cleanup.
+	 */
+	for (i = 0; i < descr->nIndices; i++)
+	{
+		OIndexDescr *idx_descr = descr->indices[i];
+		
+		/* Check if this index has the same OID but different relfilenode */
+		if (idx_descr->desc.oids.reloid == indexRelation->rd_id &&
+			idx_descr->desc.oids.relnode != current_relfilenode)
+		{
+			ix_num = i;
+			
+			elog(DEBUG1, "orioledb: cleaning up old concurrent index structure "
+				 "for index %s (old relfilenode %u, new relfilenode %u)",
+				 NameStr(indexRelation->rd_rel->relname),
+				 idx_descr->desc.oids.relnode,
+				 current_relfilenode);
+			
+			/* Drop the old index structure */
+			o_index_drop(heapRelation, ix_num);
+			
+			break;
+		}
+	}
+}
+
+/*
  * debug_print_validate_tuple - Debug function to print tuple before adding to tuplesort
  *
  * This function prints the tuple data in readable format for debugging purposes 
