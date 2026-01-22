@@ -418,13 +418,6 @@ o_define_index(Relation heap, Relation index, Oid indoid, bool reindex,
 		Assert(options->orioledb_index);
 	}
 
-	if (index->rd_index->indisprimary)
-		ix_type = oIndexPrimary;
-	else if (index->rd_index->indisunique)
-		ix_type = oIndexUnique;
-	else
-		ix_type = oIndexRegular;
-
 	indnatts = index->rd_index->indnatts;
 	indnkeyatts = index->rd_index->indnkeyatts;
 	tablespace = index->rd_rel->reltablespace;
@@ -456,6 +449,21 @@ o_define_index(Relation heap, Relation index, Oid indoid, bool reindex,
 			reindex = ix_num != InvalidIndexNumber &&
 				ix_num < o_table->nindices;
 
+			/*
+			 * For reindex, use the type from the old index being replaced,
+			 * not from the new concurrent index which is always secondary.
+			 * This is important for REINDEX CONCURRENTLY where PostgreSQL
+			 * creates a temporary index that is not marked as primary.
+			 */
+			if (reindex && ix_num != InvalidIndexNumber)
+				ix_type = o_table->indices[ix_num].type;
+			else if (index->rd_index->indisprimary)
+				ix_type = oIndexPrimary;
+			else if (index->rd_index->indisunique)
+				ix_type = oIndexUnique;
+			else
+				ix_type = oIndexRegular;
+
 			o_index_drop(heap, ix_num);
 
 			if (ix_type == oIndexPrimary)
@@ -478,6 +486,14 @@ o_define_index(Relation heap, Relation index, Oid indoid, bool reindex,
 		else
 		{
 			ORelOids	primary_oids;
+
+			/* Normal index creation - determine type from index properties */
+			if (index->rd_index->indisprimary)
+				ix_type = oIndexPrimary;
+			else if (index->rd_index->indisunique)
+				ix_type = oIndexUnique;
+			else
+				ix_type = oIndexRegular;
 
 			primary_oids = ix_type == oIndexPrimary ||
 				!old_o_table->has_primary ?
