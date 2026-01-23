@@ -228,6 +228,56 @@ extern void orioledb_index_validate_cleanup_old_concurrent(Relation heapRelation
 														   Relation indexRelation);
 
 /*
+ * Hooks for REINDEX CONCURRENTLY stages to synchronize orioledb system trees
+ * with PostgreSQL's system catalogs (pg_index).
+ *
+ * These functions should be called from PostgreSQL's reindex concurrent logic
+ * at the appropriate stages to keep orioledb's metadata synchronized.
+ *
+ * Usage in PostgreSQL's REINDEX CONCURRENTLY code:
+ *
+ * 1. After marking old index as dead (indislive=false):
+ *    orioledb_reindex_concurrent_set_dead(heapRel, oldIndexRel, newIndexRel);
+ *
+ * 2. After swapping relfilenodes in pg_class:
+ *    orioledb_reindex_concurrent_swap(heapRel, oldIndexRel, newIndexRel);
+ *
+ * 3. After marking new index as valid (indisvalid=true):
+ *    orioledb_reindex_concurrent_set_valid(heapRel, oldIndexRel, newIndexRel);
+ *
+ * 4. After marking old index as invalid:
+ *    orioledb_reindex_concurrent_set_invalid(heapRel, oldIndexRel, newIndexRel);
+ *
+ * 5. During final cleanup:
+ *    orioledb_reindex_concurrent_cleanup(heapRel, oldIndexRel, newIndexRel);
+ */
+
+/* Mark old index as dead (stage 1) */
+extern void orioledb_reindex_concurrent_set_dead(Relation heapRelation,
+												  Relation oldIndex,
+												  Relation newIndex);
+
+/* Swap relfilenodes between old and new index (stage 2) */
+extern void orioledb_reindex_concurrent_swap(Relation heapRelation,
+											  Relation oldIndex,
+											  Relation newIndex);
+
+/* Mark new index as valid (stage 3) */
+extern void orioledb_reindex_concurrent_set_valid(Relation heapRelation,
+												   Relation oldIndex,
+												   Relation newIndex);
+
+/* Mark old index as invalid (stage 4) */
+extern void orioledb_reindex_concurrent_set_invalid(Relation heapRelation,
+													 Relation oldIndex,
+													 Relation newIndex);
+
+/* Final cleanup of old index structure (stage 5) */
+extern void orioledb_reindex_concurrent_cleanup(Relation heapRelation,
+												 Relation oldIndex,
+												 Relation newIndex);
+
+/*
  * State for orioledb index validation
  * Extends PostgreSQL's ValidateIndexState with orioledb-specific fields
  */
