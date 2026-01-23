@@ -234,45 +234,69 @@ extern void orioledb_index_validate_cleanup_old_concurrent(Relation heapRelation
  * These functions should be called from PostgreSQL's reindex concurrent logic
  * at the appropriate stages to keep orioledb's metadata synchronized.
  *
- * Usage in PostgreSQL's REINDEX CONCURRENTLY code:
- *
- * 1. After marking old index as dead (indislive=false):
- *    orioledb_reindex_concurrent_set_dead(heapRel, oldIndexRel, newIndexRel);
- *
- * 2. After swapping relfilenodes in pg_class:
- *    orioledb_reindex_concurrent_swap(heapRel, oldIndexRel, newIndexRel);
- *
- * 3. After marking new index as valid (indisvalid=true):
- *    orioledb_reindex_concurrent_set_valid(heapRel, oldIndexRel, newIndexRel);
- *
- * 4. After marking old index as invalid:
- *    orioledb_reindex_concurrent_set_invalid(heapRel, oldIndexRel, newIndexRel);
- *
- * 5. During final cleanup:
- *    orioledb_reindex_concurrent_cleanup(heapRel, oldIndexRel, newIndexRel);
+ * General function for setting any combination of index state flags:
  */
 
-/* Mark old index as dead (stage 1) */
+/*
+ * Flags for index state synchronization with PostgreSQL's pg_index
+ * These correspond to indislive, indisready, and indisvalid in pg_index
+ */
+typedef struct IndexStateFlags
+{
+	bool		set_live;		/* Set or clear indislive flag */
+	bool		live_value;		/* Value for indislive */
+	bool		set_ready;		/* Set or clear indisready flag */
+	bool		ready_value;	/* Value for indisready */
+	bool		set_valid;		/* Set or clear indisvalid flag */
+	bool		valid_value;	/* Value for indisvalid */
+} IndexStateFlags;
+
+/*
+ * General function for setting index state flags.
+ * Call this AFTER updating pg_index with the corresponding flags.
+ * 
+ * Example:
+ *   IndexStateFlags flags = {0};
+ *   flags.set_ready = true;
+ *   flags.ready_value = true;
+ *   flags.set_valid = true;
+ *   flags.valid_value = true;
+ *   orioledb_index_set_state_flags(heapRel, indexRel, &flags);
+ */
+extern void orioledb_index_set_state_flags(Relation heapRelation,
+											Relation indexRelation,
+											IndexStateFlags *flags);
+
+/*
+ * Convenience wrappers for common operations:
+ */
+
+/* Set indisready flag */
+extern void orioledb_reindex_concurrent_set_ready(Relation heapRelation,
+												   Relation indexRelation,
+												   bool ready);
+
+/* Mark old index as dead (indislive=false) */
 extern void orioledb_reindex_concurrent_set_dead(Relation heapRelation,
 												  Relation oldIndex,
 												  Relation newIndex);
 
-/* Swap relfilenodes between old and new index (stage 2) */
+/* Swap relfilenodes between old and new index */
 extern void orioledb_reindex_concurrent_swap(Relation heapRelation,
 											  Relation oldIndex,
 											  Relation newIndex);
 
-/* Mark new index as valid (stage 3) */
+/* Mark new index as valid (indisvalid=true) */
 extern void orioledb_reindex_concurrent_set_valid(Relation heapRelation,
 												   Relation oldIndex,
 												   Relation newIndex);
 
-/* Mark old index as invalid (stage 4) */
+/* Mark old index as invalid (indisvalid=false) */
 extern void orioledb_reindex_concurrent_set_invalid(Relation heapRelation,
 													 Relation oldIndex,
 													 Relation newIndex);
 
-/* Final cleanup of old index structure (stage 5) */
+/* Final cleanup of old index structure */
 extern void orioledb_reindex_concurrent_cleanup(Relation heapRelation,
 												 Relation oldIndex,
 												 Relation newIndex);
