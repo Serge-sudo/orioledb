@@ -145,11 +145,16 @@ orioledb_reindex_concurrent_swap(Relation heapRelation,
 	OIndexNumber new_ix_num = InvalidIndexNumber;
 	int			i;
 	OXid		oxid = get_current_oxid();
-	CommitSeqNo csn = COMMITSEQNO_INPROGRESS;
+	OSnapshot	oSnapshot;
+	CommitSeqNo csn;
 
 	/* Only process orioledb tables */
 	if (!is_orioledb_rel(heapRelation))
 		return;
+
+	/* Get current snapshot and use its CommitSeqNo for persistent updates */
+	O_LOAD_SNAPSHOT(&oSnapshot, GetActiveSnapshot());
+	csn = oSnapshot.csn;
 
 	ORelOidsSetFromRel(oids, heapRelation);
 	o_table = o_tables_get(oids);
