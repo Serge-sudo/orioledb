@@ -202,7 +202,14 @@ orioledb_reindex_concurrent_swap(Relation heapRelation,
 		new_index_oids = o_table->indices[new_ix_num].oids;
 
 		/*
-		 * Add invalidation undo items to ensure cached descriptors are
+		 * Immediately invalidate cached descriptors for both indices.
+		 * This ensures any cached descriptors are invalidated right away.
+		 */
+		o_invalidate_oids(old_index_oids);
+		o_invalidate_oids(new_index_oids);
+
+		/*
+		 * Add invalidation undo items to ensure cached descriptors stay
 		 * invalidated on commit. This ensures the relfilenode swap persists
 		 * beyond the transaction and orioledb's system trees stay synchronized
 		 * with PostgreSQL's pg_class.
