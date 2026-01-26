@@ -180,10 +180,6 @@ orioledb_reindex_concurrent_swap(Relation heapRelation,
 			 o_table->indices[new_ix_num].oids.relnode,
 			 newIndex->rd_rel->relfilenode);
 
-		/* Save the ORelOids for invalidation */
-		old_index_oids = o_table->indices[old_ix_num].oids;
-		new_index_oids = o_table->indices[new_ix_num].oids;
-
 		/*
 		 * Swap the relfilenodes in our structures to match what
 		 * PostgreSQL just did in pg_class.
@@ -196,13 +192,20 @@ orioledb_reindex_concurrent_swap(Relation heapRelation,
 		o_indices_update(o_table, new_ix_num, oxid, csn);
 
 		/*
+		 * Save the ORelOids AFTER the swap for invalidation.
+		 * This is critical: we need to invalidate based on the POST-SWAP
+		 * identifiers so the invalidation system can correctly find and
+		 * invalidate the updated structures. Using pre-swap ORelOids would
+		 * cause the invalidation to target the wrong structures.
+		 */
+		old_index_oids = o_table->indices[old_ix_num].oids;
+		new_index_oids = o_table->indices[new_ix_num].oids;
+
+		/*
 		 * Add invalidation undo items to ensure cached descriptors are
-		 * invalidated on commit. This is critical because the relfilenode
-		 * swap must persist beyond the transaction - PostgreSQL's swap
-		 * in pg_class is permanent and our system tree must stay synchronized.
-		 *
-		 * We invalidate using the ORelOids we saved before the swap to ensure
-		 * we invalidate based on the original structure identifiers.
+		 * invalidated on commit. This ensures the relfilenode swap persists
+		 * beyond the transaction and orioledb's system trees stay synchronized
+		 * with PostgreSQL's pg_class.
 		 */
 		o_add_invalidate_undo_item(old_index_oids, O_INVALIDATE_OIDS_ON_COMMIT);
 		o_add_invalidate_undo_item(new_index_oids, O_INVALIDATE_OIDS_ON_COMMIT);
