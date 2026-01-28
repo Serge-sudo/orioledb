@@ -69,9 +69,11 @@ For a snapshot with CSN=101:
 ### CSN in Tuple Headers
 
 Every tuple version has a CSN that indicates when it became visible:
-- **COMMITSEQNO_INPROGRESS**: Transaction is still in progress
-- **Specific CSN value**: Transaction committed at this CSN
-- **COMMITSEQNO_ABORTED**: Transaction was aborted
+- **COMMITSEQNO_INPROGRESS**: A special value indicating the transaction is still in progress
+- **Specific CSN value**: The actual commit sequence number when the transaction committed
+- **Aborted transactions**: Special handling for rolled-back transactions
+
+Note: `CommitSeqNo` is a 64-bit unsigned integer type (`uint64`) that PostgreSQL uses for global transaction ordering.
 
 ## Undo Log Architecture
 
@@ -111,7 +113,8 @@ OrioleDB has two main categories of undo records:
 Block-level undo records store entire page images and are used when space management requires page reorganization:
 
 - **Compact undo record**: Stores one page image before compaction
-  - Created when deleted tuples need to be removed to make space
+  - Created when the page needs to be compacted to reclaim space from deleted tuples
+  - Enables insertion or updating of tuples when there isn't enough contiguous space
   - Size: `ORIOLEDB_BLCKSZ + header`
 
 - **Split undo record**: Stores one page image before split
@@ -422,9 +425,9 @@ OrioleDB uses **row-level WAL** and only logs:
 
 - During recovery, secondary indexes are reconstructed from TOAST and primary key changes
 - This is possible because secondary keys are derived from primary key data
-- A "TOAST consistency point" marks when secondary index updates begin
+- During checkpointing, a "TOAST consistency point" marks the WAL position after primary key checkpointing completes
 
-Recovery process:
+Recovery process (see [Recovery & Replication](./recovery.mdx) for full details):
 ```
 Before TOAST consistency point:
   - Apply WAL only to TOAST and primary key
@@ -436,9 +439,9 @@ After TOAST consistency point:
 ```
 
 This design:
-- Reduces WAL volume significantly
+- Reduces WAL volume significantly (secondary indexes are not logged)
 - Enables efficient parallel recovery
-- Maintains index consistency through structural checkpoints
+- Maintains index consistency through copy-on-write checkpoints
 
 ## Summary
 
