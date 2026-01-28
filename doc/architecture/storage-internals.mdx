@@ -301,6 +301,24 @@ OrioleDB stores data in **index-organized tables**:
 - **Primary key index**: Contains the full table rows as leaf tuples
 - **Secondary indexes**: Contain secondary key columns + primary key columns
 
+All indexes (primary, TOAST, and secondary) are B-trees that use the **same storage infrastructure**:
+- All use `UndoLogRegular` for undo log management
+- All support page compaction and page splits/merges
+- All maintain MVCC visibility through tuple headers
+
+However, **secondary indexes handle undo logs differently** from the primary index:
+
+**Primary Index & TOAST**:
+- Create undo records for updates and deletes (via `needs_undo` callback)
+- Maintain version chains in the undo log
+- Full MVCC visibility support with rollback capability
+
+**Secondary Indexes**:
+- Do **NOT** create row-level undo records for DML operations (`needs_undo = NULL`)
+- Use only **page-level undo records** (compact, split, merge) for structural changes
+- Updates/deletes are idempotent operations (safe to replay)
+- Simpler lifecycle: entries are simply deleted and reinserted
+
 Example:
 ```sql
 CREATE TABLE vegetables (
@@ -389,8 +407,10 @@ When a tuple is deleted:
 For each secondary index:
 
 1. **Delete the corresponding entry** (secondary key + PK)
-2. **Create undo record** for rollback
+2. **Mark entry as deleted** (similar to primary index)
 3. **Same vacated space management** as primary index
+
+Note: Secondary indexes don't create row-level undo records (see [Secondary Index Undo and Page Operations](#secondary-index-undo-and-page-operations) below).
 
 ### Following the Update Chain
 
@@ -412,6 +432,91 @@ This happens because:
 3. It "sees through" the delete/insert pair and updates the newly inserted tuple
 
 This is considered a feature for MVCC consistency, though it may be surprising behavior.
+
+### Secondary Index Undo and Page Operations
+
+While all OrioleDB indexes use the same B-tree infrastructure, **secondary indexes have a simplified undo model**:
+
+#### What Secondary Indexes DO Use
+
+1. **Page-level undo records**: Just like primary indexes
+   - **Compact undo**: When page needs compaction to reclaim space
+   - **Split undo**: When page splits into two pages
+   - **Merge undo**: When two sparse pages merge into one
+   
+2. **Same page management**: 
+   - Page compaction works identically
+   - Page splits and merges follow the same logic
+   - Vacated space tracking (deleted entries)
+   - Page state management and locking
+
+3. **MVCC visibility**: Secondary index entries have tuple headers with:
+   - Transaction info (xactInfo)
+   - CSN for visibility checks
+   - Deleted flag
+
+#### What Secondary Indexes DON'T Use
+
+Secondary indexes **do NOT create row-level undo records**:
+
+```c
+// From src/tableam/tree.c
+secondaryOps = {
+    .needs_undo = NULL,  // No row-level undo for secondary indexes
+    // ... other operations
+}
+```
+
+This means:
+- No undo chains for individual index entries
+- No version history stored in undo log for updates/deletes
+- Simpler rollback: just remove the entry (idempotent)
+
+#### Why This Design?
+
+This simplified model works because:
+
+1. **Idempotent operations**: Secondary index updates are DELETE + INSERT
+   - Safe to replay during recovery
+   - No need to track intermediate versions
+
+2. **Reconstructable from primary**: Secondary indexes can always be rebuilt from primary key + TOAST
+   - During recovery, reconstructed after "TOAST consistency point"
+   - See [Recovery & Replication](./recovery.mdx) for details
+
+3. **Reduced WAL volume**: Secondary indexes aren't WAL-logged
+   - Only structural changes (via page-level undo)
+   - DML changes derived from primary key during recovery
+
+4. **Better performance**: Less undo log overhead
+   - Fewer undo records to write
+   - Faster transaction commits
+   - Simpler rollback logic
+
+#### Example: Update Affecting Secondary Index
+
+```sql
+UPDATE vegetables SET count = 15 WHERE id = 1;
+```
+
+What happens:
+
+**Primary index (id)**:
+1. Find tuple with id=1
+2. Create row-level undo record (old: count=10, csn=100)
+3. Update in place: count=15, csn=102
+4. If page needs space: create page-level compact undo
+
+**Secondary index (count, id)**:
+1. DELETE old entry: [count=10, id=1]
+   - Mark as deleted (no row-level undo)
+   - Track vacated space
+2. INSERT new entry: [count=15, id=1]
+   - Use available space (or compact if needed)
+   - If compact needed: create page-level compact undo
+3. Page operations (compact/split/merge) work identically to primary index
+
+The key difference: step 1 doesn't create a row-level undo record. If the transaction rolls back, the secondary index simply removes the new entry and undeletes the old one (structurally, not via undo chain traversal).
 
 ### WAL Logging for Indexes
 
