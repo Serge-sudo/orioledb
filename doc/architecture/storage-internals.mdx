@@ -5,7 +5,7 @@ sidebar_label: Storage Internals
 
 # OrioleDB Storage Internals: MVCC, CSN, and Undo Logs
 
-This document provides a detailed analysis of how OrioleDB storage works, focusing on Multi-Version Concurrency Control (MVCC), Commit Sequence Numbers (CSN), undo log management, and how updates and deletes affect indexes.
+This document provides a detailed analysis of how OrioleDB storage works, covering MVCC implementation, Commit Sequence Numbers (CSN), undo log management, and index behavior during updates and deletes.
 
 ## Table of Contents
 
@@ -23,7 +23,7 @@ OrioleDB implements Multi-Version Concurrency Control (MVCC) using an **undo log
 ### Key Differences from PostgreSQL
 
 - **No tuple bloat in main storage**: In PostgreSQL, old tuple versions remain in the heap until VACUUM removes them. In OrioleDB, old versions are moved to the undo log, keeping the main B-tree clean.
-- **No dedicated VACUUM needed**: The undo log approach eliminates the need for dedicated garbage collection processes.
+- **No dedicated VACUUM process needed**: The undo log approach eliminates the need for dedicated garbage collection processes.
 - **Page-level undo records**: Allow the system to reclaim space occupied by deleted tuples as soon as they're no longer needed by any transaction or snapshot.
 
 ### MVCC Implementation Details
@@ -55,7 +55,7 @@ A **Commit Sequence Number (CSN)** is a monotonically increasing 64-bit integer 
 
 ### How CSN Works with MVCC
 
-```
+```sql
 Transaction 1 (CSN=100): INSERT INTO table VALUES (1, 'a');
 Transaction 2 (CSN=101): UPDATE table SET val='b' WHERE id=1;
 Transaction 3 (CSN=102): DELETE FROM table WHERE id=1;
@@ -73,7 +73,7 @@ Every tuple version has a CSN that indicates when it became visible:
 - **Specific CSN value**: The actual commit sequence number when the transaction committed
 - **Aborted transactions**: Special handling for rolled-back transactions
 
-Note: `CommitSeqNo` is a 64-bit unsigned integer type (`uint64`) that PostgreSQL uses for global transaction ordering.
+Note: `CommitSeqNo` is a 64-bit unsigned integer type (`uint64`) that OrioleDB uses for global transaction ordering.
 
 ## Undo Log Architecture
 
@@ -88,7 +88,7 @@ The undo log is a critical component of OrioleDB's storage architecture. It stor
 
 Each tuple in the main B-tree has a pointer to its previous version in the undo log. These form **chains** of tuple versions:
 
-```
+```text
 Main B-tree page:
   Tuple (CSN=103, undoLocation=L1)
       ↓
@@ -136,9 +136,8 @@ Each transaction has its own undo chain linking all changes made by that transac
 
 ### Example: Update Operation
 
-When a tuple is updated:
+When a tuple is updated, the following process occurs:
 
-```
 1. Check if tuple has enough space for update
 2. If space is sufficient:
    - Create row-level undo record with old tuple version
@@ -149,7 +148,6 @@ When a tuple is updated:
    - Create page-level compact undo record (entire page image)
    - Compact page (remove deleted tuples)
    - Insert/update tuple with new size
-```
 
 ## Undo Log Storage
 
@@ -163,7 +161,7 @@ OrioleDB stores undo logs in a **hybrid approach** combining in-memory buffers a
 - **Purpose**: Provides fastest access to recent undo records
 - **Operation**: Works as a circular buffer that wraps around when reaching the end
 
-```
+```text
 Circular buffer layout:
 [retained undo records | free space | new undo records]
                         ↑            ↑
@@ -250,7 +248,7 @@ If there's not enough contiguous space but enough total free space (deleted tupl
 This is why the compact undo record is important - it allows rollback even after page structure changes.
 
 Example from the documentation:
-```
+```text
 Before compaction:
 Page contains: [t1, t2, t3 (deleted), t4 (deleted)]
 Need to insert: t5 (large)
@@ -313,7 +311,7 @@ CREATE INDEX idx_count ON vegetables(count);
 ```
 
 Storage structure:
-```
+```text
 Primary index (id):
   Leaf tuples: [id=1, name='Tomato', count=10]
                [id=2, name='Cucumber', count=3]
@@ -330,12 +328,12 @@ Secondary index (count, id):
 Updates to the primary key are **special** because they change the tuple's position in the primary index:
 
 1. **Implemented as DELETE + INSERT**:
-   ```
+   ```sql
    UPDATE table SET id = 2 WHERE id = 1;
    
-   Becomes:
-   DELETE old tuple (id=1)
-   INSERT new tuple (id=2)
+   -- Becomes:
+   -- DELETE old tuple (id=1)
+   -- INSERT new tuple (id=2)
    ```
 
 2. **Concurrent operations may fail**:
@@ -428,7 +426,7 @@ OrioleDB uses **row-level WAL** and only logs:
 - During checkpointing, a "TOAST consistency point" marks the WAL position after primary key checkpointing completes
 
 Recovery process (see [Recovery & Replication](./recovery.mdx) for full details):
-```
+```text
 Before TOAST consistency point:
   - Apply WAL only to TOAST and primary key
   - Secondary indexes already contain these changes (from checkpoint)
