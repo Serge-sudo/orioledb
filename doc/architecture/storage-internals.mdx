@@ -15,6 +15,7 @@ This document provides a detailed analysis of how OrioleDB storage works, coveri
 4. [Undo Log Storage](#undo-log-storage)
 5. [Tuple Updates and Size Changes](#tuple-updates-and-size-changes)
 6. [How Updates and Deletes Affect Indexes](#how-updates-and-deletes-affect-indexes)
+7. [VACUUM Behavior](#vacuum-behavior)
 
 ## MVCC Overview
 
@@ -465,3 +466,82 @@ This architecture makes OrioleDB particularly well-suited for:
 - Write-heavy workloads (no bloat accumulation)
 - Replication (compact row-level WAL)
 - Modern hardware (lock-free algorithms, optimized page structure)
+
+## VACUUM Behavior
+
+### What Happens When VACUUM Runs on OrioleDB Tables?
+
+Unlike traditional PostgreSQL tables, OrioleDB tables **do not require regular VACUUM** for routine maintenance because:
+
+1. **No tuple bloat**: Old tuple versions are moved to the undo log, not left in the main B-tree
+2. **Automatic space reclamation**: Page-level undo records and page merging eliminate bloat automatically
+3. **No dead tuple accumulation**: The undo log retention is managed based on active transactions and snapshots
+
+### Regular VACUUM
+
+When you run `VACUUM` (without `FULL`) on an OrioleDB table:
+
+```sql
+VACUUM my_orioledb_table;
+```
+
+**Result**: The command runs successfully but performs **minimal work**:
+- Only cleans up **bridged indexes** if index bridging is enabled
+- Does NOT scan the table for dead tuples (there are none in the main storage)
+- Does NOT compact pages (handled automatically by page compaction)
+- Essentially a no-op for regular OrioleDB tables without bridging
+
+Implementation (from `src/tableam/handler.c`):
+```c
+/*
+ * We do VACUUM only to cleanup bridged indexes.
+ */
+if (!descr->bridge || params->index_cleanup == VACOPTVALUE_DISABLED)
+    return;
+
+orioledb_vacuum_bridged_indexes(onerel, descr, params, bstrategy);
+```
+
+### VACUUM FULL
+
+`VACUUM FULL` is **NOT supported** for OrioleDB tables:
+
+```sql
+VACUUM FULL my_orioledb_table;
+-- ERROR: orioledb table "my_orioledb_table" does not support VACUUM FULL
+-- DETAIL: VACUUM FULL is not supported for OrioleDB tables yet.
+```
+
+**Why?** `VACUUM FULL` requires rewriting the entire table, which:
+- Doesn't make sense for index-organized tables (data is already organized by the primary key)
+- Would require reimplementing complex table rewrite logic
+- Isn't necessary due to OrioleDB's architecture preventing bloat
+
+### ANALYZE
+
+`ANALYZE` works normally on OrioleDB tables to gather statistics for query planning:
+
+```sql
+ANALYZE my_orioledb_table;
+```
+
+This is important for maintaining optimal query performance and is recommended to run periodically.
+
+### Practical Implications
+
+1. **No vacuum scheduling needed**: Remove OrioleDB tables from your vacuum scheduling scripts
+2. **Autovacuum still runs**: But exits quickly after determining no work is needed
+3. **Index bridging caveat**: If you use index bridging (for non-OrioleDB indexes), regular vacuum is beneficial for those indexes
+4. **Monitor undo log size**: Instead of monitoring bloat, monitor undo log retention with long-running transactions
+
+### Comparison with PostgreSQL
+
+| Aspect | PostgreSQL (heap) | OrioleDB |
+|--------|------------------|----------|
+| Dead tuples | Accumulate in heap | Moved to undo log |
+| VACUUM needed | Yes, regularly | No (except bridged indexes) |
+| VACUUM FULL | Supported | Not supported |
+| Bloat management | Manual (VACUUM) | Automatic |
+| Long transactions | Cause heap bloat | Increase undo log retention |
+
+This fundamental difference eliminates one of the most common operational challenges with PostgreSQL databases.
