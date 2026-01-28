@@ -1,0 +1,466 @@
+---
+id: storage-internals
+sidebar_label: Storage Internals
+---
+
+# OrioleDB Storage Internals: MVCC, CSN, and Undo Logs
+
+This document provides a detailed analysis of how OrioleDB storage works, focusing on Multi-Version Concurrency Control (MVCC), Commit Sequence Numbers (CSN), undo log management, and how updates and deletes affect indexes.
+
+## Table of Contents
+
+1. [MVCC Overview](#mvcc-overview)
+2. [Commit Sequence Numbers (CSN)](#commit-sequence-numbers-csn)
+3. [Undo Log Architecture](#undo-log-architecture)
+4. [Undo Log Storage](#undo-log-storage)
+5. [Tuple Updates and Size Changes](#tuple-updates-and-size-changes)
+6. [How Updates and Deletes Affect Indexes](#how-updates-and-deletes-affect-indexes)
+
+## MVCC Overview
+
+OrioleDB implements Multi-Version Concurrency Control (MVCC) using an **undo log-based approach**, which is fundamentally different from PostgreSQL's traditional heap storage:
+
+### Key Differences from PostgreSQL
+
+- **No tuple bloat in main storage**: In PostgreSQL, old tuple versions remain in the heap until VACUUM removes them. In OrioleDB, old versions are moved to the undo log, keeping the main B-tree clean.
+- **No dedicated VACUUM needed**: The undo log approach eliminates the need for dedicated garbage collection processes.
+- **Page-level undo records**: Allow the system to reclaim space occupied by deleted tuples as soon as they're no longer needed by any transaction or snapshot.
+
+### MVCC Implementation Details
+
+Each tuple in OrioleDB has a header (`BTreeLeafTuphdr`) that contains:
+
+- **xactInfo**: Transaction information identifying which transaction created/modified the tuple
+- **csn**: Commit Sequence Number indicating when the transaction committed
+- **undoLocation**: Pointer to the previous version of the tuple in the undo log
+- **deleted**: Flag indicating if the tuple is deleted
+- **formatFlags**: Metadata about tuple format
+
+When a transaction reads a tuple, it checks:
+1. If the tuple's CSN is less than or equal to the snapshot's CSN → tuple is visible
+2. If the tuple was created by an in-progress transaction → follow the undo chain to find a visible version
+3. If no visible version exists → tuple is not visible to this snapshot
+
+## Commit Sequence Numbers (CSN)
+
+### What is CSN?
+
+A **Commit Sequence Number (CSN)** is a monotonically increasing 64-bit integer assigned to each transaction when it commits. CSNs provide a global ordering of transactions and enable efficient visibility checks.
+
+### Key Properties
+
+1. **Global ordering**: CSNs establish a total order of transaction commits across the entire database
+2. **64-bit identifiers**: Unlike PostgreSQL's 32-bit XIDs, OrioleDB uses 64-bit CSNs, eliminating wraparound problems
+3. **Assigned at commit time**: Transactions receive their CSN only when they commit, not when they start
+
+### How CSN Works with MVCC
+
+```
+Transaction 1 (CSN=100): INSERT INTO table VALUES (1, 'a');
+Transaction 2 (CSN=101): UPDATE table SET val='b' WHERE id=1;
+Transaction 3 (CSN=102): DELETE FROM table WHERE id=1;
+```
+
+For a snapshot with CSN=101:
+- The tuple modified by Transaction 1 (CSN=100) is visible
+- The tuple modified by Transaction 2 (CSN=101) is visible
+- The tuple modified by Transaction 3 (CSN=102) is NOT visible
+
+### CSN in Tuple Headers
+
+Every tuple version has a CSN that indicates when it became visible:
+- **COMMITSEQNO_INPROGRESS**: Transaction is still in progress
+- **Specific CSN value**: Transaction committed at this CSN
+- **COMMITSEQNO_ABORTED**: Transaction was aborted
+
+## Undo Log Architecture
+
+### Core Concept
+
+The undo log is a critical component of OrioleDB's storage architecture. It stores previous versions of tuples, allowing:
+1. **Transaction rollback**: Revert changes if a transaction aborts
+2. **MVCC visibility**: Provide older versions of tuples for concurrent transactions
+3. **Recovery**: Rollback in-progress transactions during crash recovery
+
+### Undo Chain Structure
+
+Each tuple in the main B-tree has a pointer to its previous version in the undo log. These form **chains** of tuple versions:
+
+```
+Main B-tree page:
+  Tuple (CSN=103, undoLocation=L1)
+      ↓
+Undo log:
+  L1: Previous tuple header (CSN=102, undoLocation=L2)
+      ↓
+  L2: Previous tuple header (CSN=101, undoLocation=Invalid)
+```
+
+### Types of Undo Records
+
+OrioleDB has two main categories of undo records:
+
+#### 1. Row-Level Undo Records
+
+- **Update records**: Store both the previous tuple header and tuple body
+- **Delete records**: Store only the tuple header (previous non-deleted state)
+- **Row-level lock records**: Store only the tuple header with lock information
+
+#### 2. Block-Level (Page-Level) Undo Records
+
+Block-level undo records store entire page images and are used when space management requires page reorganization:
+
+- **Compact undo record**: Stores one page image before compaction
+  - Created when deleted tuples need to be removed to make space
+  - Size: `ORIOLEDB_BLCKSZ + header`
+
+- **Split undo record**: Stores one page image before split
+  - Created when a page is split into two pages
+  - Stores the original page plus the split key
+  - Size: `ORIOLEDB_BLCKSZ + header + split_key_size`
+
+- **Merge undo record**: Stores two page images before merge
+  - Created when two sparse pages are merged into one
+  - Size: `2 * ORIOLEDB_BLCKSZ + header`
+
+### Transaction Undo Chains
+
+Each transaction has its own undo chain linking all changes made by that transaction. This chain is used for:
+
+1. **Full transaction rollback**: Traverse the entire chain and revert all changes
+2. **Partial rollback (SAVEPOINT)**: Follow the chain until reaching the savepoint location
+3. **Branch records**: When partial rollback occurs, a "branch" record preserves the full undo path for recovery
+
+### Example: Update Operation
+
+When a tuple is updated:
+
+```
+1. Check if tuple has enough space for update
+2. If space is sufficient:
+   - Create row-level undo record with old tuple version
+   - Update tuple in place (or resize if growing)
+   - Set new tuple header with current transaction info
+   
+3. If space is insufficient (tuple growing larger):
+   - Create page-level compact undo record (entire page image)
+   - Compact page (remove deleted tuples)
+   - Insert/update tuple with new size
+```
+
+## Undo Log Storage
+
+### Where Are Undo Logs Kept?
+
+OrioleDB stores undo logs in a **hybrid approach** combining in-memory buffers and disk files:
+
+#### In-Memory Circular Buffer
+
+- **Size**: Controlled by `orioledb.undo_buffers` GUC parameter (split 50/50 between circular and block buffers)
+- **Purpose**: Provides fastest access to recent undo records
+- **Operation**: Works as a circular buffer that wraps around when reaching the end
+
+```
+Circular buffer layout:
+[retained undo records | free space | new undo records]
+                        ↑            ↑
+                   cleanedLoc   writtenLoc
+```
+
+#### Disk Files
+
+When the circular buffer fills up, undo records are written to disk files:
+
+- **Row-level undo**: `ORIOLEDB_UNDO_DIR/[hex]row`
+- **Page-level undo**: `ORIOLEDB_UNDO_DIR/[hex]page`
+- **System undo**: `ORIOLEDB_UNDO_DIR/[hex]system`
+
+Each file is 64MB (`UNDO_FILE_SIZE = 0x4000000`)
+
+### Undo Location Tracking
+
+The `UndoMeta` structure maintains several critical locations:
+
+1. **lastUsedLocation**: Maximum undo location actually used
+2. **advanceReservedLocation**: Pre-reserved location for future records
+3. **minProcRetainLocation**: Minimum location needed for any active snapshot
+4. **minProcTransactionRetainLocation**: Minimum location needed for transaction rollback
+5. **writtenLocation**: Location up to which undo has been written to disk
+6. **cleanedLocation**: Location up to which undo files have been cleaned
+
+### Retention Policy
+
+Undo records are retained as long as:
+
+1. **Active transactions need them** for rollback
+2. **Active snapshots need them** for MVCC visibility
+3. **Checkpoint needs them** for recovery (in-progress transactions during checkpoint)
+4. **Rewind needs them** (if rewind feature is enabled)
+
+Once none of these conditions apply, undo records can be:
+- Overwritten in the circular buffer
+- Deleted from disk files (during cleanup)
+
+### Eviction Process
+
+When the circular buffer is full:
+
+1. Check if `retain_location` allows overwriting old records
+2. If not, write undo records to disk:
+   - Set `writeInProgressLocation`
+   - Write undo range to disk file
+   - Update `writtenLocation`
+3. Continue with new undo records in the circular buffer
+
+## Tuple Updates and Size Changes
+
+### What Happens When Updated Tuple is Bigger?
+
+This is a critical question. When a tuple is updated and the new version is larger than the old version, OrioleDB has several strategies:
+
+#### Case 1: Enough Space on Page
+
+If there's enough free space on the page (including vacated space from deleted tuples):
+
+```c
+if (newItemSize > prevItemSize)
+{
+    page_locator_resize_item(p, &loc, newItemSize);
+    PAGE_SUB_N_VACATED(p, prevItemSize);
+}
+```
+
+1. Create row-level undo record with old tuple
+2. Resize the page item to accommodate the larger tuple
+3. Update tuple in place
+4. Adjust vacated space accounting
+
+#### Case 2: Need Page Compaction
+
+If there's not enough contiguous space but enough total free space (deleted tuples exist):
+
+1. **Create block-level compact undo record**: Store entire current page image
+2. **Compact the page**: Remove deleted tuples to reclaim space
+3. **Insert updated tuple**: With its new larger size
+4. **Update page metadata**: Reset vacated space counters
+
+This is why the compact undo record is important - it allows rollback even after page structure changes.
+
+Example from the documentation:
+```
+Before compaction:
+Page contains: [t1, t2, t3 (deleted), t4 (deleted)]
+Need to insert: t5 (large)
+
+After compaction:
+Page contains: [t1, t2, t5]
+Undo log: [Page image with t1, t2, t3, t4]
+```
+
+#### Case 3: Need Page Split
+
+If even after compaction there's not enough space:
+
+1. **Create block-level split undo record**: Store entire page image + split key
+2. **Split the page** into two pages (left and right)
+3. **Distribute tuples** between the two pages
+4. **Insert updated tuple** into appropriate page
+5. **Insert downlink** to parent page pointing to new page
+
+The split undo record enables rollback by restoring the original single page.
+
+### Why This Approach Works
+
+The key insight is that OrioleDB **never needs to resize existing tuple slots immediately for smaller tuples**:
+
+```c
+/*
+ * If new tuple is less than previous one, don't resize page item
+ * immediately. We want to be able to rollback this action
+ * without page splits.
+ *
+ * Page compaction will re-use unoccupied page space when needed.
+ */
+if (newItemSize > prevItemSize)
+{
+    page_locator_resize_item(p, &loc, newItemSize);
+    // ...
+}
+```
+
+This ensures rollback never requires a page split, only potentially a page compaction (which can be rolled back via the compact undo record).
+
+## How Updates and Deletes Affect Indexes
+
+### Index-Organized Tables
+
+OrioleDB stores data in **index-organized tables**:
+
+- **Primary key index**: Contains the full table rows as leaf tuples
+- **Secondary indexes**: Contain secondary key columns + primary key columns
+
+Example:
+```sql
+CREATE TABLE vegetables (
+    id int PRIMARY KEY,
+    name text,
+    count int
+);
+CREATE INDEX idx_count ON vegetables(count);
+```
+
+Storage structure:
+```
+Primary index (id):
+  Leaf tuples: [id=1, name='Tomato', count=10]
+               [id=2, name='Cucumber', count=3]
+
+Secondary index (count, id):
+  Leaf tuples: [count=3, id=2]
+               [count=10, id=1]
+```
+
+### Update Behavior
+
+#### Primary Key Update
+
+Updates to the primary key are **special** because they change the tuple's position in the primary index:
+
+1. **Implemented as DELETE + INSERT**:
+   ```
+   UPDATE table SET id = 2 WHERE id = 1;
+   
+   Becomes:
+   DELETE old tuple (id=1)
+   INSERT new tuple (id=2)
+   ```
+
+2. **Concurrent operations may fail**:
+   - Another transaction trying to update/delete the same tuple will get an error:
+   - `"tuple to be locked has its primary key changed due to concurrent update"`
+
+3. **Secondary indexes must be updated**:
+   - Delete old entries (with old PK value)
+   - Insert new entries (with new PK value)
+
+#### Non-Primary Key Update
+
+Updates to non-primary key columns:
+
+1. **Primary index**: Update the tuple in place (following the size change logic above)
+
+2. **Secondary indexes**: Only updated if the secondary key columns changed
+   ```c
+   if (is_keys_eq(&id->desc, &old_key, &new_key) && (old_valid == new_valid))
+       return res;  // No change needed
+   ```
+
+3. **Update process**:
+   - Delete old secondary index entry (if existed)
+   - Insert new secondary index entry (if should exist)
+
+### Delete Behavior
+
+#### Primary Index
+
+When a tuple is deleted:
+
+1. **Mark tuple as deleted** in the primary index
+   ```c
+   tuphdr->deleted = BTreeLeafTupleMovedPartitions; // or other delete reason
+   ```
+
+2. **Create undo record** with previous tuple header (and body if needed)
+
+3. **Update vacated space counter**:
+   ```c
+   PAGE_ADD_N_VACATED(p, BTreeLeafTuphdrSize + tuple_size);
+   ```
+
+4. **Space is not immediately reclaimed**:
+   - Deleted tuple space is marked as "vacated"
+   - Can be reused during compaction
+   - Allows rollback without page splits
+
+#### Secondary Indexes
+
+For each secondary index:
+
+1. **Delete the corresponding entry** (secondary key + PK)
+2. **Create undo record** for rollback
+3. **Same vacated space management** as primary index
+
+### Following the Update Chain
+
+OrioleDB handles a special case where a tuple is deleted and immediately recreated:
+
+```sql
+-- Session 1
+BEGIN;
+DELETE FROM tbl WHERE id = 1;
+INSERT INTO tbl VALUES (1, 0.0);
+
+-- Session 2
+UPDATE tbl SET value = value + 1 WHERE id = 1;  -- Waits, then updates NEW tuple
+```
+
+This happens because:
+1. The new INSERT reuses the same primary key location
+2. The concurrent UPDATE follows the update chain
+3. It "sees through" the delete/insert pair and updates the newly inserted tuple
+
+This is considered a feature for MVCC consistency, though it may be surprising behavior.
+
+### WAL Logging for Indexes
+
+OrioleDB uses **row-level WAL** and only logs:
+
+1. **TOAST tree changes**
+2. **Primary key tree changes**
+
+**Secondary indexes are NOT logged directly**. Instead:
+
+- During recovery, secondary indexes are reconstructed from TOAST and primary key changes
+- This is possible because secondary keys are derived from primary key data
+- A "TOAST consistency point" marks when secondary index updates begin
+
+Recovery process:
+```
+Before TOAST consistency point:
+  - Apply WAL only to TOAST and primary key
+  - Secondary indexes already contain these changes (from checkpoint)
+
+After TOAST consistency point:
+  - Apply WAL to TOAST, primary key, AND secondary indexes
+  - Reconstruct secondary index entries from primary key data
+```
+
+This design:
+- Reduces WAL volume significantly
+- Enables efficient parallel recovery
+- Maintains index consistency through structural checkpoints
+
+## Summary
+
+### Key Takeaways
+
+1. **MVCC via Undo Logs**: Old tuple versions are stored in undo log, not in main B-tree, preventing bloat
+
+2. **CSN for Visibility**: 64-bit Commit Sequence Numbers provide global transaction ordering without wraparound issues
+
+3. **Undo Log Location**: Hybrid storage with in-memory circular buffer (fast) and disk files (overflow)
+
+4. **Growing Tuples**: Handled via page compaction (with block-level undo) or page split (with split undo record)
+
+5. **Index Updates**:
+   - Primary key updates are DELETE + INSERT
+   - Secondary index updates are conditional (only if key changed)
+   - Secondary indexes not WAL-logged (reconstructed during recovery)
+
+6. **No VACUUM Needed**: Undo log approach with page-level records eliminates need for dedicated garbage collection
+
+This architecture makes OrioleDB particularly well-suited for:
+- Cloud environments (reduced maintenance)
+- Write-heavy workloads (no bloat accumulation)
+- Replication (compact row-level WAL)
+- Modern hardware (lock-free algorithms, optimized page structure)
