@@ -129,11 +129,162 @@ Block-level undo records store entire page images and are used when space manage
 
 ### Transaction Undo Chains
 
-Each transaction has its own undo chain linking all changes made by that transaction. This chain is used for:
+Each transaction maintains its own **undo chain** that links all modifications made by that transaction. This is distinct from the per-tuple undo chains described above. The transaction undo chain enables complete transaction rollback and recovery operations.
 
-1. **Full transaction rollback**: Traverse the entire chain and revert all changes
-2. **Partial rollback (SAVEPOINT)**: Follow the chain until reaching the savepoint location
-3. **Branch records**: When partial rollback occurs, a "branch" record preserves the full undo path for recovery
+#### Structure
+
+A transaction's undo chain is tracked through `UndoStackLocations` which contains four key pointers:
+
+```c
+typedef struct {
+    UndoLocation location;           // Main transaction chain head
+    UndoLocation branchLocation;     // Branches for partial rollbacks
+    UndoLocation subxactLocation;    // Subtransaction markers
+    UndoLocation onCommitLocation;   // Actions to execute on commit
+} UndoStackLocations;
+```
+
+Each undo record in the chain contains:
+- **prev**: Pointer to the previous undo record in the chain
+- **type**: Type of operation (ModifyUndoItemType, RowLockUndoItemType, etc.)
+- **itemSize**: Size of the undo record
+- **indexType**: Which index was modified
+
+#### How the Chain is Built
+
+When a transaction performs an operation:
+
+1. **Create undo record**: The operation creates an appropriate undo record (update, delete, lock, etc.)
+2. **Link to chain**: The new record's `prev` pointer is set to the current chain head
+3. **Update head**: The transaction's `location` pointer is updated to point to the new record
+
+Example sequence:
+```text
+Transaction starts:
+  location = Invalid
+
+After INSERT id=1:
+  Undo Record A (prev=Invalid) ← location
+
+After UPDATE id=1:
+  Undo Record B (prev=A) ← location
+
+After INSERT id=2:
+  Undo Record C (prev=B) ← location
+```
+
+The chain grows backwards in time, with the most recent operation at the head.
+
+#### Uses of Transaction Undo Chains
+
+1. **Full Transaction Rollback (ABORT)**
+   - Traverse the entire chain from head to tail
+   - Apply each undo record in reverse order
+   - Restores database to state before transaction started
+   
+   ```sql
+   BEGIN;
+   INSERT INTO t1 VALUES (1);  -- Undo Record A created
+   UPDATE t1 SET val=2;        -- Undo Record B created  
+   DELETE FROM t1;             -- Undo Record C created
+   ROLLBACK;                   -- Walk C → B → A, applying each
+   ```
+
+2. **Partial Rollback (SAVEPOINT)**
+   - Follow the chain only to the savepoint location
+   - Apply undo records until reaching the saved point
+   - Creates a **branch record** to preserve the full chain for recovery
+   
+   ```sql
+   BEGIN;
+   INSERT INTO t1 VALUES (1);  -- Undo Record A
+   SAVEPOINT sp1;
+   UPDATE t1 SET val=2;        -- Undo Record B
+   DELETE FROM t1;             -- Undo Record C
+   ROLLBACK TO sp1;            -- Walk C → B, stop at A
+                               -- Create Branch Record preserving C-B path
+   COMMIT;                     -- Transaction commits with just A applied
+   ```
+
+3. **Branch Records for Recovery**
+   - When partial rollback occurs, a `BranchUndoStackItem` is created
+   - Contains:
+     - `longPathLocation`: Points to the un-rolled-back portion
+     - `prevBranchLocation`: Links to previous branch records
+   - During recovery, these branches must be walked to fully rollback in-progress transactions
+   - Necessary because checkpointed data may reference the rolled-back operations
+
+4. **On-Commit Actions**
+   - Some undo records require actions at commit time (not just rollback)
+   - Example: `TRUNCATE` operations
+     - On commit: delete old relfilenodes
+     - On abort: delete new relfilenodes
+   - These records are tracked in a separate `onCommitLocation` chain
+
+5. **Subtransaction Management**
+   - Subtransactions use `SubXactUndoStackItem` records
+   - Contain:
+     - `prevSubLocation`: Previous savepoint location
+     - `parentSubid`: Parent subtransaction ID
+   - Enable nested transaction control with proper rollback semantics
+
+#### Example: Complex Transaction with Savepoint
+
+```sql
+BEGIN;                          -- Start transaction
+INSERT INTO t VALUES (1);       -- Undo Record A (location=A)
+INSERT INTO t VALUES (2);       -- Undo Record B (location=B, prev=A)
+SAVEPOINT sp1;                  -- Subxact Record S1 (location=S1, prev=B)
+UPDATE t SET val=10 WHERE id=1; -- Undo Record C (location=C, prev=S1)
+DELETE FROM t WHERE id=2;       -- Undo Record D (location=D, prev=C)
+ROLLBACK TO sp1;                -- Walk D→C, create Branch Record BR
+                               -- (branchLocation=BR, longPath points to D)
+INSERT INTO t VALUES (3);       -- Undo Record E (location=E, prev=S1)
+COMMIT;                        -- On-commit: nothing to rollback
+```
+
+Chain state after `ROLLBACK TO sp1`:
+```text
+Main chain: E → S1 → B → A
+Branch chain: BR → (points to rolled-back path D → C)
+```
+
+If crash occurs and recovery runs:
+- Apply main chain normally: E, S1, B, A
+- Also walk branch chain to rollback: D, C
+- Ensures consistency even if D or C were partially checkpointed
+
+#### Interaction with Per-Tuple Undo Chains
+
+It's important to distinguish:
+
+- **Transaction undo chain**: Links all operations by one transaction across all tuples
+  - Used for: Transaction rollback, recovery, savepoints
+  - Organized by: Transaction/operation order
+  
+- **Per-tuple undo chain**: Links versions of a single tuple across transactions
+  - Used for: MVCC visibility, finding old tuple versions
+  - Organized by: Tuple location (undoLocation field in tuple header)
+
+Example with both:
+```sql
+-- Transaction 1
+BEGIN;                           -- Txn1 chain starts
+INSERT INTO t VALUES (1, 'a');   -- Txn1 chain: [Insert-1]
+                                -- Tuple (1,'a'): undoLocation=Invalid
+UPDATE t SET val='b' WHERE id=1; -- Txn1 chain: [Update-1, Insert-1]
+                                -- Tuple (1,'b'): undoLocation→old header
+COMMIT;
+
+-- Transaction 2
+BEGIN;                           -- Txn2 chain starts (separate)
+UPDATE t SET val='c' WHERE id=1; -- Txn2 chain: [Update-2]
+                                -- Tuple (1,'c'): undoLocation→(1,'b') header
+ROLLBACK;                        -- Walk Txn2 chain, revert Update-2
+                                -- Tuple (1,'b') restored
+```
+
+The transaction chain allows complete rollback of Transaction 2, while the per-tuple chain allows older transactions to see previous versions.
 
 ### Example: Update Operation
 
