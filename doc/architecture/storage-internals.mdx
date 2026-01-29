@@ -21,11 +21,133 @@ This document provides a detailed analysis of how OrioleDB storage works, coveri
 
 OrioleDB implements Multi-Version Concurrency Control (MVCC) using an **undo log-based approach**, which is fundamentally different from PostgreSQL's traditional heap storage:
 
+### PostgreSQL's Approach: Append-Only Heap Storage
+
+PostgreSQL uses an **append-only heap storage model** without undo logs:
+
+**How it works:**
+1. **New tuple versions are appended**: When a row is updated, PostgreSQL creates a new version of the entire tuple and writes it to the heap
+2. **Old versions remain in place**: The old tuple version stays in the heap, marked as "dead" but not immediately removed
+3. **Tuple headers track versions**: Each tuple has visibility information (xmin, xmax, cmin, cmax) indicating which transactions can see it
+4. **HOT (Heap-Only Tuple) optimization**: If the updated tuple fits on the same page and indexed columns don't change, uses a simpler update chain
+
+**Example:**
+```sql
+-- Initial state
+INSERT INTO t VALUES (1, 'a');  -- Tuple A at heap location 1
+
+-- Update
+UPDATE t SET val='b' WHERE id=1; -- Tuple B created at heap location 2
+                                 -- Tuple A marked as dead (xmax set)
+                                 -- Indexes updated to point to location 2
+
+-- Another update  
+UPDATE t SET val='c' WHERE id=1; -- Tuple C created at heap location 3
+                                 -- Tuple B marked as dead
+                                 -- Indexes updated to point to location 3
+```
+
+**Result**: The heap contains all three versions (A, B, C) until VACUUM runs.
+
+**Problems this causes:**
+- **Bloat**: Dead tuples accumulate, wasting space
+- **VACUUM overhead**: Regular VACUUM needed to reclaim space
+- **Index bloat**: Each update creates new index entries
+- **Write amplification**: Full tuple written for every update
+- **VACUUM blocking**: Long-running transactions prevent cleanup
+
+### OrioleDB's Approach: Undo Log-Based Storage
+
+OrioleDB uses **undo logs** to store old versions separately:
+
+**How it works:**
+1. **Current version in B-tree**: Only the current tuple version lives in the main B-tree
+2. **Old versions in undo log**: When a tuple is updated, the old version is moved to the undo log
+3. **Undo chains link versions**: Tuple headers contain `undoLocation` pointers forming chains
+4. **Automatic cleanup**: Undo log is cleaned up as soon as no transaction needs old versions
+
+**Example:**
+```sql
+-- Initial state
+INSERT INTO t VALUES (1, 'a');  -- Tuple A in B-tree
+
+-- Update
+UPDATE t SET val='b' WHERE id=1; -- Old Tuple A moved to undo log
+                                 -- New Tuple B replaces A in B-tree
+                                 -- B.undoLocation → A in undo log
+
+-- Another update
+UPDATE t SET val='c' WHERE id=1; -- Old Tuple B moved to undo log  
+                                 -- New Tuple C replaces B in B-tree
+                                 -- C.undoLocation → B in undo log
+                                 -- B.undoLocation → A in undo log
+```
+
+**Result**: B-tree contains only current version (C), undo log contains old versions (B→A).
+
+**Benefits:**
+- **No bloat**: Main B-tree always clean, contains only current data
+- **No VACUUM needed**: Space reclaimed automatically when transactions complete
+- **Compact indexes**: Secondary indexes don't store old versions
+- **Better cache efficiency**: Hot data stays in cache, old versions evicted
+- **Predictable performance**: No periodic VACUUM slowdowns
+
 ### Key Differences from PostgreSQL
 
 - **No tuple bloat in main storage**: In PostgreSQL, old tuple versions remain in the heap until VACUUM removes them. In OrioleDB, old versions are moved to the undo log, keeping the main B-tree clean.
 - **No dedicated VACUUM process needed**: The undo log approach eliminates the need for dedicated garbage collection processes.
 - **Page-level undo records**: Allow the system to reclaim space occupied by deleted tuples as soon as they're no longer needed by any transaction or snapshot.
+
+### Why OrioleDB Specifically Needs Undo Logs
+
+OrioleDB's design choices **require** undo logs, not just benefit from them:
+
+1. **Index-Organized Tables**
+   - OrioleDB stores data in B-tree indexes (not heaps)
+   - Tuples are ordered by primary key
+   - Can't "append" new versions like PostgreSQL's heap
+   - Old versions must go somewhere else → undo log
+
+2. **Copy-on-Write Checkpoints**
+   - Checkpoints create consistent snapshots without blocking writes
+   - Pages are immutable once checkpointed
+   - In-progress transactions need their changes preserved
+   - Undo log stores pre-checkpoint state for rollback
+
+3. **Row-Level WAL**
+   - WAL logs individual row changes, not page images
+   - Recovery needs to reconstruct page state
+   - Can't rely on old tuple versions in main storage
+   - Undo log provides the old versions for recovery
+
+4. **Page Compaction**
+   - Pages are compacted to reclaim space from deleted tuples
+   - Compaction changes page structure
+   - Rollback needs original page state → stored in undo log
+   - Without undo, compaction would be non-transactional
+
+5. **No Tuple Address Stability**
+   - Tuples can move within B-tree during splits/merges
+   - Can't use fixed heap addresses like PostgreSQL's ctid
+   - Old versions need stable storage → undo log
+   - Indexes point to logical keys, not physical addresses
+
+**In summary**: PostgreSQL's heap storage naturally keeps old versions in place. OrioleDB's index-organized, page-compacting, checkpoint-friendly design requires explicitly storing old versions elsewhere. The undo log is not optional—it's fundamental to how OrioleDB works.
+
+### Comparison Table
+
+| Aspect | PostgreSQL (Heap) | OrioleDB (Undo Log) |
+|--------|------------------|---------------------|
+| **Storage model** | Append-only heap | Index-organized B-tree |
+| **Old versions** | Remain in heap | Moved to undo log |
+| **New version location** | Appended to heap | Replaces old in B-tree |
+| **Space reclamation** | VACUUM (manual/auto) | Automatic (undo cleanup) |
+| **Bloat** | Common problem | Rare (contained in undo) |
+| **Index updates** | All indexes updated | Secondary indexes idempotent |
+| **Write amplification** | High (full tuples) | Lower (undo records) |
+| **Long transactions** | Block VACUUM | Increase undo retention |
+| **Visibility check** | Tuple header (xmin/xmax) | CSN + undo chain |
+| **Rollback** | Mark tuples as aborted | Walk undo chain |
 
 ### MVCC Implementation Details
 
