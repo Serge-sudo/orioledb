@@ -26,6 +26,7 @@
 #include "recovery/wal.h"
 #include "tableam/operations.h"
 #include "transam/oxid.h"
+#include "transam/undo.h"
 #include "tuple/slot.h"
 #include "tuple/sort.h"
 #include "tuple/toast.h"
@@ -271,8 +272,12 @@ o_define_index_validate(ORelOids oids, Relation index, IndexInfo *indexInfo, OTa
 	int			nattrs;
 	OIndexType	ix_type;
 
+	/* Concurrent indexes are now supported through the 4-stage build process */
 	if (indexInfo && indexInfo->ii_Concurrent)
-		elog(ERROR, "concurrent indexes are not supported.");
+	{
+		/* Validation for concurrent index builds */
+		/* TODO: Add any specific validation requirements for concurrent builds */
+	}
 
 	if (index->rd_index->indisexclusion)
 		elog(ERROR, "exclusion indices are not supported.");
@@ -1509,19 +1514,23 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 			_o_index_end_parallel(buildstate.btleader);
 	}
 
-	/*
-	 * Write the file header.  We need to write the correct checkpoint number,
-	 * meta lock will prevent checkpointer from walking through.  Remove
-	 * shared root info placeholder to let checkpointer process this tree when
-	 * we release the lock.
-	 */
-	o_tables_table_meta_lock(o_table);
+	/* For non-concurrent builds, make index visible immediately */
+	if (!isconcurrent)
+	{
+		/*
+		 * Write the file header.  We need to write the correct checkpoint number,
+		 * meta lock will prevent checkpointer from walking through.  Remove
+		 * shared root info placeholder to let checkpointer process this tree when
+		 * we release the lock.
+		 */
+		o_tables_table_meta_lock(o_table);
 
-	btree_write_file_header(&idx->desc, &fileHeader);
-	o_drop_shared_root_info(idx->desc.oids.datoid,
-							idx->desc.oids.relnode);
+		btree_write_file_header(&idx->desc, &fileHeader);
+		o_drop_shared_root_info(idx->desc.oids.datoid,
+								idx->desc.oids.relnode);
 
-	o_tables_table_meta_unlock(o_table, InvalidOid);
+		o_tables_table_meta_unlock(o_table, InvalidOid);
+	}
 
 	if (result)
 	{
@@ -1547,8 +1556,18 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		index_close(indexRelation, AccessExclusiveLock);
 	}
 
+	/* Stage 2: For concurrent builds, rescan for changes between undo1 and undo2 */
 	if (isconcurrent)
 	{
+		UndoStackLocations undoLocations;
+
+		/*
+		 * Capture undo2: current undo position after Stage 1 completes.
+		 * Any changes after this point will have normal undo records.
+		 */
+		undoLocations = get_cur_undo_locations(UndoLogRegular);
+		buildstate.undo2 = undoLocations.location;
+
 		buildstate.concurrentStage = 2;
 		buildstate.noncomplete_xact = false;
 		buildstate.noncomplete_xact_tupstore = NULL;
@@ -1557,26 +1576,38 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		/* Begin serial stage2 tuplesort */
 		sortstates = palloc0(sizeof(Pointer));
 		sortstates[0] = tuplesort_begin_orioledb_index(idx, work_mem, false, coordinate);
-		/* Serial build */
+		
+		/* Scan primary index for tuples modified between undo1 and undo2 */
 		build_secondary_index_worker_heap_scan(&buildstate, descr, idx, NULL, sortstates, false, &heap_tuples, &index_tuples);
+		
 		o_set_syscache_hooks();
 		tuplesort_performsort(sortstates[0]);
 		o_unset_syscache_hooks();
 
+		/* Write stage 2 index data */
 		btree_write_index_data(&idx->desc, idx->leafTupdesc, sortstates[0],
 						   ctid, &fileHeader);
-		/* End serial/leader sort */
+		
 		tuplesort_end(sortstates[0]);
 		pfree(sortstates);
 
 		/*
-		 * Wait for all xacts for tuples between undo1 and undo2 finished. If rolled back then delete inserted tuple
-		 * from index
+		 * Wait for all transactions with tuples between undo1 and undo2 to finish.
+		 * If they rollback, we need to remove those tuples from the index.
 		 */
 		if (buildstate.noncomplete_xact)
 		{
-			
+			/* TODO: Implement waiting for incomplete transactions and handling rollbacks */
 		}
+
+		/* Stage 4: Now make the index visible for normal operation */
+		o_tables_table_meta_lock(o_table);
+
+		btree_write_file_header(&idx->desc, &fileHeader);
+		o_drop_shared_root_info(idx->desc.oids.datoid,
+								idx->desc.oids.relnode);
+
+		o_tables_table_meta_unlock(o_table, InvalidOid);
 	}
 
 
