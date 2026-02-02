@@ -376,7 +376,7 @@ index_build_params(OTableIndex *index)
  */
 void
 o_define_index(Relation heap, Relation index, Oid indoid, bool reindex,
-			   OIndexNumber old_ix_num, IndexBuildResult *result)
+			   OIndexNumber old_ix_num, bool isconcurrent, IndexBuildResult *result)
 {
 	OTable	   *old_o_table = NULL;
 	OTable	   *new_o_table;
@@ -609,7 +609,7 @@ o_define_index(Relation heap, Relation index, Oid indoid, bool reindex,
 		else
 		{
 			Assert(!is_recovery_in_progress());
-			build_secondary_index(o_table, descr, ix_num, false, result);
+			build_secondary_index(o_table, descr, ix_num, false, isconcurrent, result);
 		}
 	}
 	else
@@ -1289,12 +1289,19 @@ scan_getnextslot_allattrs(oIdxBuildState *buildstate, BTreeSeqScan *scan, OTable
 	CommitSeqNo tupleCsn;
 
 	if (buildstate->concurrentStage == 1)
+	{
 		tup = btree_seq_scan_getnext_raw(scan, slot->tts_mcxt, &hint, tupHdr);
 		tupleCsn = InvalidCSN;
+	}
 	else if (buildstate->concurrentStage == 2)
+	{
 		tup = btree_seq_scan_getnext_page_undo(scan, slot->tts_mcxt, &hint, tupHdr);
+		tupleCsn = InvalidCSN;
+	}
 	else
+	{
 		tup = btree_seq_scan_getnext(scan, slot->tts_mcxt, &tupleCsn, &hint);
+	}
 
 	if (O_TUPLE_IS_NULL(tup))
 		return false;
@@ -1364,7 +1371,7 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 							/* construct tuple descriptor (index attributes, xid) */
 						}
 						values = palloc(sizeof(Datum) * buildstate->noncomplete_xact_tupdesc->natts);
-						nulls = palloc(sizeod(bool) * buildstate->noncomplete_xact_tupdesc->natts);
+						nulls = palloc(sizeof(bool) * buildstate->noncomplete_xact_tupdesc->natts);
 						tts_orioledb_get_index_values(primarySlot, idx, values, nulls, true);
 						o_btree_check_size_of_tuple(o_tuple_size(secondaryTup,
 													&idx->leafSpec),
@@ -1406,6 +1413,7 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 void
 build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 					  bool in_dedicated_recovery_worker,
+					  bool isconcurrent,
 					  IndexBuildResult *result)
 {
 	Tuplesortstate **sortstates;
@@ -1427,7 +1435,7 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 	idx = descr->indices[o_table->has_primary ? ix_num : ix_num + 1];
 	buildstate.btleader = NULL;
 
-	if (concurrent)
+	if (isconcurrent)
 	{
 		buildstate.concurrentStage = 1;
 		buildstate.undo1 = InvalidUndoLocation;
@@ -1539,12 +1547,12 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		index_close(indexRelation, AccessExclusiveLock);
 	}
 
-	if (concurrent)
+	if (isconcurrent)
 	{
 		buildstate.concurrentStage = 2;
-		buildstate.noncomplete_xact_exists = false;
-		noncomplete_xact_tupstore = NULL;
-		noncomplete_xact_tupdesc = NULL;
+		buildstate.noncomplete_xact = false;
+		buildstate.noncomplete_xact_tupstore = NULL;
+		buildstate.noncomplete_xact_tupdesc = NULL;
 
 		/* Begin serial stage2 tuplesort */
 		sortstates = palloc0(sizeof(Pointer));
@@ -1565,7 +1573,7 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		 * Wait for all xacts for tuples between undo1 and undo2 finished. If rolled back then delete inserted tuple
 		 * from index
 		 */
-		if (buildstate.noncomplete_xact_exists)
+		if (buildstate.noncomplete_xact)
 		{
 			
 		}
