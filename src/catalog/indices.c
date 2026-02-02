@@ -1647,12 +1647,38 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 				/*
 				 * Wait for transaction to finish.
 				 * xid_is_finished() checks if the transaction is committed or aborted.
+				 * Use a reasonable timeout to avoid hanging indefinitely.
 				 */
-				while (!xid_is_finished(oxid))
 				{
-					/* Wait for transaction to complete */
-					pg_usleep(1000L);	/* Sleep 1ms */
-					CHECK_FOR_INTERRUPTS();
+					int wait_iterations = 0;
+					const int max_wait_iterations = 600000; /* 10 minutes at 1ms intervals */
+					const int log_interval = 60000; /* Log every minute */
+					
+					while (!xid_is_finished(oxid))
+					{
+						/* Wait for transaction to complete */
+						pg_usleep(1000L);	/* Sleep 1ms */
+						CHECK_FOR_INTERRUPTS();
+						
+						wait_iterations++;
+						
+						/* Log progress periodically */
+						if (wait_iterations % log_interval == 0)
+						{
+							elog(LOG, "CREATE INDEX CONCURRENTLY: waiting for transaction %lu to complete (%d seconds)",
+								 oxid, wait_iterations / 1000);
+						}
+						
+						/* Timeout check */
+						if (wait_iterations >= max_wait_iterations)
+						{
+							ereport(ERROR,
+									(errcode(ERRCODE_QUERY_CANCELED),
+									 errmsg("CREATE INDEX CONCURRENTLY: timeout waiting for transaction %lu to complete",
+											oxid),
+									 errhint("The transaction may be blocked or taking too long to complete.")));
+						}
+					}
 				}
 				
 				/*
