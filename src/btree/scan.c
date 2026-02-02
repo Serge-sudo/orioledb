@@ -1627,6 +1627,37 @@ btree_seq_scan_getnext_raw(BTreeSeqScan *scan, MemoryContext mctx,
 	return tuple;
 }
 
+/*
+ * btree_seq_scan_getnext_page_undo
+ *		Similar to btree_seq_scan_getnext_raw, but for concurrent index builds.
+ *		Returns raw tuples with their undo information for Stage 2 scanning.
+ */
+OTuple
+btree_seq_scan_getnext_page_undo(BTreeSeqScan *scan, MemoryContext mctx,
+								 BTreeLocationHint *hint, BTreeLeafTuphdr **tupHdr)
+{
+	OTuple		tuple;
+	bool		end;
+
+	if (!scan->initialized)
+		init_btree_seq_scan(scan);
+
+	if (scan->status == BTreeSeqScanInMemory ||
+		scan->status == BTreeSeqScanDisk)
+	{
+		tuple = btree_seq_scan_getnext_raw_internal(scan, mctx, hint, tupHdr);
+		if (scan->status == BTreeSeqScanInMemory ||
+			scan->status == BTreeSeqScanDisk)
+		{
+			return tuple;
+		}
+	}
+	Assert(scan->status == BTreeSeqScanFinished);
+
+	O_TUPLE_SET_NULL(tuple);
+	return tuple;
+}
+
 void
 free_btree_seq_scan(BTreeSeqScan *scan)
 {

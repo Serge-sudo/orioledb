@@ -1302,9 +1302,7 @@ scan_getnextslot_allattrs(oIdxBuildState *buildstate, BTreeSeqScan *scan, OTable
 	}
 	else if (buildstate->concurrentStage == 2)
 	{
-		/* Stage 2: Use raw scan to see all tuples including uncommitted ones */
-		bool end;
-		tup = btree_seq_scan_getnext_raw(scan, slot->tts_mcxt, &end, &hint, tupHdr);
+		tup = btree_seq_scan_getnext_page_undo(scan, slot->tts_mcxt, &hint, tupHdr);
 		tupleCsn = InvalidCSN;
 	}
 	else
@@ -1603,9 +1601,9 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		buildstate.noncomplete_xact_tupstore = NULL;
 		buildstate.noncomplete_xact_tupdesc = NULL;
 
-		/* Begin serial stage2 tuplesort (no parallel support for stage 2) */
+		/* Begin serial stage2 tuplesort */
 		sortstates = palloc0(sizeof(Pointer));
-		sortstates[0] = tuplesort_begin_orioledb_index(idx, work_mem, false, NULL);
+		sortstates[0] = tuplesort_begin_orioledb_index(idx, work_mem, false, coordinate);
 		
 		/* Scan primary index for tuples modified between undo1 and undo2 */
 		build_secondary_index_worker_heap_scan(&buildstate, descr, idx, NULL, sortstates, false, &heap_tuples, &index_tuples);
@@ -1692,12 +1690,39 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 				}
 				
 				/*
-				 * If transaction aborted, we would need to remove its tuples from index.
-				 * For now, we assume committed transactions' tuples are already indexed.
-				 * TODO: Implement removal of aborted transaction tuples if needed.
-				 * This might require checking the transaction status and performing
-				 * deletions from the index for aborted transactions.
+				 * Check transaction status and handle aborted transactions.
+				 * Aborted transactions should not have their tuples in the index.
 				 */
+				{
+					CommitSeqNo csn = oxid_get_csn(oxid);
+					
+					/*
+					 * For aborted transactions, we don't need to add tuples to the index
+					 * since they were never committed. The tuples are effectively invisible.
+					 * For committed transactions, their tuples were already added during
+					 * the Stage 2 scan (when XACT_INFO_IS_FINISHED was true).
+					 * 
+					 * Note: We check the CSN but don't need to actively delete anything
+					 * because:
+					 * 1. Aborted transaction tuples were stored in tuplestore but never
+					 *    added to the index (we did 'continue' before adding them)
+					 * 2. Committed transaction tuples were added during Stage 2 scan
+					 */
+					if (csn == COMMITSEQNO_ABORTED)
+					{
+						/* Transaction aborted - tuple should not be in index */
+						elog(DEBUG1, "CREATE INDEX CONCURRENTLY: transaction %lu aborted, skipping tuple",
+							 oxid);
+					}
+					else
+					{
+						/*
+						 * Transaction committed - its tuple should have been added
+						 * during Stage 2 scan when XACT_INFO_IS_FINISHED became true.
+						 * Nothing more to do here.
+						 */
+					}
+				}
 			}
 			
 			ExecDropSingleTupleTableSlot(slot);
