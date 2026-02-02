@@ -132,8 +132,9 @@ if (!XACT_INFO_IS_FINISHED(tupHdr->OTupleXactInfo))
 
 4. **Wait for in-progress transactions**:
    - After the scan, wait for all tracked in-progress transactions to complete
-   - Use `xid_is_finished(oxid)` with 10-minute timeout
-   - Log progress every minute
+   - Use `wait_for_oxid(oxid)` which uses PostgreSQL's `VirtualXactLock` mechanism
+   - This properly waits for transactions without polling
+   - Handles interrupts gracefully
 
 5. **Clean up aborted transactions**:
    ```c
@@ -250,13 +251,20 @@ Index now visible to queries
 3. **Why the window [undo1, undo2]?**: These changes occurred DURING our scan and need special handling
 4. **Why optimistic addition?**: More efficient than pessimistic - most transactions commit
 5. **Why autonomous delete?**: Can delete from index without affecting current transaction
+6. **Why wait_for_oxid instead of polling?**: 
+   - Uses PostgreSQL's standard VirtualXactLock mechanism
+   - No arbitrary timeouts - waits as long as needed
+   - Properly handles interrupts and cancellations
+   - More efficient - no busy-waiting with pg_usleep
+   - Integrates with PostgreSQL's deadlock detection
 
 ## Error Handling
 
-- **Timeout**: 10 minutes waiting for transactions to complete
-- **Logging**: Progress logged every minute during waits
+- **Interrupts**: Properly handled via `wait_for_oxid()` and `VirtualXactLock`
+- **Query Cancellation**: User can cancel with Ctrl+C - handled gracefully
 - **Cleanup**: Tuplestore and slots properly freed on completion
 - **Assertions**: Validate undo location monotonicity
+- **Deadlock Detection**: Integrated with PostgreSQL's standard deadlock detector
 
 ## Files Modified
 
@@ -274,7 +282,6 @@ Index now visible to queries
 
 ## Future Enhancements
 
-1. Async transaction waiting (use condition variables)
-2. Better progress reporting
-3. More comprehensive tests for edge cases
-4. Handling of very long-running transactions
+1. Better progress reporting during long waits
+2. More comprehensive tests for edge cases
+3. Handling of very long-running transactions with better visibility

@@ -1656,40 +1656,34 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 				oxid = DatumGetUInt64(oxid_datum);
 				
 				/*
-				 * Wait for transaction to finish.
-				 * xid_is_finished() checks if the transaction is committed or aborted.
-				 * Use a reasonable timeout to avoid hanging indefinitely.
+				 * Wait for transaction to finish using PostgreSQL's proper
+				 * transaction waiting mechanism instead of polling.
+				 * wait_for_oxid() uses VirtualXactLock which properly waits
+				 * for the transaction to complete and handles interrupts.
 				 */
+				if (!xid_is_finished(oxid))
 				{
-					int wait_iterations = 0;
-					const int max_wait_iterations = 600000; /* 10 minutes at 1ms intervals */
-					const int log_interval = 60000; /* Log every minute */
+					elog(DEBUG1, "CREATE INDEX CONCURRENTLY: waiting for transaction %lu to complete",
+						 oxid);
 					
-					while (!xid_is_finished(oxid))
+					/* Wait for the transaction using proper lock mechanism */
+					if (!wait_for_oxid(oxid))
 					{
-						/* Wait for transaction to complete */
-						pg_usleep(1000L);	/* Sleep 1ms */
-						CHECK_FOR_INTERRUPTS();
-						
-						wait_iterations++;
-						
-						/* Log progress periodically */
-						if (wait_iterations % log_interval == 0)
-						{
-							elog(LOG, "CREATE INDEX CONCURRENTLY: waiting for transaction %lu to complete (%d seconds)",
-								 oxid, wait_iterations / 1000);
-						}
-						
-						/* Timeout check */
-						if (wait_iterations >= max_wait_iterations)
+						/*
+						 * wait_for_oxid returns false if interrupted or lock was released
+						 * without transaction finishing. Check again if it's finished.
+						 */
+						if (!xid_is_finished(oxid))
 						{
 							ereport(ERROR,
 									(errcode(ERRCODE_QUERY_CANCELED),
-									 errmsg("CREATE INDEX CONCURRENTLY: timeout waiting for transaction %lu to complete",
-											oxid),
-									 errhint("The transaction may be blocked or taking too long to complete.")));
+									 errmsg("CREATE INDEX CONCURRENTLY: interrupted while waiting for transaction %lu",
+											oxid)));
 						}
 					}
+					
+					elog(DEBUG1, "CREATE INDEX CONCURRENTLY: transaction %lu completed",
+						 oxid);
 				}
 				
 				/*
