@@ -69,6 +69,9 @@ typedef struct
 {
 	uint64		downlink;
 	CommitSeqNo csn;
+	OInMemoryBlkno parentBlkno;
+	uint32		parentPageChangeCount;
+	OffsetNumber parentOffset;
 } BTreeSeqScanDiskDownlink;
 
 struct BTreeSeqScan
@@ -104,6 +107,8 @@ struct BTreeSeqScan
 	int64		downlinksCount;
 	int64		downlinkIndex;
 	int64		allocatedDownlinks;
+	OffsetNumber downlinkOffset;
+	bool		loadLeafsToShmem;
 
 	BTreeIterator *iter;
 	OTuple		iterEnd;
@@ -377,14 +382,33 @@ load_next_internal_page(BTreeSeqScan *scan, OTuple prevHikey,
 static void
 add_on_disk_downlink(BTreeSeqScan *scan, uint64 downlink, CommitSeqNo csn)
 {
+	BTreeSeqScanDiskDownlink *entry;
+
 	if (scan->downlinksCount >= scan->allocatedDownlinks)
 	{
 		scan->allocatedDownlinks *= 2;
 		scan->diskDownlinks = (BTreeSeqScanDiskDownlink *) repalloc_huge(scan->diskDownlinks,
 																		 sizeof(scan->diskDownlinks[0]) * scan->allocatedDownlinks);
 	}
-	scan->diskDownlinks[scan->downlinksCount].downlink = downlink;
-	scan->diskDownlinks[scan->downlinksCount].csn = csn;
+
+	entry = &scan->diskDownlinks[scan->downlinksCount];
+	entry->downlink = downlink;
+	entry->csn = csn;
+
+	if (scan->loadLeafsToShmem &&
+		OInMemoryBlknoIsValid(scan->context.items[scan->context.index].blkno) &&
+		OffsetNumberIsValid(scan->downlinkOffset))
+	{
+		entry->parentBlkno = scan->context.items[scan->context.index].blkno;
+		entry->parentPageChangeCount = scan->context.items[scan->context.index].pageChangeCount;
+		entry->parentOffset = scan->downlinkOffset;
+	}
+	else
+	{
+		entry->parentBlkno = OInvalidInMemoryBlkno;
+		entry->parentPageChangeCount = 0;
+		entry->parentOffset = InvalidOffsetNumber;
+	}
 	scan->downlinksCount++;
 }
 
@@ -623,6 +647,8 @@ get_next_downlink(BTreeSeqScan *scan, uint64 *downlink,
 {
 	ParallelOScanDesc poscan = scan->poscan;
 
+	scan->downlinkOffset = InvalidOffsetNumber;
+
 	if (!poscan)
 	{
 		/* Non-parallel case */
@@ -663,6 +689,9 @@ get_next_downlink(BTreeSeqScan *scan, uint64 *downlink,
 
 			if (BTREE_PAGE_LOCATOR_IS_VALID(scan->context.img, &scan->intLoc))
 			{
+				OffsetNumber curOffset;
+
+				curOffset = BTREE_PAGE_LOCATOR_GET_OFFSET(scan->context.img, &scan->intLoc);
 				get_current_downlink_key(scan, &scan->intLoc, scan->intStartOffset,
 										 scan->prevHikey.tuple, keyRangeLow,
 										 downlink, scan->context.img);
@@ -672,6 +701,7 @@ get_next_downlink(BTreeSeqScan *scan, uint64 *downlink,
 				 * internal locator
 				 */
 				get_next_key(scan, &scan->intLoc, keyRangeHigh, scan->context.img);
+				scan->downlinkOffset = curOffset;
 				return true;
 			}
 
@@ -793,6 +823,8 @@ get_next_downlink(BTreeSeqScan *scan, uint64 *downlink,
 
 			if (BTREE_PAGE_LOCATOR_IS_VALID(curPage->img, &loc))	/* inside int page */
 			{
+				OffsetNumber curOffset = curPage->offset;
+
 				get_current_downlink_key(scan, &loc, curPage->startOffset,
 										 fixed_shmem_key_get_tuple(&curPage->prevHikey),
 										 keyRangeLow, downlink, curPage->img);
@@ -802,6 +834,7 @@ get_next_downlink(BTreeSeqScan *scan, uint64 *downlink,
 				/* Push next internal item page offset into shared state */
 				curPage->offset = BTREE_PAGE_LOCATOR_GET_OFFSET(curPage->img, &loc);
 				scan->context.imgReadCsn = curPage->imgReadCsn;
+				scan->downlinkOffset = curOffset;
 				SpinLockRelease(&poscan->intpageAccess);
 				return true;
 			}
@@ -957,6 +990,80 @@ iterate_internal_page(BTreeSeqScan *scan)
 }
 
 static bool
+load_leaf_page_to_shmem(BTreeSeqScan *scan, FileExtent *extent,
+						BTreeSeqScanDiskDownlink *downlink)
+{
+	Page		parentPage;
+	BTreePageItemLocator loc;
+	BTreeNonLeafTuphdr *intHdr;
+	OrioleDBPageDesc *pageDesc,
+			   *parentPageDesc;
+	OInMemoryBlkno parentBlkno,
+				blkno;
+	BTreePageHeader *header = (BTreePageHeader *) scan->leafImg;
+
+	if (!scan->loadLeafsToShmem)
+		return false;
+
+	parentBlkno = downlink->parentBlkno;
+	if (!OInMemoryBlknoIsValid(parentBlkno) ||
+		!FileExtentIsValid(*extent) ||
+		!OffsetNumberIsValid(downlink->parentOffset))
+		return false;
+
+	lock_page(parentBlkno);
+	parentPage = O_GET_IN_MEMORY_PAGE(parentBlkno);
+	if (O_PAGE_GET_CHANGE_COUNT(parentPage) != downlink->parentPageChangeCount)
+	{
+		unlock_page(parentBlkno);
+		return false;
+	}
+
+	BTREE_PAGE_OFFSET_GET_LOCATOR(parentPage, downlink->parentOffset, &loc);
+	if (!BTREE_PAGE_LOCATOR_IS_VALID(parentPage, &loc))
+	{
+		unlock_page(parentBlkno);
+		return false;
+	}
+
+	intHdr = (BTreeNonLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(parentPage, &loc);
+	if (!DOWNLINK_IS_ON_DISK(intHdr->downlink) ||
+		intHdr->downlink != downlink->downlink)
+	{
+		unlock_page(parentBlkno);
+		return false;
+	}
+
+	ppool_reserve_pages(scan->desc->ppool, PPOOL_RESERVE_FIND, 1);
+	blkno = ppool_get_page(scan->desc->ppool, PPOOL_RESERVE_FIND);
+	lock_page(blkno);
+	page_block_reads(blkno);
+
+	parentPageDesc = O_GET_IN_MEMORY_PAGEDESC(parentBlkno);
+	pageDesc = O_GET_IN_MEMORY_PAGEDESC(blkno);
+	pageDesc->flags = 0;
+	pageDesc->fileExtent = *extent;
+	pageDesc->type = parentPageDesc->type;
+	pageDesc->oids = parentPageDesc->oids;
+
+	put_page_image(blkno, scan->leafImg);
+	page_change_usage_count(&scan->desc->ppool->ucm, blkno,
+							(pg_atomic_read_u32(scan->desc->ppool->ucm.epoch) + 2) % UCM_USAGE_LEVELS);
+	unlock_page(blkno);
+
+	EA_LOAD_INC(blkno);
+	PAGE_DEC_N_ONDISK(parentPage);
+
+	intHdr->downlink = MAKE_IN_MEMORY_DOWNLINK(blkno, header->o_header.pageChangeCount);
+	scan->hint.blkno = blkno;
+	scan->hint.pageChangeCount = header->o_header.pageChangeCount;
+
+	unlock_page(parentBlkno);
+
+	return true;
+}
+
+static bool
 load_next_disk_leaf_page(BTreeSeqScan *scan)
 {
 	FileExtent	extent;
@@ -1011,6 +1118,8 @@ load_next_disk_leaf_page(BTreeSeqScan *scan)
 	scan->downlinkIndex++;
 	scan->hint.blkno = OInvalidInMemoryBlkno;
 	scan->hint.pageChangeCount = InvalidOPageChangeCount;
+	if (success)
+		(void) load_leaf_page_to_shmem(scan, &extent, &downlink);
 	O_TUPLE_SET_NULL(scan->nextKey.tuple);
 	load_first_historical_page(scan);
 	return true;
@@ -1175,6 +1284,8 @@ make_btree_seq_scan_internal(BTreeDescr *desc, OSnapshot *oSnapshot,
 	scan->initialized = false;
 	scan->checkpointNumberSet = false;
 	scan->haveHistImg = false;
+	scan->downlinkOffset = InvalidOffsetNumber;
+	scan->loadLeafsToShmem = poscan && orioledb_seqscan_load_leaf_pages_to_shmem;
 	BTREE_PAGE_LOCATOR_SET_INVALID(&scan->leafLoc);
 
 	dlist_push_tail(&listOfScans, &scan->listNode);

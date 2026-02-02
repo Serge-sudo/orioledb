@@ -449,6 +449,40 @@ SELECT * FROM o_test_no_parallel_bitmap_scan WHERE val_1 <@ int4range(10,50);
 
 COMMIT;
 
+BEGIN;
+
+SET LOCAL parallel_setup_cost = 0;
+SET LOCAL parallel_tuple_cost = 0;
+SET LOCAL min_parallel_table_scan_size = 0;
+SET LOCAL max_parallel_workers_per_gather = 2;
+SET LOCAL force_parallel_mode = on;
+SET LOCAL orioledb.seqscan_load_leaf_pages_to_shmem = on;
+
+CREATE TABLE o_test_parallel_leaf_load (
+    val_1 int PRIMARY KEY,
+    val_2 text
+) USING orioledb;
+
+INSERT INTO o_test_parallel_leaf_load
+	SELECT g, repeat('x', 50) FROM generate_series(1, 200) g;
+
+SELECT orioledb_evict_pages('o_test_parallel_leaf_load'::regclass, 0);
+
+WITH before_pages AS (
+	SELECT count(*) AS pages_before
+	FROM orioledb_table_pages('o_test_parallel_leaf_load'::regclass)
+),
+after_pages AS (
+	SELECT count(*) AS pages_after
+	FROM before_pages,
+		 (SELECT count(*) FROM o_test_parallel_leaf_load) s,
+		 orioledb_table_pages('o_test_parallel_leaf_load'::regclass)
+)
+SELECT pages_after > pages_before AS leaf_pages_loaded
+FROM before_pages, after_pages;
+
+COMMIT;
+
 DROP EXTENSION orioledb CASCADE;
 DROP SCHEMA parallel_scan CASCADE;
 RESET search_path;
