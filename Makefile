@@ -92,6 +92,7 @@ REGRESSCHECKS = btree_sys_check \
 				bitmap_scan \
 				btree_compression \
 				btree_print \
+				concurrent_index \
 				createas \
 				ddl \
 				explain \
