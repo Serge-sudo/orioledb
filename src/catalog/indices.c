@@ -1296,12 +1296,15 @@ scan_getnextslot_allattrs(oIdxBuildState *buildstate, BTreeSeqScan *scan, OTable
 
 	if (buildstate->concurrentStage == 1)
 	{
-		tup = btree_seq_scan_getnext_raw(scan, slot->tts_mcxt, &hint, tupHdr);
+		bool end;
+		tup = btree_seq_scan_getnext_raw(scan, slot->tts_mcxt, &end, &hint, tupHdr);
 		tupleCsn = InvalidCSN;
 	}
 	else if (buildstate->concurrentStage == 2)
 	{
-		tup = btree_seq_scan_getnext_page_undo(scan, slot->tts_mcxt, &hint, tupHdr);
+		/* Stage 2: Use raw scan to see all tuples including uncommitted ones */
+		bool end;
+		tup = btree_seq_scan_getnext_raw(scan, slot->tts_mcxt, &end, &hint, tupHdr);
 		tupleCsn = InvalidCSN;
 	}
 	else
@@ -1358,63 +1361,70 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 			if (buildstate->concurrentStage == 2)
 			{
 				Assert(UndoLocationIsValid(buildstate->undo1));
-				if (tupHdr->undoLocation >= buildstate->undo1 && tupHdr->undoLocation <= buildstate->undo2)
+				Assert(UndoLocationIsValid(buildstate->undo2));
+				
+				/* 
+				 * Only process tuples modified between undo1 and undo2.
+				 * Tuples outside this range were either:
+				 * - Already indexed in Stage 1 (before undo1)
+				 * - Will be indexed normally with undo records (after undo2)
+				 */
+				if (tupHdr->undoLocation < buildstate->undo1 || tupHdr->undoLocation > buildstate->undo2)
 				{
-					/* Tuples inserted between undo1 and undo2 need to be inserted into index */
-					if (!XACT_INFO_IS_FINISHED(tupHdr->OTupleXactInfo))
-					{
-						/* Store tuples for non-complete transactions for later processing */
-						Datum *values;
-						bool *nulls;
-						int natts = idx->leafTupdesc->natts;
-
-						buildstate->noncomplete_xact = true;
-						if(!buildstate->noncomplete_xact_tupstore)
-						{
-							buildstate->noncomplete_xact_tupstore = tuplestore_begin_heap(true, false, work_mem);
-						}
-						if(!buildstate->noncomplete_xact_tupdesc)
-						{
-							/* Construct tuple descriptor with index attributes plus OXid field */
-							TupleDesc desc = CreateTemplateTupleDesc(natts + 1);
-							int i;
-							
-							for (i = 0; i < natts; i++)
-							{
-								TupleDescInitEntry(desc, i + 1,
-												   NameStr(TupleDescAttr(idx->leafTupdesc, i)->attname),
-												   TupleDescAttr(idx->leafTupdesc, i)->atttypid,
-												   TupleDescAttr(idx->leafTupdesc, i)->atttypmod,
-												   TupleDescAttr(idx->leafTupdesc, i)->attndims);
-							}
-							/* Add OXid field for transaction tracking */
-							TupleDescInitEntry(desc, natts + 1, "oxid", INT8OID, -1, 0);
-							buildstate->noncomplete_xact_tupdesc = BlessTupleDesc(desc);
-						}
-						
-						values = palloc(sizeof(Datum) * (natts + 1));
-						nulls = palloc(sizeof(bool) * (natts + 1));
-						
-						tts_orioledb_get_index_values(primarySlot, idx, values, nulls, true);
-						
-						/* Add OXid value */
-						nulls[natts] = false;
-						values[natts] = UInt64GetDatum(XACT_INFO_GET_OXID(tupHdr->OTupleXactInfo));
-						
-						tuplestore_putvalues(buildstate->noncomplete_xact_tupstore,
-											 buildstate->noncomplete_xact_tupdesc, values, nulls);
-						pfree(values);
-						pfree(nulls);
-						
-						/* Skip adding to index now - will process after transactions complete */
-						continue;
-					}
-				}
-				else
-				{
-					/* Tuples inserted before undo1 and after ubdo2 are already in the index. Skip them. */
+					/* Skip tuples outside the [undo1, undo2] range */
 					continue;
 				}
+				
+				/* Tuples in the range [undo1, undo2] need special handling */
+				if (!XACT_INFO_IS_FINISHED(tupHdr->OTupleXactInfo))
+				{
+					/* Store tuples for non-complete transactions for later processing */
+					Datum *values;
+					bool *nulls;
+					int natts = idx->leafTupdesc->natts;
+
+					buildstate->noncomplete_xact = true;
+					if(!buildstate->noncomplete_xact_tupstore)
+					{
+						buildstate->noncomplete_xact_tupstore = tuplestore_begin_heap(true, false, work_mem);
+					}
+					if(!buildstate->noncomplete_xact_tupdesc)
+					{
+						/* Construct tuple descriptor with index attributes plus OXid field */
+						TupleDesc desc = CreateTemplateTupleDesc(natts + 1);
+						int i;
+						
+						for (i = 0; i < natts; i++)
+						{
+							TupleDescInitEntry(desc, i + 1,
+											   NameStr(TupleDescAttr(idx->leafTupdesc, i)->attname),
+											   TupleDescAttr(idx->leafTupdesc, i)->atttypid,
+											   TupleDescAttr(idx->leafTupdesc, i)->atttypmod,
+											   TupleDescAttr(idx->leafTupdesc, i)->attndims);
+						}
+						/* Add OXid field for transaction tracking */
+						TupleDescInitEntry(desc, natts + 1, "oxid", INT8OID, -1, 0);
+						buildstate->noncomplete_xact_tupdesc = BlessTupleDesc(desc);
+					}
+					
+					values = palloc(sizeof(Datum) * (natts + 1));
+					nulls = palloc(sizeof(bool) * (natts + 1));
+					
+					tts_orioledb_get_index_values(primarySlot, idx, values, nulls, true);
+					
+					/* Add OXid value */
+					nulls[natts] = false;
+					values[natts] = UInt64GetDatum(XACT_INFO_GET_OXID(tupHdr->OTupleXactInfo));
+					
+					tuplestore_putvalues(buildstate->noncomplete_xact_tupstore,
+										 buildstate->noncomplete_xact_tupdesc, values, nulls);
+					pfree(values);
+					pfree(nulls);
+					
+					/* Skip adding to index now - will process after transactions complete */
+					continue;
+				}
+				/* Transaction is finished - add tuple to index normally */
 			}
 			secondaryTup = tts_orioledb_make_secondary_tuple(primarySlot,
 															 idx, true);
@@ -1593,9 +1603,9 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		buildstate.noncomplete_xact_tupstore = NULL;
 		buildstate.noncomplete_xact_tupdesc = NULL;
 
-		/* Begin serial stage2 tuplesort */
+		/* Begin serial stage2 tuplesort (no parallel support for stage 2) */
 		sortstates = palloc0(sizeof(Pointer));
-		sortstates[0] = tuplesort_begin_orioledb_index(idx, work_mem, false, coordinate);
+		sortstates[0] = tuplesort_begin_orioledb_index(idx, work_mem, false, NULL);
 		
 		/* Scan primary index for tuples modified between undo1 and undo2 */
 		build_secondary_index_worker_heap_scan(&buildstate, descr, idx, NULL, sortstates, false, &heap_tuples, &index_tuples);
