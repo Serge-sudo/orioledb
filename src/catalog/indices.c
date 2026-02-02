@@ -1376,7 +1376,11 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 				/* Tuples in the range [undo1, undo2] need special handling */
 				if (!XACT_INFO_IS_FINISHED(tupHdr->OTupleXactInfo))
 				{
-					/* Store tuples for non-complete transactions for later processing */
+					/* 
+				 * Store transaction info for incomplete transactions.
+				 * We'll add the tuple to the index now (optimistically),
+				 * and later remove it if the transaction aborts.
+				 */
 					Datum *values;
 					bool *nulls;
 					int natts = idx->leafTupdesc->natts;
@@ -1419,8 +1423,7 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 					pfree(values);
 					pfree(nulls);
 					
-					/* Skip adding to index now - will process after transactions complete */
-					continue;
+					/* Fall through to add tuple to index optimistically */
 				}
 				/* Transaction is finished - add tuple to index normally */
 			}
@@ -1691,36 +1694,70 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 				
 				/*
 				 * Check transaction status and handle aborted transactions.
-				 * Aborted transactions should not have their tuples in the index.
+				 * All incomplete transaction tuples were added to the index optimistically.
+				 * Now we need to remove tuples from aborted transactions.
 				 */
 				{
 					CommitSeqNo csn = oxid_get_csn(oxid);
 					
-					/*
-					 * For aborted transactions, we don't need to add tuples to the index
-					 * since they were never committed. The tuples are effectively invisible.
-					 * For committed transactions, their tuples were already added during
-					 * the Stage 2 scan (when XACT_INFO_IS_FINISHED was true).
-					 * 
-					 * Note: We check the CSN but don't need to actively delete anything
-					 * because:
-					 * 1. Aborted transaction tuples were stored in tuplestore but never
-					 *    added to the index (we did 'continue' before adding them)
-					 * 2. Committed transaction tuples were added during Stage 2 scan
-					 */
 					if (csn == COMMITSEQNO_ABORTED)
 					{
-						/* Transaction aborted - tuple should not be in index */
-						elog(DEBUG1, "CREATE INDEX CONCURRENTLY: transaction %lu aborted, skipping tuple",
-							 oxid);
+						/* 
+						 * Transaction aborted - remove its tuple from the index.
+						 * We added it optimistically during Stage 2 scan, now we need to delete it.
+						 */
+						Datum *indexValues;
+						bool *indexNulls;
+						OTuple indexTuple;
+						bool deleted;
+						int natts = idx->leafTupdesc->natts;
+						int i;
+						
+						/* Extract index values from the stored tuple (excluding the OXid field) */
+						slot_getallattrs(slot);
+						
+						indexValues = palloc(sizeof(Datum) * natts);
+						indexNulls = palloc(sizeof(bool) * natts);
+						
+						/* Copy index attribute values (first natts columns, excluding the last OXid column) */
+						for (i = 0; i < natts; i++)
+						{
+							indexValues[i] = slot->tts_values[i];
+							indexNulls[i] = slot->tts_isnull[i];
+						}
+						
+						/* Form the index tuple to delete */
+						indexTuple = o_form_tuple(idx->leafTupdesc, &idx->leafSpec, 
+												 0, indexValues, indexNulls);
+						
+						/* Delete from the index */
+						deleted = o_btree_autonomous_delete(&idx->desc, indexTuple, 
+														   BTreeKeyLeafTuple, NULL);
+						
+						if (deleted)
+						{
+							elog(DEBUG1, "CREATE INDEX CONCURRENTLY: removed tuple from aborted transaction %lu",
+								 oxid);
+						}
+						else
+						{
+							elog(WARNING, "CREATE INDEX CONCURRENTLY: failed to remove tuple from aborted transaction %lu",
+								 oxid);
+						}
+						
+						if (indexTuple.data)
+							pfree(indexTuple.data);
+						pfree(indexValues);
+						pfree(indexNulls);
 					}
 					else
 					{
 						/*
-						 * Transaction committed - its tuple should have been added
-						 * during Stage 2 scan when XACT_INFO_IS_FINISHED became true.
-						 * Nothing more to do here.
+						 * Transaction committed - tuple was added optimistically during Stage 2 
+						 * and should remain in the index. Nothing more to do.
 						 */
+						elog(DEBUG1, "CREATE INDEX CONCURRENTLY: transaction %lu committed, tuple remains in index",
+							 oxid);
 					}
 				}
 			}
