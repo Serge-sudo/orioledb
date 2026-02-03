@@ -15,13 +15,24 @@ Secondary indexes in OrioleDB follow the same MVCC (Multi-Version Concurrency Co
 
 ### Same MVCC Mechanism as Primary Indexes
 
-Secondary indexes in OrioleDB **do keep previous versions** of index entries through the undo log system, just like primary indexes. When a transaction modifies data that affects a secondary index (e.g., updates or deletes tuples), the following happens:
+Secondary indexes in OrioleDB **do keep previous versions** of index entries through the undo log system, just like primary indexes. All indexes (primary, secondary, and TOAST) are configured with `undoType = UndoLogRegular`, which means they participate in the undo log mechanism.
+
+When a transaction modifies data that affects a secondary index (e.g., updates or deletes tuples), the following happens:
 
 1. **Undo Records Are Created**: Each modification to a secondary index tuple creates an undo record that stores the previous version of that tuple's header and optionally its data.
 
 2. **Undo Chains**: The tuples in secondary indexes maintain undo chains, where the current version on the page points to previous versions stored in the undo log.
 
 3. **Transaction Isolation**: Until a transaction commits, the old index entries remain accessible through the undo log, ensuring that other transactions with earlier snapshots can still see the previous versions.
+
+### Optimization for Self-Created Tuples
+
+There is one optimization: Secondary indexes use `needs_undo = NULL` in their operations structure, while primary indexes use a custom `pk_needs_undo` callback. This means:
+
+- **Primary indexes**: Have special logic to determine when undo is needed for tuples created by the same transaction
+- **Secondary indexes**: Use a simpler rule - if a tuple was created by the same transaction and there's no savepoint, no undo record is created when modifying it
+
+This is an optimization for the case where a transaction inserts a tuple and then updates or deletes it before committing. However, this does NOT mean secondary indexes don't use undo - they still create undo records for all other modifications.
 
 ### Example: Transaction Deletes Multiple Tuples
 
@@ -55,6 +66,31 @@ DELETE FROM vegetables WHERE count < 5;
    - Eventually, the undo records are evicted when no longer needed
 
 ## Undo Log Structure for Secondary Indexes
+
+### Implementation Details
+
+All index types (primary, secondary, and TOAST) are initialized with the same undo log configuration in `index_btree_desc_init()`:
+
+```c
+// From src/tableam/tree.c
+desc->undoType = UndoLogRegular;
+```
+
+This means secondary indexes:
+- **DO** participate in the undo log system
+- **DO** create undo records for modifications to existing tuples
+- **DO** maintain undo chains for version history
+- **CAN** rollback changes using the undo log
+
+The only difference is in the `BTreeOps` structure:
+- Primary indexes: `needs_undo = pk_needs_undo` (custom callback)
+- Secondary indexes: `needs_undo = NULL` (default behavior)
+- TOAST indexes: `needs_undo = o_toast_needs_undo` (custom callback)
+
+The `needs_undo` callback determines whether to create undo records when modifying tuples that were created by the same transaction. When `NULL`, the system uses default logic that skips undo creation only if:
+- The tuple was created by the current transaction
+- There's no active savepoint
+- The modification is not happening within a nested transaction
 
 ### Tuple Header with Undo Pointer
 
