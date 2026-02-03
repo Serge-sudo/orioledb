@@ -138,10 +138,8 @@ if (!XACT_INFO_IS_FINISHED(tupHdr->OTupleXactInfo))
 
 5. **Clean up aborted transactions**:
    ```c
-   if (csn == COMMITSEQNO_ABORTED)
-   {
-       // Remove tuple from index using o_btree_autonomous_delete
-   }
+   // TODO: Implement using page_item_rollback with BTreeUndoModeLimit
+   // to rollback secondary index changes
    ```
 
 **Code Location**: `src/catalog/indices.c` lines 1620-1750
@@ -171,10 +169,9 @@ We add **all** tuples from in-progress transactions to the index because:
 ### Handling Aborted Transactions
 
 When a tracked transaction aborts:
-1. Extract the stored index values (excluding the OXid we added for tracking)
-2. Form the index tuple using `o_form_tuple()`
-3. Delete it from the index using `o_btree_autonomous_delete()`
-4. Log the removal at DEBUG1 level
+- TODO: Implement proper cleanup using `page_item_rollback()` with `BTreeUndoModeLimit`
+- This will rollback secondary index changes using the undo chain
+- More aligned with OrioleDB's MVCC architecture
 
 ### Handling Committed Transactions
 
@@ -250,8 +247,7 @@ Index now visible to queries
 2. **Why track undo2?**: Marks the cutoff - changes after this have normal undo records
 3. **Why the window [undo1, undo2]?**: These changes occurred DURING our scan and need special handling
 4. **Why optimistic addition?**: More efficient than pessimistic - most transactions commit
-5. **Why autonomous delete?**: Can delete from index without affecting current transaction
-6. **Why wait_for_oxid instead of polling?**: 
+5. **Why wait_for_oxid instead of polling?**: 
    - Uses PostgreSQL's standard VirtualXactLock mechanism
    - No arbitrary timeouts - waits as long as needed
    - Properly handles interrupts and cancellations

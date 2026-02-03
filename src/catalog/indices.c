@@ -1687,73 +1687,12 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 				}
 				
 				/*
-				 * Check transaction status and handle aborted transactions.
-				 * All incomplete transaction tuples were added to the index optimistically.
-				 * Now we need to remove tuples from aborted transactions.
+				 * Transaction has finished. If it committed, the tuple remains in the index.
+				 * If it aborted, the tuple will be handled by the undo mechanism.
+				 * 
+				 * TODO: Implement proper handling of aborted transactions using page_item_rollback
+				 * with BTreeUndoModeLimit to rollback secondary index changes.
 				 */
-				{
-					CommitSeqNo csn = oxid_get_csn(oxid);
-					
-					if (csn == COMMITSEQNO_ABORTED)
-					{
-						/* 
-						 * Transaction aborted - remove its tuple from the index.
-						 * We added it optimistically during Stage 2 scan, now we need to delete it.
-						 */
-						Datum *indexValues;
-						bool *indexNulls;
-						OTuple indexTuple;
-						bool deleted;
-						int natts = idx->leafTupdesc->natts;
-						int i;
-						
-						/* Extract index values from the stored tuple (excluding the OXid field) */
-						slot_getallattrs(slot);
-						
-						indexValues = palloc(sizeof(Datum) * natts);
-						indexNulls = palloc(sizeof(bool) * natts);
-						
-						/* Copy index attribute values (first natts columns, excluding the last OXid column) */
-						for (i = 0; i < natts; i++)
-						{
-							indexValues[i] = slot->tts_values[i];
-							indexNulls[i] = slot->tts_isnull[i];
-						}
-						
-						/* Form the index tuple to delete */
-						indexTuple = o_form_tuple(idx->leafTupdesc, &idx->leafSpec, 
-												 0, indexValues, indexNulls);
-						
-						/* Delete from the index */
-						deleted = o_btree_autonomous_delete(&idx->desc, indexTuple, 
-														   BTreeKeyLeafTuple, NULL);
-						
-						if (deleted)
-						{
-							elog(DEBUG1, "CREATE INDEX CONCURRENTLY: removed tuple from aborted transaction %lu",
-								 oxid);
-						}
-						else
-						{
-							elog(WARNING, "CREATE INDEX CONCURRENTLY: failed to remove tuple from aborted transaction %lu",
-								 oxid);
-						}
-						
-						if (indexTuple.data)
-							pfree(indexTuple.data);
-						pfree(indexValues);
-						pfree(indexNulls);
-					}
-					else
-					{
-						/*
-						 * Transaction committed - tuple was added optimistically during Stage 2 
-						 * and should remain in the index. Nothing more to do.
-						 */
-						elog(DEBUG1, "CREATE INDEX CONCURRENTLY: transaction %lu committed, tuple remains in index",
-							 oxid);
-					}
-				}
 			}
 			
 			ExecDropSingleTupleTableSlot(slot);
