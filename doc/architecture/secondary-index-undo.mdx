@@ -111,17 +111,14 @@ Each operation creates its own undo record, maintaining a complete audit trail.
 
 ### Rollback Behavior
 
-If a transaction is aborted or rolled back:
+If a transaction is aborted or rolled back, the system uses the `page_item_rollback()` function from `src/btree/undo.c` to:
 
-```c
-// From src/btree/undo.c - page_item_rollback()
-```
-
-The system:
 1. Traverses the undo chain for affected tuples
 2. Restores previous tuple headers and data
 3. Reverts deletions by unmarking tuples
 4. Removes inserted tuples that haven't been committed
+
+The rollback process walks the undo chain backwards, replaying each undo record to restore the previous state. For secondary indexes, this means restoring old index entries that were deleted or reverting new entries that were inserted during the transaction.
 
 ## Key Differences from PostgreSQL Heap Tables
 
