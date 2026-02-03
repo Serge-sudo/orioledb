@@ -136,10 +136,11 @@ if (!XACT_INFO_IS_FINISHED(tupHdr->OTupleXactInfo))
    - This properly waits for transactions without polling
    - Handles interrupts gracefully
 
-5. **Clean up aborted transactions**:
+5. **Rollback aborted transactions**:
    ```c
-   // TODO: Implement using page_item_rollback with BTreeUndoModeLimit
-   // to rollback secondary index changes
+   // Scan primary index for tuples with undoLocation in [undo1, undo2]
+   // Call page_item_rollback with BTreeUndoModeLimit to rollback
+   // secondary index changes for aborted transactions
    ```
 
 **Code Location**: `src/catalog/indices.c` lines 1620-1750
@@ -168,10 +169,11 @@ We add **all** tuples from in-progress transactions to the index because:
 
 ### Handling Aborted Transactions
 
-When a tracked transaction aborts:
-- TODO: Implement proper cleanup using `page_item_rollback()` with `BTreeUndoModeLimit`
-- This will rollback secondary index changes using the undo chain
-- More aligned with OrioleDB's MVCC architecture
+After all tracked transactions complete:
+1. Scan the primary index looking for tuples with `undoLocation` in [undo1, undo2]
+2. For each such tuple, call `page_item_rollback()` with `BTreeUndoModeLimit`
+3. This walks the undo chain and undoes secondary index changes for aborted transactions
+4. Uses `SecondaryIndexRollbackCxt` to specify the rollback window and target index
 
 ### Handling Committed Transactions
 

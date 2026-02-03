@@ -16,6 +16,7 @@
 
 #include "btree/build.h"
 #include "btree/io.h"
+#include "btree/iterator.h"
 #include "btree/undo.h"
 #include "btree/scan.h"
 #include "checkpoint/checkpoint.h"
@@ -1623,14 +1624,12 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		pfree(sortstates);
 
 		/*
-		 * Wait for all transactions with tuples between undo1 and undo2 to finish.
-		 * For committed transactions, their tuples are already in the index.
-		 * For rolled back transactions, we would need to remove those tuples.
+		 * Wait for all transactions with tuples between undo1 and undo2 to finish,
+		 * then rollback secondary index changes for aborted transactions.
 		 */
 		if (buildstate.noncomplete_xact)
 		{
 			TupleTableSlot *slot;
-			bool		found;
 			
 			/* Create slot for reading tuplestore */
 			slot = MakeTupleTableSlot(buildstate.noncomplete_xact_tupdesc, &TTSOpsMinimalTuple);
@@ -1638,10 +1637,7 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 			tuplestore_rescan(buildstate.noncomplete_xact_tupstore);
 			
 			/*
-			 * Process each tuple with incomplete transaction.
-			 * We check if the transaction has committed or aborted.
-			 * Note: For now, we wait synchronously. A future optimization
-			 * could be to wait asynchronously or in batches.
+			 * First, wait for all tracked transactions to complete.
 			 */
 			while (tuplestore_gettupleslot(buildstate.noncomplete_xact_tupstore, true, false, slot))
 			{
@@ -1685,19 +1681,96 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 					elog(DEBUG1, "CREATE INDEX CONCURRENTLY: transaction %lu completed",
 						 oxid);
 				}
-				
-				/*
-				 * Transaction has finished. If it committed, the tuple remains in the index.
-				 * If it aborted, the tuple will be handled by the undo mechanism.
-				 * 
-				 * TODO: Implement proper handling of aborted transactions using page_item_rollback
-				 * with BTreeUndoModeLimit to rollback secondary index changes.
-				 */
 			}
 			
 			ExecDropSingleTupleTableSlot(slot);
 			tuplestore_end(buildstate.noncomplete_xact_tupstore);
 			buildstate.noncomplete_xact_tupstore = NULL;
+			
+			/*
+			 * Now that all transactions have completed, rollback secondary index changes
+			 * for aborted transactions by scanning the primary index and calling
+			 * page_item_rollback with BTreeUndoModeLimit.
+			 */
+			{
+				BTreeDescr *primary_desc = &descr->indices[PrimaryIndexNumber]->desc;
+				BTreeIterator *it;
+				OTuple		tup;
+				CommitSeqNo csn = COMMITSEQNO_INPROGRESS;
+				BTreeLocationHint hint;
+				SecondaryIndexRollbackCxt rollbackCxt;
+				
+				/* Setup rollback context */
+				rollbackCxt.limitUndoLocation1 = buildstate.undo1;
+				rollbackCxt.limitUndoLocation2 = buildstate.undo2;
+				rollbackCxt.rel = idx->tableRelation;
+				rollbackCxt.descr = descr;
+				rollbackCxt.ix_num = ix_num;
+				rollbackCxt.index_descr = idx;
+				
+				elog(DEBUG1, "CREATE INDEX CONCURRENTLY: scanning primary index to rollback aborted transactions in range [%lu, %lu]",
+					 buildstate.undo1, buildstate.undo2);
+				
+				/*
+				 * Scan the primary index and rollback secondary index changes
+				 * for tuples with undoLocation in [undo1, undo2] that belong
+				 * to aborted transactions.
+				 */
+				it = o_btree_iterator_create(primary_desc, NULL, BTreeKeyNone,
+											 csn, ForwardScanDirection);
+				
+				tup = o_btree_iterator_fetch(it, NULL, BTreeKeyNone, false, &hint);
+				
+				while (!O_TUPLE_IS_NULL(tup))
+				{
+					BTreeLeafTuphdr *tupHdr = (BTreeLeafTuphdr *) tup.data;
+					UndoLocation undoLoc = tupHdr->undoLocation;
+					
+					/*
+					 * Check if this tuple's undoLocation is in our window [undo1, undo2].
+					 * If so, call page_item_rollback to handle any aborted transaction changes.
+					 */
+					if (UndoLocationIsValid(undoLoc) &&
+						undoLoc >= buildstate.undo1 &&
+						undoLoc <= buildstate.undo2)
+					{
+						OInMemoryBlkno blkno = hint.blkno;
+						uint16 pageChangeCount = hint.pageChangeCount;
+						Page p;
+						BTreePageItemLocator loc;
+						
+						/* Get the page and locate the item */
+						p = O_GET_IN_MEMORY_PAGE(blkno);
+						
+						if (O_PAGE_IS(p, LEAF) && 
+							hint.pageChangeCount == O_PAGE_CHANGE_COUNT(p))
+						{
+							/* Find the item on the page */
+							loc.blkno = blkno;
+							loc.pageOffset = hint.pageOffset;
+							
+							/*
+							 * Call page_item_rollback with BTreeUndoModeLimit to rollback
+							 * secondary index changes for aborted transactions in the [undo1, undo2] window.
+							 * This will walk the undo chain and undo changes to the secondary index
+							 * for transactions that aborted.
+							 */
+							(void) page_item_rollback(primary_desc, p, &loc,
+													 BTreeUndoModeLimit,
+													 NULL, InvalidUndoLocation,
+													 rollbackCxt);
+						}
+						
+						O_RELEASE_IN_MEMORY_PAGE(p);
+					}
+					
+					tup = o_btree_iterator_fetch(it, NULL, BTreeKeyNone, true, &hint);
+				}
+				
+				btree_iterator_free(it);
+				
+				elog(DEBUG1, "CREATE INDEX CONCURRENTLY: completed rollback of aborted transactions");
+			}
 		}
 
 		/* Stage 4: Now make the index visible for normal operation */
