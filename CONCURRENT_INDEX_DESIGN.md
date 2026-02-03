@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document explains how CREATE INDEX CONCURRENTLY works in OrioleDB, using a 4-stage undo-based protocol to build indexes while allowing concurrent modifications to the table.
+This document explains how CREATE INDEX CONCURRENTLY works in OrioleDB, using a 5-stage undo-based protocol to build indexes while allowing concurrent modifications to the table.
 
 ## What is UndoLocation?
 
@@ -21,141 +21,103 @@ typedef uint64 UndoLocation;
 2. **Per-Tuple Tracking**: Each tuple in OrioleDB has an `undoLocation` field in its header that indicates when it was last modified
 3. **Transaction Boundary Marker**: UndoLocation values serve as timestamps for when changes occurred
 
-### Why First Scan Takes First Locator?
+### Why Capture undo1 Before Scan?
 
-During the first scan (Stage 1), we capture the `undoLocation` from the **first tuple** we encounter and store it as `undo1`. This serves as our baseline timestamp.
+In the new protocol, we capture `undo1` **before** starting the scan (not from the first tuple). This provides a clear boundary: any tuple with `undoLocation >= undo1` was potentially modified during or after our scan started.
 
-**Key Insight**: Since undo locations are monotonically increasing, and we're scanning the table sequentially:
-- The first tuple we scan has some `undoLocation` value (call it `undo1`)
-- All subsequent tuples will have `undoLocation >= undo1` because:
-  - If they were modified BEFORE the first tuple, they would have been scanned first
-  - If they were modified AFTER, they naturally have higher undo locations
+**Key Insight**: This approach is more robust than capturing from the first tuple because:
+- It establishes a definite point in time BEFORE scan begins
+- We don't depend on the order in which tuples are scanned
+- It's simpler to reason about: [undo1, undo2] represents the entire scan window
 
-**The Assert Statement**:
-```c
-Assert(tupHdr->undoLocation >= buildstate->undo1);
-```
-
-This assertion validates that the monotonic property holds during our scan. If this fails, it indicates a bug in the scanning logic or undo log system.
-
-## The 4-Stage Protocol
+## The 5-Stage Protocol
 
 ### Stage 1: Initial Index Build
 
-**Purpose**: Build the index from all existing data while tracking when we started.
+**Purpose**: Build the index from all existing data while tracking the scan window.
 
 **Process**:
-1. Create a placeholder for the index (makes it invisible to queries)
-2. Scan the entire primary table
-3. For the **first tuple** encountered, capture its `undoLocation` as `undo1`
-   - This marks the "beginning of time" for our index build
-   - Represents the undo log position at the start of our scan
-4. Build index entries for all tuples
-5. Index remains invisible (placeholder exists)
+1. **Capture undo1**: Before starting scan, call `get_cur_undo_locations()` to get current undo position
+2. Create a placeholder for the index (makes it invisible to queries)
+3. Scan the entire primary table
+4. For each tuple, build corresponding index entries
+5. Index remains invisible (placeholder not removed)
 
-**Code Location**: `src/catalog/indices.c` lines 1346-1358
+**Code Location**: `build_secondary_index()` in `src/catalog/indices.c` lines ~1475-1550
 
-```c
-if (buildstate->concurrentStage == 1)
-{
-    /* Remember undo location undo1 for second scan */
-    if (!UndoLocationIsValid(buildstate->undo1))
-    {
-        buildstate->undo1 = tupHdr->undoLocation;  // Capture undo1
-    }
-    else
-    {
-        Assert(tupHdr->undoLocation >= buildstate->undo1);  // Verify monotonicity
-    }
-}
-```
+**Key Point**: undo1 is captured BEFORE the scan, establishing a baseline timestamp.
 
-**Why undo1 is Important**: It marks the boundary between:
-- Tuples we've already indexed (undoLocation < undo1)
-- Tuples that might have been modified during our scan (undoLocation >= undo1)
+### Stage 2: Enable Changes and Capture undo2
 
-### Stage 2: Enable Change Tracking
-
-**Purpose**: Capture the end of our initial scan and prepare to handle concurrent changes.
+**Purpose**: Enable the index to receive updates from new transactions and mark the end of the scan window.
 
 **Process**:
-1. After Stage 1 completes, capture the **current** undo log position as `undo2`
-   ```c
-   undoLocations = get_cur_undo_locations(UndoLogRegular);
-   buildstate.undo2 = undoLocations.location;
-   ```
-2. This creates a "window" `[undo1, undo2]` representing:
-   - All modifications that occurred during Stage 1 scan
-   - These are the "concurrent changes" we need to handle
+1. **Capture undo2**: After Stage 1 completes, call `get_cur_undo_locations()` to get current undo position
+2. From this point on, any modifications generate normal undo records for the secondary index
+3. The window [undo1, undo2] now contains all tuples that were modified DURING Stage 1
 
-**Code Location**: `src/catalog/indices.c` lines 1593-1600
+**Code Location**: `build_secondary_index()` in `src/catalog/indices.c` lines ~1602-1613
 
-**The Critical Window [undo1, undo2]**:
-- **Before undo1**: Already indexed in Stage 1
-- **Between undo1 and undo2**: Modified during Stage 1 - need special handling
-- **After undo2**: Will have normal undo records for the new index
+**Key Insight**: Changes after undo2 are handled by normal undo records. We only need to worry about [undo1, undo2].
 
 ### Stage 3: Rescan for Concurrent Changes
 
-**Purpose**: Handle all modifications that occurred during Stage 1.
+**Purpose**: Find and apply all changes that occurred in the [undo1, undo2] window.
 
 **Process**:
-1. Scan the primary table again using `btree_seq_scan_getnext_page_undo`
-2. For each tuple, check its `undoLocation`:
-   
-   ```c
-   if (tupHdr->undoLocation < buildstate->undo1 || 
-       tupHdr->undoLocation > buildstate->undo2)
-   {
-       // Skip - either already indexed or will be handled normally
-       continue;
-   }
-   ```
+1. Scan the primary index again
+2. For each tuple, check if `undoLocation` is in [undo1, undo2]
+3. If outside the range, skip it (already handled in Stage 1 or will be handled by normal undo)
+4. If inside the range:
+   - Check if transaction is in-progress (`!XACT_INFO_IS_FINISHED`)
+   - If **in-progress**: Add tuple to index AND save to local undo log (OXid, index values)
+   - If **finished**: Add tuple to index (transaction already committed/aborted)
 
-3. For tuples in the `[undo1, undo2]` window:
-   - **If transaction is complete**: Add to index (already committed/aborted)
-   - **If transaction is in-progress**: 
-     - Add to index **optimistically**
-     - Store tuple info with OXid in tuplestore for later cleanup
-
-**Code Location**: `src/catalog/indices.c` lines 1359-1426
-
-**Optimistic Approach**:
-```c
-if (!XACT_INFO_IS_FINISHED(tupHdr->OTupleXactInfo))
-{
-    // Store info about this in-progress transaction
-    // But STILL add the tuple to the index (fall through)
-}
-// Add tuple to index (for both finished and in-progress)
+**Local Undo Log Format**:
+```
+TupleDesc: (OXid INT8, <index key column 1>, <index key column 2>, ...)
 ```
 
-4. **Wait for in-progress transactions**:
-   - After the scan, wait for all tracked in-progress transactions to complete
-   - Use `wait_for_oxid(oxid)` which uses PostgreSQL's `VirtualXactLock` mechanism
-   - This properly waits for transactions without polling
-   - Handles interrupts gracefully
+**Code Location**: `build_secondary_index_worker_heap_scan()` in `src/catalog/indices.c` lines ~1353-1423
 
-5. **Rollback aborted transactions**:
-   ```c
-   // Scan primary index for tuples with undoLocation in [undo1, undo2]
-   // Call page_item_rollback with BTreeUndoModeLimit to rollback
-   // secondary index changes for aborted transactions
-   ```
+**Key Point**: We use a local undo log (tuplestore) instead of inserting into the global undo chain, which would be too complex.
 
-**Code Location**: `src/catalog/indices.c` lines 1620-1750
+### Stage 4: Wait and Rollback Aborted Transactions
 
-### Stage 4: Make Index Visible
-
-**Purpose**: Activate the index for normal use.
+**Purpose**: Wait for all in-progress transactions to complete, then remove tuples from aborted transactions.
 
 **Process**:
-1. Write the index file header
-2. Drop the placeholder
-3. Index becomes visible to the checkpointer
-4. Index is now available for queries
+1. **Wait Phase**: 
+   - Iterate through local undo log
+   - Extract OXid from each entry
+   - Call `wait_for_oxid(oxid)` to wait for transaction completion
+   - Uses PostgreSQL's `VirtualXactLock` mechanism (no polling, proper interrupt handling)
 
-**Code Location**: `src/catalog/indices.c` lines 1752-1760
+2. **Cleanup Phase**:
+   - Rescan the local undo log
+   - For each entry, check transaction status using `oxid_get_csn()`
+   - If `csn == COMMITSEQNO_ABORTED`:
+     - Extract index key values from local undo log
+     - Form index tuple using `o_form_tuple()`
+     - Delete from secondary index using `o_btree_autonomous_delete()`
+   - If committed: tuple stays in index (already added in Stage 3)
+
+**Code Location**: `build_secondary_index()` in `src/catalog/indices.c` lines ~1641-1765
+
+**Key Advantage**: This approach solves the VACUUM problem - we don't rely on tuples staying in the primary index. We have all the information we need in our local undo log.
+
+### Stage 5: Make Index Visible
+
+**Purpose**: Enable the index for normal query operations.
+
+**Process**:
+1. Acquire table meta lock
+2. Write the index file header with correct checkpoint number
+3. Drop the shared root info placeholder
+4. Release table meta lock
+5. Index is now visible to queries and the checkpointer
+
+**Code Location**: `build_secondary_index()` in `src/catalog/indices.c` lines ~1768-1776
 
 ## Transaction Handling Details
 
@@ -167,36 +129,55 @@ We add **all** tuples from in-progress transactions to the index because:
 3. **Correctness**: We track which tuples need verification
 4. **Performance**: Avoid re-scanning after transactions complete
 
+### The Local Undo Log
+
+Instead of inserting into the global undo chain (which would be too complex), we maintain a local undo log in a tuplestore:
+- Format: `(OXid, index_key_column_1, index_key_column_2, ...)`
+- Stores only in-progress transactions encountered in [undo1, undo2]
+- Used for cleanup after transactions complete
+
 ### Handling Aborted Transactions
 
 After all tracked transactions complete:
-1. Scan the primary index looking for tuples with `undoLocation` in [undo1, undo2]
-2. For each such tuple, call `page_item_rollback()` with `BTreeUndoModeLimit`
-3. This walks the undo chain and undoes secondary index changes for aborted transactions
-4. Uses `SecondaryIndexRollbackCxt` to specify the rollback window and target index
+1. Rescan the local undo log
+2. For each entry, check transaction status: `csn = oxid_get_csn(oxid)`
+3. If `csn == COMMITSEQNO_ABORTED`:
+   - Extract index key values from the log entry
+   - Form index tuple: `secondaryTup = o_form_tuple(idx->leafTupdesc, values, nulls)`
+   - Delete from secondary index: `o_btree_autonomous_delete(&idx->desc, secondaryTup)`
+4. If committed: Nothing to do - tuple is already in the index
 
 ### Handling Committed Transactions
 
 When a tracked transaction commits:
 - Nothing to do - tuple is already in the index
-- Just log at DEBUG1 level for debugging
+- The local undo log entry is simply skipped
+
+### Key Advantage: VACUUM-Safe
+
+This approach solves a critical correctness problem:
+- **Problem**: If a tuple is deleted and vacuumed between stages, it disappears from the primary index
+- **Solution**: We don't rely on tuples staying in the primary index. Our local undo log has all the information we need to clean up aborted transactions
+- **Result**: The index is always correct, even if VACUUM runs during concurrent index build
 
 ## Visual Timeline
 
 ```
 Time →
-┌─────────────┬──────────────────────┬─────────────┬──────────────┐
-│   Before    │    Stage 1 Scan      │  After      │   Query      │
-│   undo1     │  [undo1, undo2]      │  undo2      │   Time       │
-├─────────────┼──────────────────────┼─────────────┼──────────────┤
-│ Tuples:     │ Tuples:              │ Tuples:     │              │
-│ Already     │ Modified during      │ Modified    │ Index        │
-│ indexed     │ concurrent scan      │ after scan  │ visible      │
-│ in Stage 1  │ (need handling)      │ (has undo)  │ to queries   │
-└─────────────┴──────────────────────┴─────────────┴──────────────┘
-     ↑                  ↑                    ↑             ↑
-  Capture           Concurrent          Capture      Drop
-   undo1           modifications         undo2     placeholder
+┌─────────────┬──────────────────────┬─────────────┬──────────────┬──────────────┐
+│   Before    │    Stage 1 Scan      │  After      │   Cleanup    │   Query      │
+│   undo1     │  [undo1, undo2]      │  undo2      │   Complete   │   Time       │
+├─────────────┼──────────────────────┼─────────────┼──────────────┼──────────────┤
+│ Stage 1:    │ Concurrent           │ Stage 2-3:  │  Stage 4:    │  Stage 5:    │
+│ Capture     │ modifications        │ Capture     │  Wait &      │  Index       │
+│ undo1 &     │ happen in this       │ undo2 &     │  Rollback    │  visible     │
+│ build index │ window               │ rescan      │  aborted     │  to queries  │
+└─────────────┴──────────────────────┴─────────────┴──────────────┴──────────────┘
+     ↑                  ↑                    ↑             ↑             ↑
+  Capture           Concurrent          Capture        Clean up     Drop
+   undo1           modifications         undo2         aborted    placeholder
+  BEFORE                               AFTER            using
+   scan                                Stage 1        local log
 ```
 
 ## Example Scenario
@@ -207,79 +188,130 @@ Time →
 
 ### Stage 1 (Initial Build)
 ```
-Scan row 1:  undoLocation = 12345  → Capture as undo1 = 12345
-Scan row 2:  undoLocation = 12346  → undo1 <= 12346 ✓
-Scan row 3:  undoLocation = 12347  → undo1 <= 12347 ✓
-...
-[Meanwhile: Transaction T1 modifies row 500, undoLocation becomes 12450]
-...
-Scan row 500: undoLocation = 12450 → undo1 <= 12450 ✓ (captures modified version)
-...
-Scan row 1000: undoLocation = 12999 → undo1 <= 12999 ✓
-```
-Stage 1 complete. Capture undo2 = 13000 (current undo log position)
-
-### Stage 2 (Rescan Window)
-```
-Window is [12345, 13000]
-
-Scan row 1:   undoLocation = 12345 → In window, finished transaction → Add
-Scan row 500: undoLocation = 12450 → In window, T1 still in progress → Add + Track
-...
-
-[Transaction T2 starts and modifies row 600]
-Scan row 600: undoLocation = 13100 → OUTSIDE window (> undo2) → Skip
+BEFORE scan starts: Capture undo1 = 12345
+Scan all 1000 rows: Build index entries
+Index remains invisible (placeholder exists)
 ```
 
-### Stage 3 (Wait and Cleanup)
+### Concurrent Activity During Stage 1
 ```
-Wait for T1 to complete...
-T1 commits → Keep row 500 in index
+Transaction A: INSERT new row    → undoLocation = 12400 (in [undo1, undo2])
+Transaction B: UPDATE row 500     → undoLocation = 12450 (in [undo1, undo2])
+Transaction C: DELETE row 300     → undoLocation = 12500 (in [undo1, undo2])
 ```
 
-### Stage 4 (Activate)
+### Stage 2 (Enable Changes)
 ```
-Write header, drop placeholder
+AFTER Stage 1 completes: Capture undo2 = 12600
+From now on, changes generate normal undo records
+```
+
+### Stage 3 (Rescan)
+```
+Scan primary index again:
+- Row with undoLocation = 12400: Transaction A still in-progress
+  → Add to index, save (OXid_A, index_values) to local undo log
+- Row with undoLocation = 12450: Transaction B committed
+  → Add to index (no logging needed - already finished)
+- Row with undoLocation = 12500: Transaction C in-progress
+  → Add to index, save (OXid_C, index_values) to local undo log
+```
+
+### Stage 4 (Wait and Cleanup)
+```
+Wait for Transaction A: → Commits
+  - Check local log: csn = oxid_get_csn(OXid_A) → COMMITTED
+  - Action: None (tuple already in index)
+
+Wait for Transaction C: → Aborts
+  - Check local log: csn = oxid_get_csn(OXid_C) → ABORTED
+  - Action: Delete tuple from index using saved index values
+    o_btree_autonomous_delete(&idx->desc, tuple)
+```
+
+### Stage 5 (Make Visible)
+```
+Write file header
+Drop placeholder
 Index now visible to queries
 ```
 
-## Key Design Decisions
+## Design Decisions
 
-1. **Why track undo1?**: Marks the baseline - all tuples seen in Stage 1
-2. **Why track undo2?**: Marks the cutoff - changes after this have normal undo records
-3. **Why the window [undo1, undo2]?**: These changes occurred DURING our scan and need special handling
-4. **Why optimistic addition?**: More efficient than pessimistic - most transactions commit
-5. **Why wait_for_oxid instead of polling?**: 
-   - Uses PostgreSQL's standard VirtualXactLock mechanism
-   - No arbitrary timeouts - waits as long as needed
-   - Properly handles interrupts and cancellations
-   - More efficient - no busy-waiting with pg_usleep
-   - Integrates with PostgreSQL's deadlock detection
+### Why Not Use `page_item_rollback`?
 
-## Error Handling
+The original approach tried to use `page_item_rollback` with `BTreeUndoModeLimit`, but this has problems:
+1. **VACUUM issue**: Deleted tuples can be vacuumed before cleanup scan
+2. **Complexity**: Requires scanning primary index again to find all affected tuples
+3. **Dependency**: Relies on tuples staying in primary index
 
-- **Interrupts**: Properly handled via `wait_for_oxid()` and `VirtualXactLock`
-- **Query Cancellation**: User can cancel with Ctrl+C - handled gracefully
-- **Cleanup**: Tuplestore and slots properly freed on completion
-- **Assertions**: Validate undo location monotonicity
-- **Deadlock Detection**: Integrated with PostgreSQL's standard deadlock detector
+The local undo log approach is simpler and more robust.
 
-## Files Modified
+### Why Capture undo1 Before Scan?
 
-- `src/catalog/indices.c`: Main implementation
-- `src/btree/scan.c`: New scan function for Stage 2
-- `include/btree/scan.h`: Function declaration
-- `test/sql/concurrent_index.sql`: Basic tests
+Capturing undo1 BEFORE the scan (not from first tuple) provides:
+1. **Clear boundary**: Any tuple with undoLocation >= undo1 was potentially modified during/after scan
+2. **Simplicity**: Don't depend on scan order
+3. **Correctness**: Definite point in time marking scan start
 
-## Related Concepts
+### Why Use `wait_for_oxid` Instead of Polling?
 
-- **MVCC**: Multi-Version Concurrency Control
-- **Undo Log**: Transaction rollback mechanism
-- **Snapshot Isolation**: How queries see consistent data
-- **Autonomous Transactions**: Independent operations within index build
+Using PostgreSQL's `VirtualXactLock` mechanism provides:
+1. **No arbitrary timeouts**: Waits as long as needed
+2. **Proper interrupt handling**: Responds to Ctrl+C, query cancellation
+3. **Deadlock detection**: Integrates with PostgreSQL's deadlock detector
+4. **Efficiency**: No busy-waiting with `pg_usleep`
+
+## Troubleshooting
+
+### Assert Failure: `tupHdr->undoLocation >= buildstate->undo1`
+
+This assertion in Stage 1 would indicate:
+- In the new protocol, we capture undo1 BEFORE scan, so this assertion is removed
+- Any tuple can have undoLocation < undo1 (modified before scan started)
+
+### Index Corruption After Concurrent Deletes
+
+If index contains entries for deleted rows:
+- Check that Stage 4 cleanup is running
+- Verify `oxid_get_csn()` is working correctly
+- Check that `o_btree_autonomous_delete()` is being called for aborted transactions
+
+### Long Wait Times in Stage 4
+
+If CREATE INDEX CONCURRENTLY hangs:
+- Check for long-running transactions with `pg_stat_activity`
+- Look for transactions that modified rows in [undo1, undo2] window
+- These transactions must complete before index can be finalized
 
 ## Future Enhancements
 
-1. Better progress reporting during long waits
-2. More comprehensive tests for edge cases
-3. Handling of very long-running transactions with better visibility
+1. **Parallel Stage 3 Rescan**: Currently serial, could be parallelized
+2. **Optimize Local Undo Log**: Use more efficient storage than tuplestore
+3. **Incremental Cleanup**: Clean up aborted transactions as they complete, don't wait for all
+4. **Progress Reporting**: Add `pg_stat_progress_create_index` support for Stage 4 waiting
+5. **Conditional Variable Signaling**: Replace polling in `wait_for_oxid` with condition variables
+
+## Code References
+
+### Key Functions
+- `build_secondary_index()`: Main entry point in `src/catalog/indices.c`
+- `build_secondary_index_worker_heap_scan()`: Scan logic in `src/catalog/indices.c`
+- `btree_seq_scan_getnext_page_undo()`: Stage 3 scan function in `src/btree/scan.c`
+- `wait_for_oxid()`: Transaction waiting in OrioleDB transaction code
+- `oxid_get_csn()`: Get transaction commit status
+- `o_btree_autonomous_delete()`: Delete from index
+
+### Key Data Structures
+- `oIdxBuildState`: Build state in `include/catalog/indices.h`
+  - `concurrentStage`: Current stage (0=normal, 1=Stage1, 2=Stage3)
+  - `undo1`, `undo2`: Undo location boundaries
+  - `noncomplete_xact`: Flag indicating in-progress transactions found
+  - `noncomplete_xact_tupstore`: Local undo log
+  - `noncomplete_xact_tupdesc`: Tuple descriptor for local undo log
+
+### Testing
+- `test/sql/concurrent_index.sql`: Basic concurrent index tests
+- Add tests for concurrent DML during index build
+- Add tests for transaction rollback scenarios
+

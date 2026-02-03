@@ -1346,18 +1346,11 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 		{
 			if (buildstate->concurrentStage == 1)
 			{
-				/* Remember undo location undo1 for second scan */
+				/* Stage 1: Just build the index, undo1 was captured before scan */
+				Assert(UndoLocationIsValid(buildstate->undo1));
 				Assert(!UndoLocationIsValid(buildstate->undo2));
-				if (!UndoLocationIsValid(buildstate->undo1))
-				{
-					buildstate->undo1 = tupHdr->undoLocation;
-				}
-				else
-				{
-					Assert(tupHdr->undoLocation >= buildstate->undo1);
-				}
 			}
-			if (buildstate->concurrentStage == 2)
+			else if (buildstate->concurrentStage == 2)
 			{
 				Assert(UndoLocationIsValid(buildstate->undo1));
 				Assert(UndoLocationIsValid(buildstate->undo2));
@@ -1378,10 +1371,11 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 				if (!XACT_INFO_IS_FINISHED(tupHdr->OTupleXactInfo))
 				{
 					/* 
-				 * Store transaction info for incomplete transactions.
-				 * We'll add the tuple to the index now (optimistically),
-				 * and later remove it if the transaction aborts.
-				 */
+					 * In-progress transaction: save to local undo log.
+					 * Format: (OXid, index key values) - OXid first for easier extraction
+					 * We'll add tuple to index now (optimistically),
+					 * and later remove it if transaction aborts.
+					 */
 					Datum *values;
 					bool *nulls;
 					int natts = idx->leafTupdesc->natts;
@@ -1393,36 +1387,42 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 					}
 					if(!buildstate->noncomplete_xact_tupdesc)
 					{
-						/* Construct tuple descriptor with index attributes plus OXid field */
+						/* Construct tuple descriptor: OXid + index key values */
 						TupleDesc desc = CreateTemplateTupleDesc(natts + 1);
 						int i;
 						
+						/* First field: OXid */
+						TupleDescInitEntry(desc, 1, "oxid", INT8OID, -1, 0);
+						
+						/* Remaining fields: index key values */
 						for (i = 0; i < natts; i++)
 						{
-							TupleDescInitEntry(desc, i + 1,
+							TupleDescInitEntry(desc, i + 2,
 											   NameStr(TupleDescAttr(idx->leafTupdesc, i)->attname),
 											   TupleDescAttr(idx->leafTupdesc, i)->atttypid,
 											   TupleDescAttr(idx->leafTupdesc, i)->atttypmod,
 											   TupleDescAttr(idx->leafTupdesc, i)->attndims);
 						}
-						/* Add OXid field for transaction tracking */
-						TupleDescInitEntry(desc, natts + 1, "oxid", INT8OID, -1, 0);
 						buildstate->noncomplete_xact_tupdesc = BlessTupleDesc(desc);
 					}
 					
 					values = palloc(sizeof(Datum) * (natts + 1));
 					nulls = palloc(sizeof(bool) * (natts + 1));
 					
-					tts_orioledb_get_index_values(primarySlot, idx, values, nulls, true);
+					/* Store OXid first */
+					values[0] = UInt64GetDatum(XACT_INFO_GET_OXID(tupHdr->OTupleXactInfo));
+					nulls[0] = false;
 					
-					/* Add OXid value */
-					nulls[natts] = false;
-					values[natts] = UInt64GetDatum(XACT_INFO_GET_OXID(tupHdr->OTupleXactInfo));
+					/* Then store index key values */
+					tts_orioledb_get_index_values(primarySlot, idx, &values[1], &nulls[1], true);
 					
 					tuplestore_putvalues(buildstate->noncomplete_xact_tupstore,
 										 buildstate->noncomplete_xact_tupdesc, values, nulls);
 					pfree(values);
 					pfree(nulls);
+					
+					elog(DEBUG2, "CREATE INDEX CONCURRENTLY: saved in-progress transaction %lu to local undo log",
+						 XACT_INFO_GET_OXID(tupHdr->OTupleXactInfo));
 					
 					/* Fall through to add tuple to index optimistically */
 				}
@@ -1474,13 +1474,24 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 
 	if (isconcurrent)
 	{
-		buildstate.concurrentStage = 1;
-		buildstate.undo1 = InvalidUndoLocation;
+		UndoStackLocations undoLocations;
+		
+		/*
+		 * Stage 1: Build initial index.
+		 * Capture undo1 BEFORE scan starts (not from first tuple).
+		 */
+		undoLocations = get_cur_undo_locations(UndoLogRegular);
+		buildstate.undo1 = undoLocations.location;
 		buildstate.undo2 = InvalidUndoLocation;
+		buildstate.concurrentStage = 1;
+		
+		elog(DEBUG1, "CREATE INDEX CONCURRENTLY Stage 1: captured undo1=%lu before scan", buildstate.undo1);
 	}
 	else
 	{
 		buildstate.concurrentStage = 0;
+		buildstate.undo1 = InvalidUndoLocation;
+		buildstate.undo2 = InvalidUndoLocation;
 	}
 
 	/* Attempt to launch parallel worker scan when required */
@@ -1588,26 +1599,40 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		index_close(indexRelation, AccessExclusiveLock);
 	}
 
-	/* Stage 2: For concurrent builds, rescan for changes between undo1 and undo2 */
+	/* Stage 2-3: For concurrent builds, enable changes and rescan for [undo1, undo2] */
 	if (isconcurrent)
 	{
 		UndoStackLocations undoLocations;
 
 		/*
+		 * Stage 2: Enable applying changes to the built index.
 		 * Capture undo2: current undo position after Stage 1 completes.
 		 * Any changes after this point will have normal undo records.
+		 * 
+		 * Note: In the new protocol, Stage 2 is about enabling the index for updates
+		 * and capturing undo2. The rescan (Stage 3) happens in one pass below.
 		 */
 		undoLocations = get_cur_undo_locations(UndoLogRegular);
 		buildstate.undo2 = undoLocations.location;
+		
+		elog(DEBUG1, "CREATE INDEX CONCURRENTLY Stage 2: captured undo2=%lu after Stage 1, enabling index for updates",
+			 buildstate.undo2);
 
+		/*
+		 * Stage 3: Rescan primary index for tuples modified between undo1 and undo2.
+		 * Apply them to our index. For in-progress transactions, save to local undo log.
+		 */
 		buildstate.concurrentStage = 2;
 		buildstate.noncomplete_xact = false;
 		buildstate.noncomplete_xact_tupstore = NULL;
 		buildstate.noncomplete_xact_tupdesc = NULL;
 
-		/* Begin serial stage2 tuplesort */
+		/* Begin serial stage 3 tuplesort */
 		sortstates = palloc0(sizeof(Pointer));
 		sortstates[0] = tuplesort_begin_orioledb_index(idx, work_mem, false, coordinate);
+		
+		elog(DEBUG1, "CREATE INDEX CONCURRENTLY Stage 3: scanning for tuples in range [%lu, %lu]",
+			 buildstate.undo1, buildstate.undo2);
 		
 		/* Scan primary index for tuples modified between undo1 and undo2 */
 		build_secondary_index_worker_heap_scan(&buildstate, descr, idx, NULL, sortstates, false, &heap_tuples, &index_tuples);
@@ -1616,7 +1641,7 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		tuplesort_performsort(sortstates[0]);
 		o_unset_syscache_hooks();
 
-		/* Write stage 2 index data */
+		/* Write stage 3 index data */
 		btree_write_index_data(&idx->desc, idx->leafTupdesc, sortstates[0],
 						   ctid, &fileHeader);
 		
@@ -1624,8 +1649,8 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		pfree(sortstates);
 
 		/*
-		 * Wait for all transactions with tuples between undo1 and undo2 to finish,
-		 * then rollback secondary index changes for aborted transactions.
+		 * Stage 4: Wait for all in-progress transactions discovered in Stage 3 to finish.
+		 * If transactions rollback, rollback their changes using the local undo log.
 		 */
 		if (buildstate.noncomplete_xact)
 		{
@@ -1636,6 +1661,8 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 			
 			tuplestore_rescan(buildstate.noncomplete_xact_tupstore);
 			
+			elog(DEBUG1, "CREATE INDEX CONCURRENTLY Stage 4: waiting for in-progress transactions to complete");
+			
 			/*
 			 * First, wait for all tracked transactions to complete.
 			 */
@@ -1644,10 +1671,9 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 				OXid		oxid;
 				Datum		oxid_datum;
 				bool		isnull;
-				int			natts = idx->leafTupdesc->natts;
 				
-				/* Extract the OXid from the last column */
-				oxid_datum = slot_getattr(slot, natts + 1, &isnull);
+				/* Extract the OXid from the first column */
+				oxid_datum = slot_getattr(slot, 1, &isnull);
 				Assert(!isnull);
 				oxid = DatumGetUInt64(oxid_datum);
 				
@@ -1684,96 +1710,74 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 			}
 			
 			ExecDropSingleTupleTableSlot(slot);
+			
+			/*
+			 * Stage 4: Now that all transactions have completed, rollback secondary index
+			 * changes for aborted transactions using our local undo log.
+			 */
+			tuplestore_rescan(buildstate.noncomplete_xact_tupstore);
+			slot = MakeTupleTableSlot(buildstate.noncomplete_xact_tupdesc, &TTSOpsMinimalTuple);
+			
+			elog(DEBUG1, "CREATE INDEX CONCURRENTLY: checking local undo log for aborted transactions");
+			
+			while (tuplestore_gettupleslot(buildstate.noncomplete_xact_tupstore, true, false, slot))
+			{
+				OXid		oxid;
+				Datum		oxid_datum;
+				bool		isnull;
+				int			natts = idx->leafTupdesc->natts;
+				CommitSeqNo csn;
+				
+				/* Extract the OXid from the first column */
+				oxid_datum = slot_getattr(slot, 1, &isnull);
+				Assert(!isnull);
+				oxid = DatumGetUInt64(oxid_datum);
+				
+				/* Check if transaction aborted */
+				csn = oxid_get_csn(oxid);
+				if (csn == COMMITSEQNO_ABORTED)
+				{
+					/* Transaction aborted - remove its tuple from secondary index */
+					OTuple		secondaryTup;
+					Datum	   *values;
+					bool	   *nulls;
+					int			i;
+					
+					elog(DEBUG2, "CREATE INDEX CONCURRENTLY: removing tuple from aborted transaction %lu",
+						 oxid);
+					
+					/* Extract index key values from local undo log (columns 2 onwards) */
+					values = palloc(sizeof(Datum) * natts);
+					nulls = palloc(sizeof(bool) * natts);
+					
+					for (i = 0; i < natts; i++)
+					{
+						values[i] = slot_getattr(slot, i + 2, &nulls[i]);
+					}
+					
+					/* Form the index tuple to delete */
+					secondaryTup = o_form_tuple(idx->leafTupdesc, values, nulls);
+					
+					/* Delete from secondary index */
+					o_btree_autonomous_delete(&idx->desc, secondaryTup);
+					
+					pfree(secondaryTup.data);
+					pfree(values);
+					pfree(nulls);
+				}
+				/* Committed transactions - their tuples stay in the index */
+			}
+			
+			ExecDropSingleTupleTableSlot(slot);
 			tuplestore_end(buildstate.noncomplete_xact_tupstore);
 			buildstate.noncomplete_xact_tupstore = NULL;
 			
-			/*
-			 * Now that all transactions have completed, rollback secondary index changes
-			 * for aborted transactions by scanning the primary index and calling
-			 * page_item_rollback with BTreeUndoModeLimit.
-			 */
-			{
-				BTreeDescr *primary_desc = &descr->indices[PrimaryIndexNumber]->desc;
-				BTreeIterator *it;
-				OTuple		tup;
-				CommitSeqNo csn = COMMITSEQNO_INPROGRESS;
-				BTreeLocationHint hint;
-				SecondaryIndexRollbackCxt rollbackCxt;
-				
-				/* Setup rollback context */
-				rollbackCxt.limitUndoLocation1 = buildstate.undo1;
-				rollbackCxt.limitUndoLocation2 = buildstate.undo2;
-				rollbackCxt.rel = idx->tableRelation;
-				rollbackCxt.descr = descr;
-				rollbackCxt.ix_num = ix_num;
-				rollbackCxt.index_descr = idx;
-				
-				elog(DEBUG1, "CREATE INDEX CONCURRENTLY: scanning primary index to rollback aborted transactions in range [%lu, %lu]",
-					 buildstate.undo1, buildstate.undo2);
-				
-				/*
-				 * Scan the primary index and rollback secondary index changes
-				 * for tuples with undoLocation in [undo1, undo2] that belong
-				 * to aborted transactions.
-				 */
-				it = o_btree_iterator_create(primary_desc, NULL, BTreeKeyNone,
-											 csn, ForwardScanDirection);
-				
-				tup = o_btree_iterator_fetch(it, NULL, BTreeKeyNone, false, &hint);
-				
-				while (!O_TUPLE_IS_NULL(tup))
-				{
-					BTreeLeafTuphdr *tupHdr = (BTreeLeafTuphdr *) tup.data;
-					UndoLocation undoLoc = tupHdr->undoLocation;
-					
-					/*
-					 * Check if this tuple's undoLocation is in our window [undo1, undo2].
-					 * If so, call page_item_rollback to handle any aborted transaction changes.
-					 */
-					if (UndoLocationIsValid(undoLoc) &&
-						undoLoc >= buildstate.undo1 &&
-						undoLoc <= buildstate.undo2)
-					{
-						OInMemoryBlkno blkno = hint.blkno;
-						uint16 pageChangeCount = hint.pageChangeCount;
-						Page p;
-						BTreePageItemLocator loc;
-						
-						/* Get the page and locate the item */
-						p = O_GET_IN_MEMORY_PAGE(blkno);
-						
-						if (O_PAGE_IS(p, LEAF) && 
-							hint.pageChangeCount == O_PAGE_CHANGE_COUNT(p))
-						{
-							/* Find the item on the page */
-							loc.blkno = blkno;
-							loc.pageOffset = hint.pageOffset;
-							
-							/*
-							 * Call page_item_rollback with BTreeUndoModeLimit to rollback
-							 * secondary index changes for aborted transactions in the [undo1, undo2] window.
-							 * This will walk the undo chain and undo changes to the secondary index
-							 * for transactions that aborted.
-							 */
-							(void) page_item_rollback(primary_desc, p, &loc,
-													 BTreeUndoModeLimit,
-													 NULL, InvalidUndoLocation,
-													 rollbackCxt);
-						}
-						
-						O_RELEASE_IN_MEMORY_PAGE(p);
-					}
-					
-					tup = o_btree_iterator_fetch(it, NULL, BTreeKeyNone, true, &hint);
-				}
-				
-				btree_iterator_free(it);
-				
-				elog(DEBUG1, "CREATE INDEX CONCURRENTLY: completed rollback of aborted transactions");
-			}
+			elog(DEBUG1, "CREATE INDEX CONCURRENTLY: completed cleanup of aborted transactions using local undo log");
 		}
 
-		/* Stage 4: Now make the index visible for normal operation */
+		/* Stage 5: Enable the index for normal operation - make it visible */
+		elog(DEBUG1, "CREATE INDEX CONCURRENTLY Stage 5: making index visible for normal operation");
+		
 		o_tables_table_meta_lock(o_table);
 
 		btree_write_file_header(&idx->desc, &fileHeader);
