@@ -13,57 +13,98 @@ Secondary indexes in OrioleDB follow the same MVCC (Multi-Version Concurrency Co
 
 ## How Secondary Indexes Store Previous Versions
 
-### Same MVCC Mechanism as Primary Indexes
+### DELETE + INSERT Strategy (Not In-Place Update)
 
-Secondary indexes in OrioleDB **do keep previous versions** of index entries through the undo log system, just like primary indexes. All indexes (primary, secondary, and TOAST) are configured with `undoType = UndoLogRegular`, which means they participate in the undo log mechanism.
+Secondary indexes in OrioleDB handle modifications differently from primary indexes. Understanding this difference is crucial:
 
-When a transaction modifies data that affects a secondary index (e.g., updates or deletes tuples), the following happens:
+**Primary Indexes:**
+- Use `BTreeOperationUpdate` for updates
+- Modify tuples in-place and create undo records with the old tuple data
+- The undo chain links versions at the same physical location
 
-1. **Undo Records Are Created**: Each modification to a secondary index tuple creates an undo record that stores the previous version of that tuple's header and optionally its data.
+**Secondary Indexes:**
+- Use `BTreeOperationDelete` + `BTreeOperationInsert` for updates
+- Mark the old entry as deleted (creates undo record)
+- Insert a new entry (may be at a different location if key changed)
+- This is true even when only the indexed column changes
 
-2. **Undo Chains**: The tuples in secondary indexes maintain undo chains, where the current version on the page points to previous versions stored in the undo log.
+### When Undo Chains Are Created for Secondary Indexes
 
-3. **Transaction Isolation**: Until a transaction commits, the old index entries remain accessible through the undo log, ensuring that other transactions with earlier snapshots can still see the previous versions.
+Undo chains in secondary indexes are created during **DELETE operations**, not UPDATE operations:
 
-### Optimization for Self-Created Tuples
+1. **When you update an indexed column**: 
+   - The old secondary index entry is marked as deleted → **creates undo record**
+   - A new entry is inserted at a new location → **creates new tuple with undo pointer**
+   - You see: old entry marked deleted, new entry at different offset
 
-There is one optimization: Secondary indexes use `needs_undo = NULL` in their operations structure, while primary indexes use a custom `pk_needs_undo` callback. This means:
+2. **When you update a primary key**:
+   - Same behavior: old secondary index entry deleted, new one inserted
+   - The primary key is part of the secondary index key, so it's essentially a key change
 
-- **Primary indexes**: Have special logic to determine when undo is needed for tuples created by the same transaction
-- **Secondary indexes**: Use a simpler rule - if a tuple was created by the same transaction and there's no savepoint, no undo record is created when modifying it
+3. **When you delete a row from the table**:
+   - Secondary index entry is marked as deleted → **creates undo record**
+   - The undo record stores the previous state for rollback
 
-This is an optimization for the case where a transaction inserts a tuple and then updates or deletes it before committing. However, this does NOT mean secondary indexes don't use undo - they still create undo records for all other modifications.
+### Why This Approach?
 
-### Example: Transaction Deletes Multiple Tuples
+This DELETE + INSERT strategy for secondary indexes:
+- Simplifies the implementation (no complex in-place updates)
+- Works well since secondary indexes don't store the full tuple data
+- Allows the new entry to be at a different location if the key changed
+- Still supports full rollback through the undo chain on the deleted entry
 
-Consider a transaction that deletes multiple tuples from a table with a secondary index:
+### Undo Chain Structure
+
+### Example: What You Actually See
+
+Consider a transaction that updates indexed columns:
 
 ```sql
-BEGIN;
-DELETE FROM vegetables WHERE count < 5;
--- This affects both the primary index and secondary indexes
+CREATE TABLE vegetables (
+  id int PRIMARY KEY,
+  name text,
+  count int
+) USING orioledb;
+
+CREATE INDEX vegetables_count_idx ON vegetables(count);
+
+INSERT INTO vegetables VALUES (1, 'Tomato', 10);
+UPDATE vegetables SET count = 15 WHERE id = 1;
 ```
 
-**What happens:**
+**What happens in the secondary index `vegetables_count_idx`:**
 
-1. **Primary Index**: Each deleted tuple in the primary index is marked as deleted, and an undo record is created containing the previous tuple header.
+1. **Initial INSERT**: Entry `(count=10, id=1)` is inserted
+2. **UPDATE operation** internally performs:
+   - **DELETE**: Entry `(count=10, id=1)` is marked as deleted
+     - Creates an undo record with the previous tuple header
+     - The deleted entry remains on the page with `deleted` flag
+   - **INSERT**: Entry `(count=15, id=1)` is inserted at a new location
+     - May be at a different page offset
+     - Has its own tuple header with undo pointer
 
-2. **Secondary Indexes**: For each secondary index:
-   - The corresponding index entry is also marked as deleted
-   - An undo record is created for each deleted secondary index entry
-   - The undo chain is maintained with pointers to previous versions
+**Visual representation:**
+```
+Before UPDATE:
+Page offset 1: (count=10, id=1) [active]
 
-3. **Until Commit**: The old tuples cannot be physically removed because:
-   - The transaction might be rolled back (requiring undo replay)
-   - Other transactions with earlier snapshots need to see the old versions
-   - The undo log maintains the complete history of changes
+After UPDATE (before commit):
+Page offset 1: (count=10, id=1) [DELETED, has undo chain]
+Page offset 2: (count=15, id=1) [active, new entry]
+```
 
-4. **After Commit**: Once the transaction commits:
-   - The deleted entries become invisible to new transactions
-   - Old versions are retained in the undo log as long as needed for:
-     - Existing snapshots that might need them
-     - Recovery purposes
-   - Eventually, the undo records are evicted when no longer needed
+### Transaction Semantics
+
+**Until Commit:**
+- The old entry `(count=10, id=1)` cannot be physically removed
+- It remains marked as deleted with an undo chain
+- Other transactions with earlier snapshots can see the old version
+- If the transaction rolls back, the delete is reverted
+
+**After Commit:**
+- The deleted entry becomes invisible to new transactions
+- The undo record is retained as long as needed for existing snapshots
+- Eventually, the undo record is evicted and the deleted entry can be cleaned up
 
 ## Undo Log Structure for Secondary Indexes
 
@@ -76,21 +117,32 @@ All index types (primary, secondary, and TOAST) are initialized with the same un
 desc->undoType = UndoLogRegular;
 ```
 
-This means secondary indexes:
-- **DO** participate in the undo log system
-- **DO** create undo records for modifications to existing tuples
+This means all indexes:
+- **DO** participate in the undo log system  
+- **DO** create undo records for modifications
 - **DO** maintain undo chains for version history
 - **CAN** rollback changes using the undo log
 
-The only difference is in the `BTreeOps` structure:
-- Primary indexes: `needs_undo = pk_needs_undo` (custom callback)
-- Secondary indexes: `needs_undo = NULL` (default behavior)
-- TOAST indexes: `needs_undo = o_toast_needs_undo` (custom callback)
+However, the **type of operation** differs:
 
-The `needs_undo` callback determines whether to create undo records when modifying tuples that were created by the same transaction. When `NULL`, the system uses default logic that skips undo creation only if:
-- The tuple was created by the current transaction
-- There's no active savepoint
-- The modification is not happening within a nested transaction
+**Primary Indexes:**
+```c
+// From src/tableam/operations.c - o_tbl_indices_overwrite()
+modify_result = o_btree_modify(&GET_PRIMARY(descr)->desc, 
+                               BTreeOperationUpdate,  // ← UPDATE
+                               newTup, BTreeKeyLeafTuple, ...);
+```
+
+**Secondary Indexes:**
+```c
+// From src/tableam/operations.c - o_update_secondary_index()
+// DELETE old entry
+o_btree_modify(&id->desc, BTreeOperationDelete, ...);  // ← DELETE
+// INSERT new entry  
+o_btree_modify(&id->desc, BTreeOperationInsert, ...);  // ← INSERT
+```
+
+The key insight: Secondary indexes use **two separate operations** (DELETE + INSERT) instead of a single UPDATE operation. The undo records are created during the DELETE operation.
 
 ### Tuple Header with Undo Pointer
 
@@ -113,7 +165,7 @@ Secondary indexes use the same undo record types as primary indexes:
 
 ### Delete Operations
 
-When a transaction deletes tuples:
+When a transaction deletes tuples from a table with secondary indexes:
 
 ```c
 // From src/tableam/operations.c - o_update_secondary_index()
@@ -127,23 +179,29 @@ if (old_valid)
 
 This:
 1. Marks the secondary index tuple as deleted
-2. Creates an undo record with the previous state
-3. Links it in the undo chain
+2. Creates an undo record via `make_undo_record()` with the previous state
+3. Links it in the undo chain for potential rollback
 
-### Update Operations
+### Update Operations (DELETE + INSERT)
 
 When a transaction updates indexed columns:
 
 ```c
-// From src/tableam/operations.c
-// First, delete the old secondary index entry
-o_btree_modify(&id->desc, BTreeOperationDelete, ...)
+// From src/tableam/operations.c - o_update_secondary_index()
+// Step 1: Delete the old entry
+if (old_valid)
+    o_btree_modify(&id->desc, BTreeOperationDelete, ...)
 
-// Then, insert the new secondary index entry
-o_btree_modify(&id->desc, BTreeOperationInsert, ...)
+// Step 2: Insert the new entry  
+if (new_valid)
+    o_btree_modify(&id->desc, BTreeOperationInsert, ...)
 ```
 
-Each operation creates its own undo record, maintaining a complete audit trail.
+**NOT** a single UPDATE operation like primary indexes! Each step:
+- DELETE creates an undo record for the old entry
+- INSERT creates a new entry (potentially at different location)
+
+**Important:** Primary indexes use `BTreeOperationUpdate` for in-place modifications, while secondary indexes always use DELETE + INSERT.
 
 ### Rollback Behavior
 
@@ -151,10 +209,13 @@ If a transaction is aborted or rolled back, the system uses the `page_item_rollb
 
 1. Traverses the undo chain for affected tuples
 2. Restores previous tuple headers and data
-3. Reverts deletions by unmarking tuples
+3. Reverts deletions by unmarking tuples (changing deleted flag back)
 4. Removes inserted tuples that haven't been committed
 
-The rollback process walks the undo chain backwards, replaying each undo record to restore the previous state. For secondary indexes, this means restoring old index entries that were deleted or reverting new entries that were inserted during the transaction.
+For secondary indexes, this means:
+- The DELETE is reverted (tuple no longer marked as deleted)
+- The INSERT is removed (new entry is deleted from the page)
+- The secondary index returns to its pre-transaction state
 
 ## Key Differences from PostgreSQL Heap Tables
 
@@ -240,19 +301,41 @@ Secondary index reads don't require locks because:
 
 ## Summary
 
-**Yes, secondary indexes in OrioleDB keep previous versions** through the undo log system:
+**Yes, secondary indexes in OrioleDB maintain previous versions** through the undo log system, but using a different strategy than primary indexes:
 
-- **Old rows cannot be deleted** until the transaction commits and all snapshots that might need them are gone
-- **Undo logs maintain complete history** of changes during a transaction
-- **Rollback is possible** by traversing and replaying the undo chain
-- **MVCC guarantees** are preserved for concurrent transactions
-- **No bloat** in the main B-tree structure, unlike PostgreSQL heap tables
+### Key Differences:
+
+**Primary Indexes:**
+- Use `BTreeOperationUpdate` for modifications
+- Update tuples in-place
+- Create undo records that chain versions at the same location
+
+**Secondary Indexes:**
+- Use `BTreeOperationDelete` + `BTreeOperationInsert` for updates
+- Old entry marked deleted (creates undo record)
+- New entry inserted (may be at different location)
+
+### When Undo Chains Are Created:
+
+- ✅ **DELETE operations** - Always create undo records
+- ✅ **UPDATE operations** - Create undo record for the DELETE part
+- ✅ **INSERT operations** - May reuse deleted slot, maintaining undo chain
+- ❌ **No single UPDATE undo record** - Updates are split into DELETE + INSERT
+
+### What You'll Observe:
+
+When updating an indexed column, you see:
+```
+Page offset 1: (old_key, pk) [DELETED with undo chain]
+Page offset 2: (new_key, pk) [ACTIVE new entry]
+```
 
 This design provides:
 - ✅ Full transactional semantics with rollback support
-- ✅ Snapshot isolation for concurrent readers
-- ✅ Efficient space management without vacuum
-- ✅ Fast recovery through primary key reconstruction
+- ✅ Snapshot isolation for concurrent readers  
+- ✅ MVCC guarantees through undo log
+- ✅ Simpler implementation for secondary indexes
+- ✅ No bloat in the main B-tree structure
 
 ## See Also
 
