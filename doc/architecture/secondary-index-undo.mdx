@@ -1,0 +1,229 @@
+---
+id: secondary-index-undo
+sidebar_label: Secondary Index Undo Logs
+---
+
+# Undo Log Handling for Secondary Indexes
+
+This document explains how undo logs work for secondary indexes in OrioleDB, particularly in the context of transactions that modify data affecting secondary indexes.
+
+## Overview
+
+Secondary indexes in OrioleDB follow the same MVCC (Multi-Version Concurrency Control) principles as primary indexes, utilizing undo logs to maintain previous versions of tuples. This allows transactions to be rolled back and enables snapshot isolation for concurrent transactions.
+
+## How Secondary Indexes Store Previous Versions
+
+### Same MVCC Mechanism as Primary Indexes
+
+Secondary indexes in OrioleDB **do keep previous versions** of index entries through the undo log system, just like primary indexes. When a transaction modifies data that affects a secondary index (e.g., updates or deletes tuples), the following happens:
+
+1. **Undo Records Are Created**: Each modification to a secondary index tuple creates an undo record that stores the previous version of that tuple's header and optionally its data.
+
+2. **Undo Chains**: The tuples in secondary indexes maintain undo chains, where the current version on the page points to previous versions stored in the undo log.
+
+3. **Transaction Isolation**: Until a transaction commits, the old index entries remain accessible through the undo log, ensuring that other transactions with earlier snapshots can still see the previous versions.
+
+### Example: Transaction Deletes Multiple Tuples
+
+Consider a transaction that deletes multiple tuples from a table with a secondary index:
+
+```sql
+BEGIN;
+DELETE FROM vegetables WHERE count < 5;
+-- This affects both the primary index and secondary indexes
+```
+
+**What happens:**
+
+1. **Primary Index**: Each deleted tuple in the primary index is marked as deleted, and an undo record is created containing the previous tuple header.
+
+2. **Secondary Indexes**: For each secondary index:
+   - The corresponding index entry is also marked as deleted
+   - An undo record is created for each deleted secondary index entry
+   - The undo chain is maintained with pointers to previous versions
+
+3. **Until Commit**: The old tuples cannot be physically removed because:
+   - The transaction might be rolled back (requiring undo replay)
+   - Other transactions with earlier snapshots need to see the old versions
+   - The undo log maintains the complete history of changes
+
+4. **After Commit**: Once the transaction commits:
+   - The deleted entries become invisible to new transactions
+   - Old versions are retained in the undo log as long as needed for:
+     - Existing snapshots that might need them
+     - Recovery purposes
+   - Eventually, the undo records are evicted when no longer needed
+
+## Undo Log Structure for Secondary Indexes
+
+### Tuple Header with Undo Pointer
+
+Each tuple in a secondary index (leaf tuple) contains a `BTreeLeafTuphdr` header with:
+
+- **xactInfo**: Transaction information (OXid - transaction ID, CommitSeqNo)
+- **undoLocation**: Pointer to the previous version in the undo log
+- **deleted**: Deletion status flag
+- **lockMode**: Row lock mode (if any)
+
+### Undo Record Types
+
+Secondary indexes use the same undo record types as primary indexes:
+
+- **ModifyUndoItemType**: Records modifications (insert/update/delete)
+- **RowLockUndoItemType**: Records row locks
+- **Page-level undo**: For compaction, splits, and merges
+
+## Transaction Semantics
+
+### Delete Operations
+
+When a transaction deletes tuples:
+
+```c
+// From src/tableam/operations.c - o_update_secondary_index()
+if (old_valid)
+    res.success = o_btree_modify(&id->desc, BTreeOperationDelete,
+                                 nullTup, BTreeKeyNone,
+                                 (Pointer) &old_key, BTreeKeyBound,
+                                 oxid, csn, RowLockUpdate,
+                                 NULL, &callbackInfo) == OBTreeModifyResultDeleted;
+```
+
+This:
+1. Marks the secondary index tuple as deleted
+2. Creates an undo record with the previous state
+3. Links it in the undo chain
+
+### Update Operations
+
+When a transaction updates indexed columns:
+
+```c
+// From src/tableam/operations.c
+// First, delete the old secondary index entry
+o_btree_modify(&id->desc, BTreeOperationDelete, ...)
+
+// Then, insert the new secondary index entry
+o_btree_modify(&id->desc, BTreeOperationInsert, ...)
+```
+
+Each operation creates its own undo record, maintaining a complete audit trail.
+
+### Rollback Behavior
+
+If a transaction is aborted or rolled back:
+
+```c
+// From src/btree/undo.c - page_item_rollback()
+```
+
+The system:
+1. Traverses the undo chain for affected tuples
+2. Restores previous tuple headers and data
+3. Reverts deletions by unmarking tuples
+4. Removes inserted tuples that haven't been committed
+
+## Key Differences from PostgreSQL Heap Tables
+
+### No Bloat in Main Storage
+
+Unlike PostgreSQL's heap tables where deleted tuples cause bloat until VACUUM runs:
+
+- **OrioleDB**: Old versions are stored in the undo log, not on the main data pages
+- **Benefit**: The main B-tree structure remains compact
+- **Space Reclamation**: Happens automatically as undo logs are evicted
+
+### Row-Level Undo
+
+OrioleDB uses row-level undo records that:
+- Are more space-efficient than page-level MVCC
+- Allow fine-grained rollback operations
+- Support features like `ROLLBACK TO SAVEPOINT`
+
+## WAL and Recovery Considerations
+
+### Secondary Indexes Are Not WAL-Logged
+
+Important distinction from primary indexes:
+
+- **Primary Key Trees**: Are WAL-logged
+- **TOAST Trees**: Are WAL-logged  
+- **Secondary Indexes**: Are **NOT** WAL-logged
+
+### Recovery Process
+
+During recovery, secondary indexes are rebuilt from primary keys:
+
+1. Primary key and TOAST trees are recovered from WAL
+2. Secondary indexes are reconstructed by scanning primary keys
+3. This ensures consistency without logging secondary index changes
+
+### Checkpointing Order
+
+Checkpoints are written in this order:
+1. TOAST trees (first)
+2. Primary key trees
+3. Secondary indexes (last)
+
+This ordering ensures that secondary indexes can always be rebuilt from checkpointed primary key data.
+
+## Undo Log Lifecycle
+
+### Retention Requirements
+
+The undo log retains records to support:
+
+1. **Rollback**: Active transactions that might abort
+2. **Snapshots**: Concurrent transactions with earlier snapshots
+3. **Recovery**: Transactions in progress during checkpointing
+
+### Eviction
+
+Undo records are evicted when:
+- No active snapshots need them (tracked via `minProcRetainLocation`)
+- Not needed for potential rollback
+- Past the checkpoint retain location
+
+### Storage
+
+- **In-Memory**: Recent undo records in circular buffer (controlled by `orioledb.undo_buffers`)
+- **On-Disk**: Older undo records evicted to disk files (`orioledb_undo/` directory)
+
+## Concurrency and Visibility
+
+### Snapshot Isolation
+
+Transactions see consistent snapshots by:
+1. Reading the current tuple version on the page
+2. Following undo chains to find the version visible to their snapshot
+3. Applying transaction visibility rules (based on OXid and CommitSeqNo)
+
+### Lock-Free Reads
+
+Secondary index reads don't require locks because:
+- The page state mechanism allows lock-free reading
+- Undo chains provide version history
+- Change tracking detects concurrent modifications
+
+## Summary
+
+**Yes, secondary indexes in OrioleDB keep previous versions** through the undo log system:
+
+- **Old rows cannot be deleted** until the transaction commits and all snapshots that might need them are gone
+- **Undo logs maintain complete history** of changes during a transaction
+- **Rollback is possible** by traversing and replaying the undo chain
+- **MVCC guarantees** are preserved for concurrent transactions
+- **No bloat** in the main B-tree structure, unlike PostgreSQL heap tables
+
+This design provides:
+- ✅ Full transactional semantics with rollback support
+- ✅ Snapshot isolation for concurrent readers
+- ✅ Efficient space management without vacuum
+- ✅ Fast recovery through primary key reconstruction
+
+## See Also
+
+- [Undo Log Storage](buffering.mdx) - Details on undo log buffering and eviction
+- [Architecture Overview](overview.mdx) - Overall undo log design
+- [Row-Level Concurrency](row-level-concurrency.mdx) - Concurrency control mechanisms
+- [Recovery](recovery.mdx) - How secondary indexes are recovered
