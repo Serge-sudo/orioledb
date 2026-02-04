@@ -1533,15 +1533,19 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 
 	/*
 	 * Write the file header.  We need to write the correct checkpoint number,
-	 * meta lock will prevent checkpointer from walking through.  Remove
-	 * shared root info placeholder to let checkpointer process this tree when
-	 * we release the lock.
+	 * meta lock will prevent checkpointer from walking through.  
+	 * For concurrent builds, we defer removing shared root info placeholder 
+	 * until after validation is complete.
 	 */
 	o_tables_table_meta_lock(o_table);
 
 	btree_write_file_header(&idx->desc, &fileHeader);
-	o_drop_shared_root_info(idx->desc.oids.datoid,
-							idx->desc.oids.relnode);
+	if (!concurrent)
+	{
+		/* Non-concurrent build: make index visible to checkpointer immediately */
+		o_drop_shared_root_info(idx->desc.oids.datoid,
+								idx->desc.oids.relnode);
+	}
 
 	o_tables_table_meta_unlock(o_table, InvalidOid);
 
@@ -1598,6 +1602,15 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		
 		/* Unregister building index after second scan completes */
 		unregister_building_index();
+		
+		/*
+		 * Second scan is complete and validated. Now make the index visible 
+		 * to checkpointer by removing the shared root info placeholder.
+		 */
+		o_tables_table_meta_lock(o_table);
+		o_drop_shared_root_info(idx->desc.oids.datoid,
+								idx->desc.oids.relnode);
+		o_tables_table_meta_unlock(o_table, InvalidOid);
 	}
 
 
