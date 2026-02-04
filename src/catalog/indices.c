@@ -1281,7 +1281,8 @@ build_secondary_index_worker_sort(oIdxBuildState *buildstate, oIdxSpool *btspool
 /* Get next tuple and store all its attributes to a slot */
 static inline bool
 scan_getnextslot_allattrs(oIdxBuildState *buildstate, BTreeSeqScan *scan, OTableDescr *descr,
-						  TupleTableSlot *slot, double *ntuples, BTreeLeafTuphdr **tupHdr)
+						  TupleTableSlot *slot, double *ntuples,
+						  BTreeLeafTuphdr **tupHdr pg_attribute_unused())
 {
 	OTuple		tup;
 	BTreeLocationHint hint;
@@ -1291,6 +1292,7 @@ scan_getnextslot_allattrs(oIdxBuildState *buildstate, BTreeSeqScan *scan, OTable
 	 * For non-concurrent builds, use standard sequential scan.
 	 * Concurrent index build support (stages 1 and 2) is reserved
 	 * for future implementation using the undo-based approach.
+	 * The tupHdr parameter will be used for concurrent builds.
 	 */
 	if (buildstate->concurrentStage != 0)
 	{
@@ -1319,7 +1321,6 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 {
 	void	   *sscan;
 	TupleTableSlot *primarySlot;
-	BTreeLeafTuphdr *tupHdr = NULL;  /* Reserved for future concurrent build */
 
 	sscan = make_btree_seq_scan(&GET_PRIMARY(descr)->desc, &o_in_progress_snapshot, poscan);
 
@@ -1327,7 +1328,7 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 
 	*heap_tuples = 0;
 	*index_tuples[0] = 0;
-	while (scan_getnextslot_allattrs(buildstate, sscan, descr, primarySlot, heap_tuples, &tupHdr))
+	while (scan_getnextslot_allattrs(buildstate, sscan, descr, primarySlot, heap_tuples, NULL))
 	{
 		OTuple		secondaryTup;
 
