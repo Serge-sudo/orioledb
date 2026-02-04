@@ -1331,15 +1331,21 @@ scan_getnextslot_allattrs(oIdxBuildState *buildstate, BTreeSeqScan *scan, OTable
 {
 	OTuple		tup;
 	BTreeLocationHint hint;
-	CommitSeqNo tupleCsn;
+	CommitSeqNo tupleCsn = InvalidCSN;
+	bool end;
 
 	if (buildstate->concurrentStage == 1)
-		tup = btree_seq_scan_getnext_raw(scan, slot->tts_mcxt, &hint, tupHdr);
-		tupleCsn = InvalidCSN;
+	{
+		tup = btree_seq_scan_getnext_raw(scan, slot->tts_mcxt, &end, &hint, tupHdr);
+	}
 	else if (buildstate->concurrentStage == 2)
+	{
 		tup = btree_seq_scan_getnext_page_undo(scan, slot->tts_mcxt, &hint, tupHdr);
+	}
 	else
+	{
 		tup = btree_seq_scan_getnext(scan, slot->tts_mcxt, &tupleCsn, &hint);
+	}
 
 	if (O_TUPLE_IS_NULL(tup))
 		return false;
