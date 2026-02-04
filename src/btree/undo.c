@@ -561,17 +561,18 @@ modify_undo_callback(UndoLogType undoType, UndoLocation location,
 										&building_descr))
 			{
 				/* There's a building index - check if this undo is in range */
-				UndoLocation undoLoc = UndoLocationGetValue(location);
-				if (undoLoc >= UndoLocationGetValue(building_undo1) &&
-					undoLoc <= UndoLocationGetValue(building_undo2))
+				uint64 undoLocValue = UndoLocationGetValue(location);
+				if (undoLocValue >= UndoLocationGetValue(building_undo1) &&
+					undoLocValue <= UndoLocationGetValue(building_undo2))
 				{
 					/* Need to propagate rollback to building index */
 					undoMode = BTreeUndoModeLimit;
 					rollbackCxt.limitUndoLocation1 = building_undo1;
 					rollbackCxt.limitUndoLocation2 = building_undo2;
-					rollbackCxt.rel = NULL;  /* TODO: Get relation if needed */
+					rollbackCxt.rel = NULL;  /* Not needed for secondary index rollback */
 					rollbackCxt.descr = building_descr;
 					rollbackCxt.ix_num = building_ix_num;
+					/* Get the secondary index descriptor, accounting for primary index at position 0 */
 					rollbackCxt.index_descr = building_descr->indices[building_ix_num + (building_descr->indices[0]->desc.type == oIndexPrimary ? 1 : 0)];
 				}
 			}

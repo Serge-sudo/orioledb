@@ -151,6 +151,11 @@ oIdxShared *recovery_oidxshared = NULL;
 Sharedsort *recovery_sharedsort = NULL;
 
 /* Track concurrent index builds for undo rollback propagation */
+/* 
+ * TODO: Currently supports only one concurrent index build at a time.
+ * For production use, this should be extended to support multiple concurrent
+ * builds using a hash table or list with proper locking.
+ */
 typedef struct BuildingIndexInfo
 {
 	ORelOids	tableOids;
