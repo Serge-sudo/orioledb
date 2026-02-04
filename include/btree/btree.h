@@ -97,18 +97,23 @@ typedef enum BTreeUndoMode
 {
 	BTreeUndoModeSingle = 0,
 	BTreeUndoModeXact = 1,
-	BTreeUndoModeLimit = 2  /* Undo secondary index down to limitUndoLocation */
-}
+	BTreeUndoModeLimit = 2  /* Reserved for future secondary index concurrent build */
+} BTreeUndoMode;
 
-typedef struct SecondaryIndexRollbackCxt
-{
-	UndoLocation	limitUndoLocation1;
-	UndoLocation    limitUndoLocation2;
-	Relation		rel;
-	OTableDescr		*descr;
-	OIndexNumber	ix_num;
-	OIndexDescr	 	*index_descr;
-} SecondaryIndexRollbackCxt;
+/*
+ * SecondaryIndexRollbackCxt - context for secondary index rollback during
+ * concurrent index build. Reserved for future implementation.
+ *
+ * typedef struct SecondaryIndexRollbackCxt
+ * {
+ *     UndoLocation    limitUndoLocation1;
+ *     UndoLocation    limitUndoLocation2;
+ *     Relation        rel;
+ *     OTableDescr     *descr;
+ *     OIndexNumber    ix_num;
+ *     OIndexDescr     *index_descr;
+ * } SecondaryIndexRollbackCxt;
+ */
 
 typedef struct
 {
