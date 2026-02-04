@@ -1436,6 +1436,13 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 	sortstates = palloc0(sizeof(Pointer));
 	sortstates[0] = tuplesort_begin_orioledb_index(idx, work_mem, false, coordinate);
 
+	/* Capture undo1 before first scan starts for concurrent index build */
+	if (concurrent)
+	{
+		UndoStackLocations undoLocations = get_cur_undo_locations(UndoLogTypeTable);
+		buildstate.undo1 = undoLocations.location;
+	}
+
 	/* Fill spool using either serial or parallel heap scan */
 	if (!buildstate.btleader)
 	{
@@ -1507,6 +1514,10 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 
 	if (concurrent)
 	{
+		/* Capture undo2 after first scan, before second scan */
+		UndoStackLocations undoLocations = get_cur_undo_locations(UndoLogTypeTable);
+		buildstate.undo2 = undoLocations.location;
+		
 		buildstate.concurrentStage = 2;
 
 		/* Begin serial stage2 tuplesort */
