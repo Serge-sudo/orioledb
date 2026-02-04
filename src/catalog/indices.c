@@ -120,12 +120,9 @@ typedef struct oIdxBuildState
 	bool		isrebuild;
 
 	/* State of concurrent Oriole index build */
-	int     concurrentStage;	/* 0 - non concurrent, 1 - first scan, 2 - second scan */
-	undoLocation undo1;			/* Before first scan */
-	undoLocation undo2;         /* After attaching index to get updates from heap */
-	bool	noncomplete_xact;
-	Tuplestorestate *noncomplete_xact_tupstore;  /* Store for tuples waiting for transaction to finish */
-	TupleDesc		noncomplete_xact_tupdesc;	 /* Fake descriptor for index tuples waiting for transaction to finish + xid */
+	int			concurrentStage;	/* 0 - non concurrent, 1 - first scan, 2 - second scan */
+	UndoLocation undo1;			/* Before first scan */
+	UndoLocation undo2;			/* After attaching index to get updates from heap */
 } oIdxBuildState;
 
 static void _o_index_end_parallel(oIdxLeader *btleader);
@@ -270,9 +267,6 @@ o_define_index_validate(ORelOids oids, Relation index, IndexInfo *indexInfo, OTa
 {
 	int			nattrs;
 	OIndexType	ix_type;
-
-	if (indexInfo && indexInfo->ii_Concurrent)
-		elog(ERROR, "concurrent indexes are not supported.");
 
 	if (index->rd_index->indisexclusion)
 		elog(ERROR, "exclusion indices are not supported.");
@@ -1347,40 +1341,12 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 				Assert(UndoLocationIsValid(buildstate->undo1));
 				if (tupHdr->undoLocation >= buildstate->undo1 && tupHdr->undoLocation <= buildstate->undo2)
 				{
-					/* Tuples inserted between undo1 and undo2 need to be inserted into index */
-					if (!XACT_INFO_IS_FINISHED(tupHdr->OTupleXactInfo))
-					{
-						/* Store tuples for non-complete transactions to local undo log */
-						Datum *values;
-						bool *nulls;
-
-						buildstate->noncomplete_xact = true;
-						if(!buildstate->noncomplete_xact_tupstore)
-						{
-							buildstate->noncomplete_xact_tupstore = tuplestore_begin_heap(true, false, work_mem);
-						}
-						if(!buildstate->noncomplete_xact_tupdesc)
-						{
-							/* construct tuple descriptor (index attributes, xid) */
-						}
-						values = palloc(sizeof(Datum) * buildstate->noncomplete_xact_tupdesc->natts);
-						nulls = palloc(sizeod(bool) * buildstate->noncomplete_xact_tupdesc->natts);
-						tts_orioledb_get_index_values(primarySlot, idx, values, nulls, true);
-						o_btree_check_size_of_tuple(o_tuple_size(secondaryTup,
-													&idx->leafSpec),
-													idx->name.data, true);
-						/* Construct tuple (index attributes, xid) */
-						nulls[natts] = false;
-						values[natts] = tupHdr->OTupleXactInfo;
-						tuplestore_putvalues(buildstate->noncomplete_xact_tupstore,
-											 buildstate->noncomplete_xact_tupdesc, values, nulls);
-						pfree(values);
-						pfree(nulls);
-					}
+					/* Tuples modified between undo1 and undo2 need to be inserted into index */
+					/* Rollbacks will be propagated via undo callbacks */
 				}
 				else
 				{
-					/* Tuples inserted before undo1 and after ubdo2 are already in the index. Skip them. */
+					/* Tuples inserted before undo1 and after undo2 are already in the index. Skip them. */
 					continue;
 				}
 			}
@@ -1542,9 +1508,6 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 	if (concurrent)
 	{
 		buildstate.concurrentStage = 2;
-		buildstate.noncomplete_xact_exists = false;
-		noncomplete_xact_tupstore = NULL;
-		noncomplete_xact_tupdesc = NULL;
 
 		/* Begin serial stage2 tuplesort */
 		sortstates = palloc0(sizeof(Pointer));
@@ -1560,15 +1523,6 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		/* End serial/leader sort */
 		tuplesort_end(sortstates[0]);
 		pfree(sortstates);
-
-		/*
-		 * Wait for all xacts for tuples between undo1 and undo2 finished. If rolled back then delete inserted tuple
-		 * from index
-		 */
-		if (buildstate.noncomplete_xact_exists)
-		{
-			
-		}
 	}
 
 
