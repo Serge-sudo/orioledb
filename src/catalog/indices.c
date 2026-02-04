@@ -150,10 +150,61 @@ bool		in_indexes_rebuild = false;
 oIdxShared *recovery_oidxshared = NULL;
 Sharedsort *recovery_sharedsort = NULL;
 
+/* Track concurrent index builds for undo rollback propagation */
+typedef struct BuildingIndexInfo
+{
+	ORelOids	tableOids;
+	OIndexNumber ix_num;
+	UndoLocation undo1;
+	UndoLocation undo2;
+	OTableDescr *descr;
+	bool		active;
+} BuildingIndexInfo;
+
+static BuildingIndexInfo building_index_info = {0};
+
 bool
 is_in_indexes_rebuild(void)
 {
 	return in_indexes_rebuild;
+}
+
+bool
+get_building_index_info(ORelOids tableOids, OIndexNumber *ix_num,
+						UndoLocation *undo1, UndoLocation *undo2,
+						OTableDescr **descr)
+{
+	if (!building_index_info.active)
+		return false;
+	
+	if (building_index_info.tableOids.datoid != tableOids.datoid ||
+		building_index_info.tableOids.reloid != tableOids.reloid)
+		return false;
+	
+	*ix_num = building_index_info.ix_num;
+	*undo1 = building_index_info.undo1;
+	*undo2 = building_index_info.undo2;
+	*descr = building_index_info.descr;
+	return true;
+}
+
+static void
+register_building_index(ORelOids tableOids, OIndexNumber ix_num,
+						UndoLocation undo1, UndoLocation undo2,
+						OTableDescr *descr)
+{
+	building_index_info.tableOids = tableOids;
+	building_index_info.ix_num = ix_num;
+	building_index_info.undo1 = undo1;
+	building_index_info.undo2 = undo2;
+	building_index_info.descr = descr;
+	building_index_info.active = true;
+}
+
+static void
+unregister_building_index(void)
+{
+	building_index_info.active = false;
 }
 
 void
@@ -1518,6 +1569,10 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		UndoStackLocations undoLocations = get_cur_undo_locations(UndoLogTypeTable);
 		buildstate.undo2 = undoLocations.location;
 		
+		/* Register building index for undo rollback propagation */
+		register_building_index(o_table->oids, ix_num,
+								buildstate.undo1, buildstate.undo2, descr);
+		
 		buildstate.concurrentStage = 2;
 
 		/* Begin serial stage2 tuplesort */
@@ -1534,6 +1589,9 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		/* End serial/leader sort */
 		tuplesort_end(sortstates[0]);
 		pfree(sortstates);
+		
+		/* Unregister building index after second scan completes */
+		unregister_building_index();
 	}
 
 
