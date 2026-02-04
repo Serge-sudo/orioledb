@@ -278,6 +278,36 @@ retry:
 
 		BTREE_PAGE_SET_ITEM_FLAGS(p, locator, tuple.formatFlags);
 
+		if (undoMode == BTreeUndoModeLimit)
+		{
+			/* Propagate update to secondary index being built */
+			TupleTableSlot *old_slot = rollbackSecondary.index_descr->old_leaf_slot;
+			TupleTableSlot *new_slot = rollbackSecondary.index_descr->new_leaf_slot;
+			OTuple      	old_tuple,
+							new_tuple;
+			OXid			oxid;
+			CommitSeqNo		csn;
+			
+			/* Prepare old tuple (current state before rollback) */
+			old_tuple.formatFlags = BTREE_PAGE_GET_ITEM_FLAGS(p, locator);
+			old_tuple.data = item + BTreeLeafTuphdrSize;
+			
+			/* Prepare new tuple (previous state after rollback) */
+			new_tuple = tuple;
+			
+			/* Get transaction info */
+			oxid = prev_header.xactInfo.oxid;
+			csn = COMMITSEQNO_INPROGRESS;
+			
+			/* Update secondary index */
+			undone = o_update_secondary_index(rollbackSecondary.index_descr,
+											  rollbackSecondary.ix_num,
+											  true, true,
+											  new_slot, new_tuple,
+											  old_slot, oxid, csn);
+			res = res || undone;
+		}
+
 		/* Follow the row-level undo chain if needed */
 		if ((undoMode == BTreeUndoModeXact && (UndoLocationIsValid(nonLockUndoLocation) ||
 			 !XACT_INFO_IS_FINISHED(prev_header.xactInfo))) ||

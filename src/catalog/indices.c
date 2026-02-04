@@ -49,7 +49,9 @@
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_utilcmd.h"
 #include "pgstat.h"
+#include "storage/ipc.h"
 #include "storage/predicate.h"
+#include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -150,23 +152,55 @@ bool		in_indexes_rebuild = false;
 oIdxShared *recovery_oidxshared = NULL;
 Sharedsort *recovery_sharedsort = NULL;
 
-/* Track concurrent index builds for undo rollback propagation */
 /* 
- * TODO: Currently supports only one concurrent index build at a time.
- * For production use, this should be extended to support multiple concurrent
- * builds using a hash table or list with proper locking.
+ * Shared memory structure for tracking concurrent index builds.
+ * Supports multiple concurrent index builds with proper locking.
+ * Each entry tracks a building index for undo rollback propagation.
  */
-typedef struct BuildingIndexInfo
+#define MAX_BUILDING_INDEXES 8
+
+typedef struct BuildingIndexEntry
 {
 	ORelOids	tableOids;
 	OIndexNumber ix_num;
 	UndoLocation undo1;
 	UndoLocation undo2;
-	OTableDescr *descr;
+	OTableDescr *descr;		/* Local pointer, not shared across processes */
 	bool		active;
-} BuildingIndexInfo;
+	int			backend_id;	/* Backend that registered this build */
+} BuildingIndexEntry;
 
-static BuildingIndexInfo building_index_info = {0};
+typedef struct BuildingIndexShared
+{
+	slock_t		mutex;			/* Spinlock protecting the entries */
+	int			num_active;		/* Number of active building indexes */
+	BuildingIndexEntry entries[MAX_BUILDING_INDEXES];
+} BuildingIndexShared;
+
+static BuildingIndexShared *building_indexes_shared = NULL;
+
+/*
+ * Initialize shared memory for building indexes tracking.
+ * This should be called once during extension initialization.
+ */
+static void
+init_building_indexes_shared(void)
+{
+	bool found;
+	
+	building_indexes_shared = (BuildingIndexShared *)
+		ShmemInitStruct("OrioleDB Building Indexes",
+						sizeof(BuildingIndexShared),
+						&found);
+	
+	if (!found)
+	{
+		SpinLockInit(&building_indexes_shared->mutex);
+		building_indexes_shared->num_active = 0;
+		memset(building_indexes_shared->entries, 0, 
+			   sizeof(BuildingIndexEntry) * MAX_BUILDING_INDEXES);
+	}
+}
 
 bool
 is_in_indexes_rebuild(void)
@@ -179,18 +213,34 @@ get_building_index_info(ORelOids tableOids, OIndexNumber *ix_num,
 						UndoLocation *undo1, UndoLocation *undo2,
 						OTableDescr **descr)
 {
-	if (!building_index_info.active)
+	bool found = false;
+	int i;
+	
+	if (!building_indexes_shared)
 		return false;
 	
-	if (building_index_info.tableOids.datoid != tableOids.datoid ||
-		building_index_info.tableOids.reloid != tableOids.reloid)
-		return false;
+	SpinLockAcquire(&building_indexes_shared->mutex);
 	
-	*ix_num = building_index_info.ix_num;
-	*undo1 = building_index_info.undo1;
-	*undo2 = building_index_info.undo2;
-	*descr = building_index_info.descr;
-	return true;
+	for (i = 0; i < MAX_BUILDING_INDEXES; i++)
+	{
+		BuildingIndexEntry *entry = &building_indexes_shared->entries[i];
+		
+		if (entry->active &&
+			entry->tableOids.datoid == tableOids.datoid &&
+			entry->tableOids.reloid == tableOids.reloid)
+		{
+			*ix_num = entry->ix_num;
+			*undo1 = entry->undo1;
+			*undo2 = entry->undo2;
+			*descr = entry->descr;
+			found = true;
+			break;
+		}
+	}
+	
+	SpinLockRelease(&building_indexes_shared->mutex);
+	
+	return found;
 }
 
 static void
@@ -198,18 +248,67 @@ register_building_index(ORelOids tableOids, OIndexNumber ix_num,
 						UndoLocation undo1, UndoLocation undo2,
 						OTableDescr *descr)
 {
-	building_index_info.tableOids = tableOids;
-	building_index_info.ix_num = ix_num;
-	building_index_info.undo1 = undo1;
-	building_index_info.undo2 = undo2;
-	building_index_info.descr = descr;
-	building_index_info.active = true;
+	int i;
+	bool registered = false;
+	
+	if (!building_indexes_shared)
+		init_building_indexes_shared();
+	
+	SpinLockAcquire(&building_indexes_shared->mutex);
+	
+	/* Find an empty slot */
+	for (i = 0; i < MAX_BUILDING_INDEXES; i++)
+	{
+		if (!building_indexes_shared->entries[i].active)
+		{
+			BuildingIndexEntry *entry = &building_indexes_shared->entries[i];
+			entry->tableOids = tableOids;
+			entry->ix_num = ix_num;
+			entry->undo1 = undo1;
+			entry->undo2 = undo2;
+			entry->descr = descr;
+			entry->backend_id = MyBackendId;
+			entry->active = true;
+			building_indexes_shared->num_active++;
+			registered = true;
+			break;
+		}
+	}
+	
+	SpinLockRelease(&building_indexes_shared->mutex);
+	
+	if (!registered)
+		elog(ERROR, "Too many concurrent index builds. Maximum allowed: %d", 
+			 MAX_BUILDING_INDEXES);
 }
 
 static void
-unregister_building_index(void)
+unregister_building_index(ORelOids tableOids, OIndexNumber ix_num)
 {
-	building_index_info.active = false;
+	int i;
+	
+	if (!building_indexes_shared)
+		return;
+	
+	SpinLockAcquire(&building_indexes_shared->mutex);
+	
+	for (i = 0; i < MAX_BUILDING_INDEXES; i++)
+	{
+		BuildingIndexEntry *entry = &building_indexes_shared->entries[i];
+		
+		if (entry->active &&
+			entry->tableOids.datoid == tableOids.datoid &&
+			entry->tableOids.reloid == tableOids.reloid &&
+			entry->ix_num == ix_num &&
+			entry->backend_id == MyBackendId)
+		{
+			entry->active = false;
+			building_indexes_shared->num_active--;
+			break;
+		}
+	}
+	
+	SpinLockRelease(&building_indexes_shared->mutex);
 }
 
 void
@@ -1606,7 +1705,7 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		pfree(sortstates);
 		
 		/* Unregister building index after second scan completes */
-		unregister_building_index();
+		unregister_building_index(o_table->oids, ix_num);
 		
 		/*
 		 * Second scan is complete and validated. Now make the index visible 
