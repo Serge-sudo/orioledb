@@ -55,3 +55,4 @@ sql/orioledb--1.0.sql
 
 # Exclude the PostGIS Docker build directory
 /docker-postgis
+_codeql_detected_source_root
