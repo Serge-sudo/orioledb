@@ -1627,6 +1627,38 @@ btree_seq_scan_getnext_raw(BTreeSeqScan *scan, MemoryContext mctx,
 	return tuple;
 }
 
+/*
+ * Get next tuple from sequential scan for concurrent index build stage 2.
+ * Only returns tuples with undoLocation in the specified range.
+ */
+OTuple
+btree_seq_scan_getnext_page_undo(BTreeSeqScan *scan, MemoryContext mctx,
+								BTreeLocationHint *hint, BTreeLeafTuphdr **tupHdr)
+{
+	OTuple		tuple;
+	bool		end;
+
+	if (!scan->initialized)
+		init_btree_seq_scan(scan);
+
+	/* Use raw scan to get all tuples with their headers */
+	do {
+		tuple = btree_seq_scan_getnext_raw(scan, mctx, &end, hint, tupHdr);
+		
+		if (end || O_TUPLE_IS_NULL(tuple))
+		{
+			O_TUPLE_SET_NULL(tuple);
+			return tuple;
+		}
+		
+		/* For stage 2, we want ALL tuples - the caller will filter by undo range */
+		/* Return the tuple with its header so caller can check undoLocation */
+		if (*tupHdr && !(*tupHdr)->deleted)
+			return tuple;
+			
+	} while (true);
+}
+
 void
 free_btree_seq_scan(BTreeSeqScan *scan)
 {

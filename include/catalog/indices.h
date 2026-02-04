@@ -143,6 +143,9 @@ extern void build_secondary_index(OTable *o_table, OTableDescr *descr,
 								  OIndexNumber ix_num,
 								  bool in_dedicated_recovery_worker,
 								  IndexBuildResult *result);
+extern bool get_building_index_info(ORelOids tableOids, OIndexNumber *ix_num,
+									UndoLocation *undo1, UndoLocation *undo2,
+									OTableDescr **descr);
 PGDLLEXPORT void _o_index_parallel_build_main(dsm_segment *seg, shm_toc *toc);
 extern void _o_index_parallel_build_inner(dsm_segment *seg, shm_toc *toc,
 										  OTable *recovery_o_table, OTable *recovery_old_o_table);

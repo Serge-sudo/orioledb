@@ -19,6 +19,7 @@
 #include "btree/merge.h"
 #include "btree/page_chunks.h"
 #include "btree/undo.h"
+#include "catalog/indices.h"
 #include "catalog/o_sys_cache.h"
 #include "recovery/recovery.h"
 #include "tableam/descr.h"
@@ -136,7 +137,7 @@ page_item_rollback(BTreeDescr *desc, Page p, BTreePageItemLocator *locator,
 	bool		res = false;
 	bool 		undone;
 
-	Assert(undoMode == BTreeUndoModeLimit ? rollbackSecondary != NULL : rollbackSecondary == NULL);
+	Assert(undoMode == BTreeUndoModeLimit ? rollbackSecondary.index_descr != NULL : rollbackSecondary.index_descr == NULL);
 
 	item = BTREE_PAGE_LOCATOR_GET_ITEM(p, locator);
 	tuphdr = (BTreeLeafTuphdr *) item;
@@ -151,10 +152,10 @@ page_item_rollback(BTreeDescr *desc, Page p, BTreePageItemLocator *locator,
 
 	if (undoMode == BTreeUndoModeLimit)
 	{
-			Assert(UndoLocationIsValid(rollbackSecondary.limitUndoLocation1);
-			Assert(UndoLocationIsValid(rollbackSecondary.limitUndoLocation2);
-			limitUndoLocationValue1 = UndoLocationGetValue(rollbackSecondary.limitUndoLocation1);
-			limitUndoLocationValue2 = UndoLocationGetValue(rollbackSecondary.limitUndoLocation2);
+		Assert(UndoLocationIsValid(rollbackSecondary.limitUndoLocation1));
+		Assert(UndoLocationIsValid(rollbackSecondary.limitUndoLocation2));
+		limitUndoLocationValue1 = UndoLocationGetValue(rollbackSecondary.limitUndoLocation1);
+		limitUndoLocationValue2 = UndoLocationGetValue(rollbackSecondary.limitUndoLocation2);
 	}
 
 retry:
@@ -277,25 +278,49 @@ retry:
 
 		BTREE_PAGE_SET_ITEM_FLAGS(p, locator, tuple.formatFlags);
 
-		if (undoMode == BTreeUndoModeUndoLimit)
+		if (undoMode == BTreeUndoModeLimit)
 		{
-				result = o_update_secondary_index(index_descr, ix_num,
-									  new_valid, old_valid,
-									  new_slot, new_tuple,
-									  old_slot, oxid, oSnapshot.csn);
+			/* Propagate update to secondary index being built */
+			TupleTableSlot *old_slot = rollbackSecondary.index_descr->old_leaf_slot;
+			TupleTableSlot *new_slot = rollbackSecondary.index_descr->new_leaf_slot;
+			OTuple      	old_tuple,
+							new_tuple;
+			OXid			oxid;
+			CommitSeqNo		csn;
+			
+			/* Prepare old tuple (current state before rollback) */
+			old_tuple.formatFlags = BTREE_PAGE_GET_ITEM_FLAGS(p, locator);
+			old_tuple.data = item + BTreeLeafTuphdrSize;
+			
+			/* Prepare new tuple (previous state after rollback) */
+			new_tuple = tuple;
+			
+			/* Get transaction info */
+			oxid = prev_header.xactInfo.oxid;
+			csn = COMMITSEQNO_INPROGRESS;
+			
+			/* Update secondary index */
+			undone = o_update_secondary_index(rollbackSecondary.index_descr,
+											  rollbackSecondary.ix_num,
+											  true, true,
+											  new_slot, new_tuple,
+											  old_slot, oxid, csn);
+			res = res || undone;
 		}
 
 		/* Follow the row-level undo chain if needed */
-		if (undoMode == BTreeUndoModeXact && (UndoLocationIsValid(nonLockUndoLocation) ||
-			 !XACT_INFO_IS_FINISHED(prev_header.xactInfo)) ||
-			(undoMode == BTreeUndoModeUndoLimit) && tupleUndoLocationValue >= limitUndoLocationValue)
+		if ((undoMode == BTreeUndoModeXact && (UndoLocationIsValid(nonLockUndoLocation) ||
+			 !XACT_INFO_IS_FINISHED(prev_header.xactInfo))) ||
+			((undoMode == BTreeUndoModeLimit) && tupleUndoLocationValue >= limitUndoLocationValue1))
 		{
 			/* Find the next item in the chain */
 			nonLockUndoLocation = find_non_lock_only_undo_record(desc->undoType,
 																 nonLockTuphdrPtr);
 			if (undoMode == BTreeUndoModeXact && XACT_INFO_IS_FINISHED(nonLockTuphdrPtr->xactInfo))
-				return true;
-			else if (undoMode == BTreeUndoModeUndoLimit) && UndoLocationGetValue(tuphdr->undoLocation) >= UndoLocationGetValue(limitUndoLocation)
+				return res;
+			else if ((undoMode == BTreeUndoModeLimit) && 
+					 UndoLocationGetValue(tuphdr->undoLocation) < limitUndoLocationValue1)
+				return res;
 
 			item = BTREE_PAGE_LOCATOR_GET_ITEM(p, locator);
 			tuphdr = (BTreeLeafTuphdr *) item;
@@ -551,8 +576,40 @@ modify_undo_callback(UndoLogType undoType, UndoLocation location,
 	if (nonLockTupHdr.undoLocation == location + offsetof(BTreeModifyUndoStackItem, tuphdr) ||
 		(!UndoLocationIsValid(nonLockTupHdr.undoLocation) && item->action == BTreeOperationInsert))
 	{
-		(void) page_item_rollback(desc, p, loc, BTreeUndoModeSingle,
-								  &nonLockTupHdr, nonLockUndoLocation, InvalidUndoLocation);
+		BTreeUndoMode undoMode = BTreeUndoModeSingle;
+		SecondaryIndexRollbackCxt rollbackCxt = {0};
+		
+		/* Check if we need to propagate rollback to a building secondary index */
+		if (desc->type == oIndexPrimary)
+		{
+			OIndexNumber building_ix_num;
+			UndoLocation building_undo1, building_undo2;
+			OTableDescr *building_descr;
+			
+			if (get_building_index_info(desc->oids, &building_ix_num,
+										&building_undo1, &building_undo2,
+										&building_descr))
+			{
+				/* There's a building index - check if this undo is in range */
+				uint64 undoLocValue = UndoLocationGetValue(location);
+				if (undoLocValue >= UndoLocationGetValue(building_undo1) &&
+					undoLocValue <= UndoLocationGetValue(building_undo2))
+				{
+					/* Need to propagate rollback to building index */
+					undoMode = BTreeUndoModeLimit;
+					rollbackCxt.limitUndoLocation1 = building_undo1;
+					rollbackCxt.limitUndoLocation2 = building_undo2;
+					rollbackCxt.rel = NULL;  /* Not needed for secondary index rollback */
+					rollbackCxt.descr = building_descr;
+					rollbackCxt.ix_num = building_ix_num;
+					/* Get the secondary index descriptor, accounting for primary index at position 0 */
+					rollbackCxt.index_descr = building_descr->indices[building_ix_num + (building_descr->indices[0]->desc.type == oIndexPrimary ? 1 : 0)];
+				}
+			}
+		}
+		
+		(void) page_item_rollback(desc, p, loc, undoMode,
+								  &nonLockTupHdr, nonLockUndoLocation, rollbackCxt);
 	}
 
 	MARK_DIRTY(desc, blkno);

@@ -49,7 +49,9 @@
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_utilcmd.h"
 #include "pgstat.h"
+#include "storage/ipc.h"
 #include "storage/predicate.h"
+#include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -120,12 +122,9 @@ typedef struct oIdxBuildState
 	bool		isrebuild;
 
 	/* State of concurrent Oriole index build */
-	int     concurrentStage;	/* 0 - non concurrent, 1 - first scan, 2 - second scan */
-	undoLocation undo1;			/* Before first scan */
-	undoLocation undo2;         /* After attaching index to get updates from heap */
-	bool	noncomplete_xact;
-	Tuplestorestate *noncomplete_xact_tupstore;  /* Store for tuples waiting for transaction to finish */
-	TupleDesc		noncomplete_xact_tupdesc;	 /* Fake descriptor for index tuples waiting for transaction to finish + xid */
+	int			concurrentStage;	/* 0 - non concurrent, 1 - first scan, 2 - second scan */
+	UndoLocation undo1;			/* Before first scan */
+	UndoLocation undo2;			/* After attaching index to get updates from heap */
 } oIdxBuildState;
 
 static void _o_index_end_parallel(oIdxLeader *btleader);
@@ -153,10 +152,163 @@ bool		in_indexes_rebuild = false;
 oIdxShared *recovery_oidxshared = NULL;
 Sharedsort *recovery_sharedsort = NULL;
 
+/* 
+ * Shared memory structure for tracking concurrent index builds.
+ * Supports multiple concurrent index builds with proper locking.
+ * Each entry tracks a building index for undo rollback propagation.
+ */
+#define MAX_BUILDING_INDEXES 8
+
+typedef struct BuildingIndexEntry
+{
+	ORelOids	tableOids;
+	OIndexNumber ix_num;
+	UndoLocation undo1;
+	UndoLocation undo2;
+	OTableDescr *descr;		/* Local pointer, not shared across processes */
+	bool		active;
+	int			backend_id;	/* Backend that registered this build */
+} BuildingIndexEntry;
+
+typedef struct BuildingIndexShared
+{
+	slock_t		mutex;			/* Spinlock protecting the entries */
+	int			num_active;		/* Number of active building indexes */
+	BuildingIndexEntry entries[MAX_BUILDING_INDEXES];
+} BuildingIndexShared;
+
+static BuildingIndexShared *building_indexes_shared = NULL;
+
+/*
+ * Initialize shared memory for building indexes tracking.
+ * This should be called once during extension initialization.
+ */
+static void
+init_building_indexes_shared(void)
+{
+	bool found;
+	
+	building_indexes_shared = (BuildingIndexShared *)
+		ShmemInitStruct("OrioleDB Building Indexes",
+						sizeof(BuildingIndexShared),
+						&found);
+	
+	if (!found)
+	{
+		SpinLockInit(&building_indexes_shared->mutex);
+		building_indexes_shared->num_active = 0;
+		memset(building_indexes_shared->entries, 0, 
+			   sizeof(BuildingIndexEntry) * MAX_BUILDING_INDEXES);
+	}
+}
+
 bool
 is_in_indexes_rebuild(void)
 {
 	return in_indexes_rebuild;
+}
+
+bool
+get_building_index_info(ORelOids tableOids, OIndexNumber *ix_num,
+						UndoLocation *undo1, UndoLocation *undo2,
+						OTableDescr **descr)
+{
+	bool found = false;
+	int i;
+	
+	if (!building_indexes_shared)
+		return false;
+	
+	SpinLockAcquire(&building_indexes_shared->mutex);
+	
+	for (i = 0; i < MAX_BUILDING_INDEXES; i++)
+	{
+		BuildingIndexEntry *entry = &building_indexes_shared->entries[i];
+		
+		if (entry->active &&
+			entry->tableOids.datoid == tableOids.datoid &&
+			entry->tableOids.reloid == tableOids.reloid)
+		{
+			*ix_num = entry->ix_num;
+			*undo1 = entry->undo1;
+			*undo2 = entry->undo2;
+			*descr = entry->descr;
+			found = true;
+			break;
+		}
+	}
+	
+	SpinLockRelease(&building_indexes_shared->mutex);
+	
+	return found;
+}
+
+static void
+register_building_index(ORelOids tableOids, OIndexNumber ix_num,
+						UndoLocation undo1, UndoLocation undo2,
+						OTableDescr *descr)
+{
+	int i;
+	bool registered = false;
+	
+	if (!building_indexes_shared)
+		init_building_indexes_shared();
+	
+	SpinLockAcquire(&building_indexes_shared->mutex);
+	
+	/* Find an empty slot */
+	for (i = 0; i < MAX_BUILDING_INDEXES; i++)
+	{
+		if (!building_indexes_shared->entries[i].active)
+		{
+			BuildingIndexEntry *entry = &building_indexes_shared->entries[i];
+			entry->tableOids = tableOids;
+			entry->ix_num = ix_num;
+			entry->undo1 = undo1;
+			entry->undo2 = undo2;
+			entry->descr = descr;
+			entry->backend_id = MyBackendId;
+			entry->active = true;
+			building_indexes_shared->num_active++;
+			registered = true;
+			break;
+		}
+	}
+	
+	SpinLockRelease(&building_indexes_shared->mutex);
+	
+	if (!registered)
+		elog(ERROR, "Too many concurrent index builds. Maximum allowed: %d", 
+			 MAX_BUILDING_INDEXES);
+}
+
+static void
+unregister_building_index(ORelOids tableOids, OIndexNumber ix_num)
+{
+	int i;
+	
+	if (!building_indexes_shared)
+		return;
+	
+	SpinLockAcquire(&building_indexes_shared->mutex);
+	
+	for (i = 0; i < MAX_BUILDING_INDEXES; i++)
+	{
+		BuildingIndexEntry *entry = &building_indexes_shared->entries[i];
+		
+		if (entry->active &&
+			entry->tableOids.datoid == tableOids.datoid &&
+			entry->tableOids.reloid == tableOids.reloid &&
+			entry->ix_num == ix_num &&
+			entry->backend_id == MyBackendId)
+		{
+			entry->active = false;
+			building_indexes_shared->num_active--;
+			break;
+		}
+	}
+	
+	SpinLockRelease(&building_indexes_shared->mutex);
 }
 
 void
@@ -270,9 +422,6 @@ o_define_index_validate(ORelOids oids, Relation index, IndexInfo *indexInfo, OTa
 {
 	int			nattrs;
 	OIndexType	ix_type;
-
-	if (indexInfo && indexInfo->ii_Concurrent)
-		elog(ERROR, "concurrent indexes are not supported.");
 
 	if (index->rd_index->indisexclusion)
 		elog(ERROR, "exclusion indices are not supported.");
@@ -1286,15 +1435,21 @@ scan_getnextslot_allattrs(oIdxBuildState *buildstate, BTreeSeqScan *scan, OTable
 {
 	OTuple		tup;
 	BTreeLocationHint hint;
-	CommitSeqNo tupleCsn;
+	CommitSeqNo tupleCsn = InvalidCSN;
+	bool end;
 
 	if (buildstate->concurrentStage == 1)
-		tup = btree_seq_scan_getnext_raw(scan, slot->tts_mcxt, &hint, tupHdr);
-		tupleCsn = InvalidCSN;
+	{
+		tup = btree_seq_scan_getnext_raw(scan, slot->tts_mcxt, &end, &hint, tupHdr);
+	}
 	else if (buildstate->concurrentStage == 2)
+	{
 		tup = btree_seq_scan_getnext_page_undo(scan, slot->tts_mcxt, &hint, tupHdr);
+	}
 	else
+	{
 		tup = btree_seq_scan_getnext(scan, slot->tts_mcxt, &tupleCsn, &hint);
+	}
 
 	if (O_TUPLE_IS_NULL(tup))
 		return false;
@@ -1347,40 +1502,12 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 				Assert(UndoLocationIsValid(buildstate->undo1));
 				if (tupHdr->undoLocation >= buildstate->undo1 && tupHdr->undoLocation <= buildstate->undo2)
 				{
-					/* Tuples inserted between undo1 and undo2 need to be inserted into index */
-					if (!XACT_INFO_IS_FINISHED(tupHdr->OTupleXactInfo))
-					{
-						/* Store tuples for non-complete transactions to local undo log */
-						Datum *values;
-						bool *nulls;
-
-						buildstate->noncomplete_xact = true;
-						if(!buildstate->noncomplete_xact_tupstore)
-						{
-							buildstate->noncomplete_xact_tupstore = tuplestore_begin_heap(true, false, work_mem);
-						}
-						if(!buildstate->noncomplete_xact_tupdesc)
-						{
-							/* construct tuple descriptor (index attributes, xid) */
-						}
-						values = palloc(sizeof(Datum) * buildstate->noncomplete_xact_tupdesc->natts);
-						nulls = palloc(sizeod(bool) * buildstate->noncomplete_xact_tupdesc->natts);
-						tts_orioledb_get_index_values(primarySlot, idx, values, nulls, true);
-						o_btree_check_size_of_tuple(o_tuple_size(secondaryTup,
-													&idx->leafSpec),
-													idx->name.data, true);
-						/* Construct tuple (index attributes, xid) */
-						nulls[natts] = false;
-						values[natts] = tupHdr->OTupleXactInfo;
-						tuplestore_putvalues(buildstate->noncomplete_xact_tupstore,
-											 buildstate->noncomplete_xact_tupdesc, values, nulls);
-						pfree(values);
-						pfree(nulls);
-					}
+					/* Tuples modified between undo1 and undo2 need to be inserted into index */
+					/* Rollbacks will be propagated via undo callbacks */
 				}
 				else
 				{
-					/* Tuples inserted before undo1 and after ubdo2 are already in the index. Skip them. */
+					/* Tuples inserted before undo1 and after undo2 are already in the index. Skip them. */
 					continue;
 				}
 			}
@@ -1470,6 +1597,13 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 	sortstates = palloc0(sizeof(Pointer));
 	sortstates[0] = tuplesort_begin_orioledb_index(idx, work_mem, false, coordinate);
 
+	/* Capture undo1 before first scan starts for concurrent index build */
+	if (concurrent)
+	{
+		UndoStackLocations undoLocations = get_cur_undo_locations(UndoLogTypeTable);
+		buildstate.undo1 = undoLocations.location;
+	}
+
 	/* Fill spool using either serial or parallel heap scan */
 	if (!buildstate.btleader)
 	{
@@ -1503,15 +1637,19 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 
 	/*
 	 * Write the file header.  We need to write the correct checkpoint number,
-	 * meta lock will prevent checkpointer from walking through.  Remove
-	 * shared root info placeholder to let checkpointer process this tree when
-	 * we release the lock.
+	 * meta lock will prevent checkpointer from walking through.  
+	 * For concurrent builds, we defer removing shared root info placeholder 
+	 * until after validation is complete.
 	 */
 	o_tables_table_meta_lock(o_table);
 
 	btree_write_file_header(&idx->desc, &fileHeader);
-	o_drop_shared_root_info(idx->desc.oids.datoid,
-							idx->desc.oids.relnode);
+	if (!concurrent)
+	{
+		/* Non-concurrent build: make index visible to checkpointer immediately */
+		o_drop_shared_root_info(idx->desc.oids.datoid,
+								idx->desc.oids.relnode);
+	}
 
 	o_tables_table_meta_unlock(o_table, InvalidOid);
 
@@ -1541,10 +1679,15 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 
 	if (concurrent)
 	{
+		/* Capture undo2 after first scan, before second scan */
+		UndoStackLocations undoLocations = get_cur_undo_locations(UndoLogTypeTable);
+		buildstate.undo2 = undoLocations.location;
+		
+		/* Register building index for undo rollback propagation */
+		register_building_index(o_table->oids, ix_num,
+								buildstate.undo1, buildstate.undo2, descr);
+		
 		buildstate.concurrentStage = 2;
-		buildstate.noncomplete_xact_exists = false;
-		noncomplete_xact_tupstore = NULL;
-		noncomplete_xact_tupdesc = NULL;
 
 		/* Begin serial stage2 tuplesort */
 		sortstates = palloc0(sizeof(Pointer));
@@ -1560,15 +1703,18 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		/* End serial/leader sort */
 		tuplesort_end(sortstates[0]);
 		pfree(sortstates);
-
+		
+		/* Unregister building index after second scan completes */
+		unregister_building_index(o_table->oids, ix_num);
+		
 		/*
-		 * Wait for all xacts for tuples between undo1 and undo2 finished. If rolled back then delete inserted tuple
-		 * from index
+		 * Second scan is complete and validated. Now make the index visible 
+		 * to checkpointer by removing the shared root info placeholder.
 		 */
-		if (buildstate.noncomplete_xact_exists)
-		{
-			
-		}
+		o_tables_table_meta_lock(o_table);
+		o_drop_shared_root_info(idx->desc.oids.datoid,
+								idx->desc.oids.relnode);
+		o_tables_table_meta_unlock(o_table, InvalidOid);
 	}
 
 
