@@ -144,15 +144,15 @@ retry:
 		/*
 		 * Special handling for ANTI_DELETED state.
 		 * This tuple was marked ANTI_DELETED during concurrent index build.
-		 * On rollback of the transaction that marked it:
-		 * - If validator has converted it to DELETED, leave it
-		 * - If still ANTI_DELETED, physically delete the tuple
+		 * On rollback of the transaction that marked it, we check the undo
+		 * chain to determine if the validator has already processed this tuple.
 		 */
 		if (tuphdr->deleted == BTreeLeafTupleAntiDeleted)
 		{
 			/* 
-			 * Check if this is still in ANTI_DELETED state (not converted by validator).
-			 * If converted to DELETED by validator, handle as normal deletion.
+			 * Examine the undo chain to see what the tuple's state was before
+			 * it was marked ANTI_DELETED. This tells us if the validator has
+			 * converted it to DELETED or if it's still pending.
 			 */
 			BTreeLeafTuphdr undoHeader;
 			
@@ -161,8 +161,9 @@ retry:
 			get_prev_leaf_header_from_undo(desc->undoType, &undoHeader, false);
 			
 			/* 
-			 * If previous state was NON_DELETED, validator hasn't processed it yet.
-			 * The undo chain should have: NON_DELETED -> ANTI_DELETED
+			 * If the undo chain shows NON_DELETED as the previous state,
+			 * the validator hasn't processed this tuple yet.
+			 * Undo chain: NON_DELETED -> ANTI_DELETED (current)
 			 */
 			if (undoHeader.deleted == BTreeLeafTupleNonDeleted)
 			{

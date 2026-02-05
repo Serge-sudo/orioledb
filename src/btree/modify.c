@@ -760,12 +760,12 @@ o_btree_modify_handle_tuple_not_found(BTreeModifyInternalContext *context)
 
 			/* Validate key count */
 			if (bound->nkeys > INDEX_MAX_KEYS)
-				elog(ERROR, "key count %u exceeds INDEX_MAX_KEYS (%d)", 
+				elog(ERROR, "key count %d exceeds INDEX_MAX_KEYS (%d)", 
 					 bound->nkeys, INDEX_MAX_KEYS);
 
 			/* Ensure key count is compatible with leaf tuple descriptor */
 			if (bound->nkeys > idx->leafTupdesc->natts)
-				elog(ERROR, "key count %u exceeds leaf tuple attribute count %d",
+				elog(ERROR, "key count %d exceeds leaf tuple attribute count %d",
 					 bound->nkeys, idx->leafTupdesc->natts);
 
 			/* Initialize all values to NULL first */

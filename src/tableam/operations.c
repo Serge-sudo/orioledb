@@ -1628,17 +1628,17 @@ o_insert_callback(BTreeDescr *descr, OTuple tup, OTuple *newtup,
 	/*
 	 * Validation phase: Convert ANTI_NON_DELETED to NON_DELETED.
 	 * When validation tries to insert a tuple and finds it already exists
-	 * with ANTI_NON_DELETED state (created by Case 1 DELETE), we convert
-	 * it to NON_DELETED to complete the validation.
+	 * with ANTI_NON_DELETED state (created by Case 1 DELETE), we return
+	 * OBTreeCallbackActionUpdate which triggers the normal UPDATE code path.
 	 * 
-	 * Note: We don't create a separate undo record here because this
-	 * conversion happens during validation, which uses its own transaction
-	 * context. The tuple will be updated via the normal UPDATE path which
-	 * creates proper undo records.
+	 * The UPDATE path in the btree modify layer will:
+	 * 1. Create an undo record for the state transition
+	 * 2. Update the tuple's deleted field from ANTI_NON_DELETED to NON_DELETED
+	 * 3. Properly maintain the undo chain for rollback support
 	 */
 	if (deleted == BTreeLeafTupleAntiNonDeleted)
 	{
-		/* The UPDATE action below will handle undo record creation */
+		/* The UPDATE action triggers btree layer to create undo and update state */
 		return OBTreeCallbackActionUpdate;
 	}
 
