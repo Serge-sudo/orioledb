@@ -313,7 +313,6 @@ retry:
 					 * replaced.
 					 */
 					if (action == BTreeOperationInsert &&
-						desc->type == oIndexSecondary &&
 						!IS_SYS_TREE_OIDS(desc->oids) &&
 						o_index_is_under_concurrent_build(desc) &&
 						tuphdr->deleted == BTreeLeafTupleNonDeleted)
