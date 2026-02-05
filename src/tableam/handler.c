@@ -1348,55 +1348,42 @@ static bool
 validate_index_callback(ItemPointer itemptr, void *callback_state)
 {
 	OValidateIndexState *state = (OValidateIndexState *) callback_state;
-	OTuple		pkTuple;
+	OTuple		storedTuple;
 	OIndexDescr *id = state->index_descr;
 	OTableDescr *table_descr = state->table_descr;
-	OIndexDescr *primary = GET_PRIMARY(table_descr);
-	Datum		values[INDEX_MAX_KEYS];
-	bool		isnull[INDEX_MAX_KEYS];
-	int			i;
-	int			pk_from;
-	bool		pk_isnull;
 
 	/*
 	 * For orioledb, the actual tuple is stored in state->current_tuple
 	 * by orioledb_ambulkdelete. For secondary indexes, this tuple contains
-	 * both the indexed columns and the primary key fields. We need to extract
-	 * only the primary key portion, similar to o_fill_pindex_tuple_key_bound.
+	 * both the indexed columns and the primary key fields.
+	 * 
+	 * We store the full secondary index tuple in the tuplesort. The tuplesort
+	 * comparator will only use the PK portion for sorting, but having the
+	 * full tuple allows us to delete from the secondary index during validation
+	 * if the tuple is not found in the heap.
 	 */
 	if (!O_TUPLE_IS_NULL(state->current_tuple))
 	{
-		/*
-		 * Extract the primary key fields from the index tuple.
-		 * Similar to o_fill_pindex_tuple_key_bound, but we extract values
-		 * to form a tuple rather than filling a bound structure.
+		/* 
+		 * Store a copy of the full secondary index tuple.
+		 * The tuplesort is initialized with the primary index descriptor for
+		 * comparison, but we store secondary index tuples for later deletion.
 		 */
-		if (id->desc.type == oIndexBridge)
-			pk_from = 1;
-		else
-			pk_from = id->nFields - id->nPrimaryFields;
-
-		for (i = 0; i < id->nPrimaryFields; i++)
-		{
-			AttrNumber	attnum = id->primaryFieldsAttnums[i];
-
-			values[i] = o_fastgetattr(state->current_tuple, attnum,
-									  id->leafTupdesc, &id->leafSpec, &pk_isnull);
-			isnull[i] = pk_isnull;
-		}
-
-		/* Form a tuple with only the primary key fields */
-		pkTuple = o_form_tuple(primary->leafTupdesc, &primary->leafSpec,
-							   0, values, isnull, NULL);
+		int tupleLen = o_tuple_size(state->current_tuple, &id->leafSpec);
+		storedTuple.data = (Pointer) palloc(tupleLen);
+		storedTuple.formatFlags = state->current_tuple.formatFlags;
+		memcpy(storedTuple.data, state->current_tuple.data, tupleLen);
 		
 		/* Debug: Print tuple before adding to tuplesort */
-		debug_print_validate_tuple(pkTuple, table_descr, id);
+		debug_print_validate_tuple(storedTuple, table_descr, id);
 		
-		/* Put only the PK tuple into the tuplesort */
-		tuplesort_putotuple(state->tuplesort, pkTuple);
+		/* Put the full secondary index tuple into the tuplesort */
+		tuplesort_putotuple(state->tuplesort, storedTuple);
 		
-		/* Free the formed tuple */
-		pfree(pkTuple.data);
+		/* 
+		 * Note: We don't free storedTuple.data here because tuplesort takes
+		 * ownership of the tuple data.
+		 */
 	}
 
 	/* Return false to indicate we don't want to delete this tuple */
@@ -1542,13 +1529,42 @@ orioledb_index_validate_scan(Relation heapRelation,
 			if (cmp < 0)
 			{
 				/*
-				 * Index tuple doesn't exist in heap.
-				 * During concurrent build, this can happen if tuple was deleted.
+				 * Index tuple doesn't exist in heap - need to delete it.
+				 * This can happen if tuple was deleted during concurrent build.
 				 * 
-				 * TODO: Implement active deletion from index during validation.
-				 * Currently we just mark it as invalid and move on.
-				 * The tuple should ideally be deleted or marked as deleted here.
+				 * Now that we have the full secondary index tuple from tuplesort,
+				 * we can delete it from the index. If the tuple has ANTI_DELETED
+				 * state (from Case 2), the delete callback will convert it to DELETED.
+				 * Otherwise, we simply delete it.
 				 */
+				OIndexDescr *idx = state->index_descr;
+				OXid oxid = get_current_oxid();
+				CommitSeqNo csn = get_current_csn();
+				TupleTableSlot *deleteSlot;
+				OBTreeKeyBound deleteBound;
+				OTableModifyResult deleteResult;
+				
+				/* Create a slot for the delete operation */
+				deleteSlot = MakeSingleTupleTableSlot(idx->itupdesc, &TTSOpsVirtual);
+				
+				/* Fill the key bound from the index tuple for deletion */
+				tts_orioledb_store_tuple((OTableSlot *) deleteSlot, indexTuple, 
+										 state->table_descr, csn, 
+										 state->index_descr->desc.type == oIndexPrimary ? 
+										 PrimaryIndexNumber : 1, 
+										 false, NULL);
+				slot_getallattrs(deleteSlot);
+				fill_key_bound(deleteSlot, idx, &deleteBound);
+				
+				/* Perform the delete operation */
+				deleteResult = o_tbl_index_delete(idx, 
+												  idx->desc.type == oIndexPrimary ? 
+												  PrimaryIndexNumber : 1,
+												  deleteSlot, oxid, csn);
+				
+				ExecDropSingleTupleTableSlot(deleteSlot);
+				
+				/* Mark as invalid and continue to next index tuple */
 				indexTupleValid = false;
 				continue;
 			}
