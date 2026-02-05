@@ -303,6 +303,54 @@ retry:
 				if (cbAction == OBTreeCallbackActionUpdate)
 				{
 					Assert(tupleType == BTreeKeyLeafTuple);
+					
+					/*
+					 * Case 2: Handle INSERT on secondary index during concurrent build.
+					 * If we're inserting into a secondary index that's under concurrent
+					 * build and find an existing NON_DELETED tuple (added by the build
+					 * from its snapshot), we need to first mark it as ANTI_DELETED to
+					 * track that this tuple existed in the build snapshot but is being
+					 * replaced.
+					 */
+					if (action == BTreeOperationInsert &&
+						desc->type == oIndexSecondary &&
+						!IS_SYS_TREE_OIDS(desc->oids) &&
+						o_index_is_under_concurrent_build(desc) &&
+						tuphdr->deleted == BTreeLeafTupleNonDeleted)
+					{
+						UndoLocation antiDeletedUndoLoc;
+						Page		page = O_GET_IN_MEMORY_PAGE(blkno);
+						
+						/*
+						 * Create undo record for the state transition from
+						 * NON_DELETED to ANTI_DELETED
+						 */
+						antiDeletedUndoLoc = make_undo_record(desc, curTuple, true,
+															  BTreeOperationUpdate, blkno,
+															  O_PAGE_GET_CHANGE_COUNT(page),
+															  tuphdr);
+						
+						/*
+						 * Mark the existing tuple as ANTI_DELETED.
+						 * This happens in a critical section to ensure atomicity.
+						 */
+						START_CRIT_SECTION();
+						page_block_reads(blkno);
+						
+						tuphdr->deleted = BTreeLeafTupleAntiDeleted;
+						tuphdr->undoLocation = antiDeletedUndoLoc;
+						
+						MARK_DIRTY(desc, blkno);
+						
+						END_CRIT_SECTION();
+						
+						/*
+						 * Now proceed with normal INSERT processing, which will
+						 * replace the ANTI_DELETED tuple with the new one.
+						 * The replacement will create its own undo record.
+						 */
+					}
+					
 					context.replace = true;
 					result = OBTreeModifyResultUpdated;
 				}

@@ -72,6 +72,13 @@ static OBTreeModifyCallbackAction o_insert_callback(BTreeDescr *descr,
 													RowLockMode *lock_mode,
 													BTreeLocationHint *hint,
 													void *arg);
+static OBTreeModifyCallbackAction o_insert_modify_callback(BTreeDescr *descr,
+														   OTuple tup, OTuple *newtup,
+														   OXid oxid, OTupleXactInfo xactInfo,
+														   UndoLocation location,
+														   RowLockMode *lock_mode,
+														   BTreeLocationHint *hint,
+														   void *arg);
 static OBTreeWaitCallbackAction o_insert_with_arbiter_wait_callback(BTreeDescr *descr,
 																	OTuple tup, OTuple *newtup,
 																	OXid oxid, OTupleXactInfo xactInfo,
@@ -193,7 +200,7 @@ apply_new_bridge_index_ctid(OTableDescr *descr, Relation relation,
 	{
 		.waitCallback = NULL,
 		.modifyDeletedCallback = o_insert_callback,
-		.modifyCallback = NULL,
+		.modifyCallback = o_insert_modify_callback,
 		.needsUndoForSelfCreated = true
 	};
 	OSnapshot	o_snapshot;
@@ -303,7 +310,7 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 	{
 		.waitCallback = NULL,
 		.modifyDeletedCallback = o_insert_callback,
-		.modifyCallback = NULL,
+		.modifyCallback = o_insert_modify_callback,
 		.needsUndoForSelfCreated = false,
 		.arg = slot
 	};
@@ -1235,7 +1242,7 @@ o_tbl_indices_reinsert(OTableDescr *descr,
 	BTreeModifyCallbackInfo insertCallbackInfo = {
 		.waitCallback = NULL,
 		.modifyDeletedCallback = o_insert_callback,
-		.modifyCallback = NULL,
+		.modifyCallback = o_insert_modify_callback,
 		.needsUndoForSelfCreated = false,
 		.arg = newSlot
 	};
@@ -1595,6 +1602,18 @@ copy_tuple_to_slot(OTuple tup, TupleTableSlot *slot, OTableDescr *descr,
 	copy.formatFlags = tup.formatFlags;
 	memcpy(copy.data, tup.data, sz);
 	tts_orioledb_store_tuple(slot, copy, descr, csn, ix_num, true, hint);
+}
+
+static OBTreeModifyCallbackAction
+o_insert_modify_callback(BTreeDescr *descr, OTuple tup, OTuple *newtup,
+						 OXid oxid, OTupleXactInfo xactInfo,
+						 UndoLocation location, RowLockMode *lock_mode,
+						 BTreeLocationHint *hint, void *arg)
+{
+	/* Call the common callback with BTreeLeafTupleNonDeleted */
+	return o_insert_callback(descr, tup, newtup, oxid, xactInfo,
+							 BTreeLeafTupleNonDeleted, location,
+							 lock_mode, hint, arg);
 }
 
 static OBTreeModifyCallbackAction
