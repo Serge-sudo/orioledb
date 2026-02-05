@@ -1625,6 +1625,20 @@ o_insert_callback(BTreeDescr *descr, OTuple tup, OTuple *newtup,
 {
 	OTableSlot *oslot = (OTableSlot *) arg;
 
+	/*
+	 * Validation phase: Convert ANTI_NON_DELETED to NON_DELETED.
+	 * When validation tries to insert a tuple and finds it already exists
+	 * with ANTI_NON_DELETED state (created by Case 1 DELETE), we convert
+	 * it to NON_DELETED to complete the validation.
+	 */
+	if (deleted == BTreeLeafTupleAntiNonDeleted)
+	{
+		/* Convert ANTI_NON_DELETED → NON_DELETED */
+		BTreeLeafTuphdr *tuphdr = (BTreeLeafTuphdr *) newtup->data;
+		tuphdr->deleted = BTreeLeafTupleNonDeleted;
+		return OBTreeCallbackActionUpdate;
+	}
+
 	if (descr->type == oIndexPrimary &&
 		XACT_INFO_OXID_IS_CURRENT(xactInfo))
 	{

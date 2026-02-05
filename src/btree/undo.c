@@ -127,6 +127,53 @@ retry:
 		OTuple		prev_tuple;
 
 		/*
+		 * Special handling for ANTI_NON_DELETED state.
+		 * This is a synthetic tuple created during concurrent index build
+		 * when DELETE didn't find a tuple. On rollback, we should remove
+		 * it entirely as it was never a real tuple.
+		 */
+		if (tuphdr->deleted == BTreeLeafTupleAntiNonDeleted)
+		{
+			BTREE_PAGE_READ_TUPLE(prev_tuple, p, locator);
+			PAGE_SUB_N_VACATED(p, BTREE_PAGE_GET_ITEM_SIZE(p, locator) -
+							   (BTreeLeafTuphdrSize + MAXALIGN(o_btree_len(desc, prev_tuple, OTupleLength))));
+			page_locator_delete_item(p, locator);
+			return false;
+		}
+
+		/*
+		 * Special handling for ANTI_DELETED state.
+		 * This tuple was marked ANTI_DELETED during concurrent index build.
+		 * On rollback of the transaction that marked it:
+		 * - If validator has converted it to DELETED, leave it
+		 * - If still ANTI_DELETED, physically delete the tuple
+		 */
+		if (tuphdr->deleted == BTreeLeafTupleAntiDeleted)
+		{
+			/* 
+			 * Check if this is still in ANTI_DELETED state (not converted by validator).
+			 * If converted to DELETED by validator, handle as normal deletion.
+			 */
+			BTreeLeafTuphdr undoHeader;
+			
+			Assert(UndoLocationIsValid(tuphdr->undoLocation));
+			undoHeader = *tuphdr;
+			get_prev_leaf_header_from_undo(desc->undoType, &undoHeader, false);
+			
+			/* If previous state was NON_DELETED, validator hasn't processed it yet */
+			if (undoHeader.deleted == BTreeLeafTupleNonDeleted)
+			{
+				/* Validator hasn't seen it, physically delete */
+				BTREE_PAGE_READ_TUPLE(prev_tuple, p, locator);
+				PAGE_SUB_N_VACATED(p, BTREE_PAGE_GET_ITEM_SIZE(p, locator) -
+								   (BTreeLeafTuphdrSize + MAXALIGN(o_btree_len(desc, prev_tuple, OTupleLength))));
+				page_locator_delete_item(p, locator);
+				return false;
+			}
+			/* Else: validator has converted it, leave it alone (fall through to normal handling) */
+		}
+
+		/*
 		 * Revert deletion.  Assuming tuple is deleted, we shouldn't have any
 		 * row-level lock on this tuple.
 		 */
