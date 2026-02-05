@@ -1630,12 +1630,15 @@ o_insert_callback(BTreeDescr *descr, OTuple tup, OTuple *newtup,
 	 * When validation tries to insert a tuple and finds it already exists
 	 * with ANTI_NON_DELETED state (created by Case 1 DELETE), we convert
 	 * it to NON_DELETED to complete the validation.
+	 * 
+	 * Note: We don't create a separate undo record here because this
+	 * conversion happens during validation, which uses its own transaction
+	 * context. The tuple will be updated via the normal UPDATE path which
+	 * creates proper undo records.
 	 */
 	if (deleted == BTreeLeafTupleAntiNonDeleted)
 	{
-		/* Convert ANTI_NON_DELETED → NON_DELETED */
-		BTreeLeafTuphdr *tuphdr = (BTreeLeafTuphdr *) newtup->data;
-		tuphdr->deleted = BTreeLeafTupleNonDeleted;
+		/* The UPDATE action below will handle undo record creation */
 		return OBTreeCallbackActionUpdate;
 	}
 

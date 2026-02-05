@@ -110,6 +110,9 @@ static OBTreeModifyResult o_btree_normal_modify(BTreeDescr *desc,
 /*
  * Helper function to check if an index is under concurrent build.
  * Returns true if the index is a secondary index that is ready but not yet valid.
+ * 
+ * Note: A similar function exists in operations.c that takes OIndexDescr* instead.
+ * This version is needed at the btree layer where we only have BTreeDescr*.
  */
 static bool
 o_index_is_under_concurrent_build(BTreeDescr *desc)
@@ -757,7 +760,13 @@ o_btree_modify_handle_tuple_not_found(BTreeModifyInternalContext *context)
 
 			/* Validate key count */
 			if (bound->nkeys > INDEX_MAX_KEYS)
-				elog(ERROR, "key count %d exceeds INDEX_MAX_KEYS", bound->nkeys);
+				elog(ERROR, "key count %u exceeds INDEX_MAX_KEYS (%d)", 
+					 bound->nkeys, INDEX_MAX_KEYS);
+
+			/* Ensure key count is compatible with leaf tuple descriptor */
+			if (bound->nkeys > idx->leafTupdesc->natts)
+				elog(ERROR, "key count %u exceeds leaf tuple attribute count %d",
+					 bound->nkeys, idx->leafTupdesc->natts);
 
 			/* Initialize all values to NULL first */
 			memset(isnull, true, sizeof(isnull));
@@ -772,9 +781,9 @@ o_btree_modify_handle_tuple_not_found(BTreeModifyInternalContext *context)
 			/*
 			 * For any remaining attributes in the leaf tuple descriptor
 			 * (e.g., included columns), leave them as NULL.
-			 * The bound->nkeys should match the key columns in the index.
+			 * The bound->nkeys represents key columns which must not exceed
+			 * the total attribute count.
 			 */
-			Assert(bound->nkeys <= idx->leafTupdesc->natts);
 
 			/*
 			 * Create synthetic tuple from key fields.
@@ -795,6 +804,11 @@ o_btree_modify_handle_tuple_not_found(BTreeModifyInternalContext *context)
 				context->tupleType = BTreeKeyLeafTuple;
 				context->replace = false;
 				context->leafTuphdr.deleted = BTreeLeafTupleAntiNonDeleted;
+				/*
+				 * Use BootstrapTransactionId (XID 1) as specified in the requirements.
+				 * This marks the tuple as a system-level synthetic entry created during
+				 * concurrent index build, distinct from regular user transactions.
+				 */
 				context->leafTuphdr.xactInfo = OXID_GET_XACT_INFO(BootstrapTransactionId,
 																  RowLockUpdate,
 																  false);

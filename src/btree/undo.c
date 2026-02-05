@@ -160,7 +160,10 @@ retry:
 			undoHeader = *tuphdr;
 			get_prev_leaf_header_from_undo(desc->undoType, &undoHeader, false);
 			
-			/* If previous state was NON_DELETED, validator hasn't processed it yet */
+			/* 
+			 * If previous state was NON_DELETED, validator hasn't processed it yet.
+			 * The undo chain should have: NON_DELETED -> ANTI_DELETED
+			 */
 			if (undoHeader.deleted == BTreeLeafTupleNonDeleted)
 			{
 				/* Validator hasn't seen it, physically delete */
@@ -169,6 +172,16 @@ retry:
 								   (BTreeLeafTuphdrSize + MAXALIGN(o_btree_len(desc, prev_tuple, OTupleLength))));
 				page_locator_delete_item(p, locator);
 				return false;
+			}
+			/* 
+			 * If previous state was something else, we have an unexpected undo chain.
+			 * This shouldn't happen in normal operation.
+			 */
+			else if (undoHeader.deleted != BTreeLeafTupleDeleted &&
+					 undoHeader.deleted != BTreeLeafTupleAntiNonDeleted)
+			{
+				elog(WARNING, "unexpected undo chain state %d for ANTI_DELETED tuple",
+					 undoHeader.deleted);
 			}
 			/* Else: validator has converted it, leave it alone (fall through to normal handling) */
 		}
