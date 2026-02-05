@@ -132,6 +132,7 @@ REGRESSCHECKS = btree_sys_check \
 				tableam \
 				tablespace \
 				temp \
+				temp_local_ppool \
 				toast \
 				trigger \
 				truncate \
