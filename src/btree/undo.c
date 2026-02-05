@@ -129,16 +129,38 @@ retry:
 		/*
 		 * Special handling for ANTI_NON_DELETED state.
 		 * This is a synthetic tuple created during concurrent index build
-		 * when DELETE didn't find a tuple. On rollback, we should remove
-		 * it entirely as it was never a real tuple.
+		 * when DELETE didn't find a tuple. On rollback, we check if validator
+		 * has converted it to NON_DELETED. If so, validator owns it now and
+		 * we should not delete. If state is still ANTI_NON_DELETED, we remove it.
 		 */
 		if (tuphdr->deleted == BTreeLeafTupleAntiNonDeleted)
 		{
+			/* Validator hasn't seen it yet, remove the synthetic tuple */
 			BTREE_PAGE_READ_TUPLE(prev_tuple, p, locator);
 			PAGE_SUB_N_VACATED(p, BTREE_PAGE_GET_ITEM_SIZE(p, locator) -
 							   (BTreeLeafTuphdrSize + MAXALIGN(o_btree_len(desc, prev_tuple, OTupleLength))));
 			page_locator_delete_item(p, locator);
 			return false;
+		}
+		
+		/*
+		 * Check if current state is NON_DELETED but was ANTI_NON_DELETED before.
+		 * This means validator has converted it. In this case, skip deletion
+		 * as validator now owns the tuple.
+		 */
+		if (tuphdr->deleted == BTreeLeafTupleNonDeleted && 
+			UndoLocationIsValid(tuphdr->undoLocation))
+		{
+			BTreeLeafTuphdr undoHeader;
+			
+			undoHeader = *tuphdr;
+			get_prev_leaf_header_from_undo(desc->undoType, &undoHeader, false);
+			
+			if (undoHeader.deleted == BTreeLeafTupleAntiNonDeleted)
+			{
+				/* Validator converted ANTI_NON_DELETED -> NON_DELETED, skip deletion */
+				return true;
+			}
 		}
 
 		/*
@@ -185,6 +207,26 @@ retry:
 					 undoHeader.deleted);
 			}
 			/* Else: validator has converted it, leave it alone (fall through to normal handling) */
+		}
+		
+		/*
+		 * Check if current state is DELETED but was ANTI_DELETED before.
+		 * This means validator has converted it. In this case, skip physical
+		 * deletion as validator now owns the tuple.
+		 */
+		if (tuphdr->deleted == BTreeLeafTupleDeleted && 
+			UndoLocationIsValid(tuphdr->undoLocation))
+		{
+			BTreeLeafTuphdr undoHeader;
+			
+			undoHeader = *tuphdr;
+			get_prev_leaf_header_from_undo(desc->undoType, &undoHeader, false);
+			
+			if (undoHeader.deleted == BTreeLeafTupleAntiDeleted)
+			{
+				/* Validator converted ANTI_DELETED -> DELETED, skip deletion */
+				return true;
+			}
 		}
 
 		/*

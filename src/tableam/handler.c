@@ -1541,6 +1541,14 @@ orioledb_index_validate_scan(Relation heapRelation,
 							  heapTuple.data, BTreeKeyNonLeafKey);
 			if (cmp < 0)
 			{
+				/*
+				 * Index tuple doesn't exist in heap.
+				 * During concurrent build, this can happen if tuple was deleted.
+				 * 
+				 * TODO: Implement active deletion from index during validation.
+				 * Currently we just mark it as invalid and move on.
+				 * The tuple should ideally be deleted or marked as deleted here.
+				 */
 				indexTupleValid = false;
 				continue;
 			}

@@ -1808,6 +1808,18 @@ o_delete_deleted_callback(BTreeDescr *desc,
 
 	o_arg->deleted = deleted;
 
+	/*
+	 * Validation phase: Convert ANTI_DELETED to DELETED.
+	 * When validation tries to delete a tuple and finds it in ANTI_DELETED
+	 * state (created by Case 2 INSERT during concurrent build), convert it
+	 * to final DELETED state. The UPDATE action triggers the btree layer to
+	 * create undo and update the state.
+	 */
+	if (deleted == BTreeLeafTupleAntiDeleted)
+	{
+		return OBTreeCallbackActionDelete;
+	}
+
 	if (desc->type != oIndexPrimary)
 		return OBTreeCallbackActionDelete;
 
