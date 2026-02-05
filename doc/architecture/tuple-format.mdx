@@ -14,8 +14,8 @@ The OrioleDB tuple header is defined in `include/tuple/format.h` as `OTupleHeade
 ```c
 typedef struct
 {
-    uint16  hasnulls:1,    // 1-bit flag: whether tuple has null values
-            len:15;        // 15-bit field: tuple length in bytes
+    uint16  hasnulls:1,    // 1-bit: whether tuple has null values
+            len:15;        // 15-bit: tuple length in bytes
     uint16  natts;         // Number of attributes in the tuple
     uint32  version;       // Version number for MVCC
 } OTupleHeaderData;
@@ -27,7 +27,7 @@ The tuple header is very compact at only **8 bytes** (after alignment with `Size
 
 1. **hasnulls** (1 bit): A flag indicating whether the tuple contains any NULL values. If set, a null bitmap follows the header.
 
-2. **len** (15 bits): The total length of the tuple in bytes, including the header. The maximum tuple length is 32,767 bytes (2^15 - 1).
+2. **len** (15 bits): The total length of the tuple in bytes, including the header. The field can represent values from 0 to 32,767 (2^15 - 1), though the practical maximum may be lower due to page size constraints (OrioleDB uses 8KB pages by default).
 
 3. **natts** (16 bits): The number of attributes (columns) in the tuple.
 
@@ -108,11 +108,13 @@ The complete tuple storage layout on a page is:
 +------------------+
 | OTupleHeader     | (8 bytes aligned)
 +------------------+
-| Null bitmap      | (if hasnulls is set, MAXALIGN(BITMAPLEN(natts)))
+| Null bitmap      | (if hasnulls is set, aligned bitmap for NULL attributes)
 +------------------+
 | Attribute data   | (variable length)
 +------------------+
 ```
+
+Note: The null bitmap size is calculated as `MAXALIGN(BITMAPLEN(natts))`, where `BITMAPLEN` calculates the number of bytes needed for a bitmap of `natts` bits, and `MAXALIGN` rounds up to the platform's alignment boundary (typically 8 bytes).
 
 - If `hasnulls` is 0, the null bitmap is omitted, and attribute data immediately follows the header.
 - If `hasnulls` is 1, a bitmap follows the header indicating which attributes are NULL.
