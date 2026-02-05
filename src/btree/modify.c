@@ -694,6 +694,7 @@ o_btree_modify_handle_tuple_not_found(BTreeModifyInternalContext *context)
 		 */
 		if (context->action == BTreeOperationDelete &&
 			desc->type == oIndexSecondary &&
+			!IS_SYS_TREE_OIDS(desc->oids) &&
 			o_index_is_under_concurrent_build(desc))
 		{
 			OIndexDescr *idx = (OIndexDescr *) desc->arg;
@@ -704,7 +705,15 @@ o_btree_modify_handle_tuple_not_found(BTreeModifyInternalContext *context)
 			int			i;
 
 			Assert(context->keyType == BTreeKeyBound);
+			Assert(idx != NULL);
 			bound = (OBTreeKeyBound *) context->key;
+
+			/* Validate key count */
+			if (bound->nkeys > INDEX_MAX_KEYS)
+				elog(ERROR, "key count %d exceeds INDEX_MAX_KEYS", bound->nkeys);
+
+			/* Initialize all values to NULL first */
+			memset(isnull, true, sizeof(isnull));
 
 			/* Extract values from key bound */
 			for (i = 0; i < bound->nkeys; i++)
@@ -712,6 +721,13 @@ o_btree_modify_handle_tuple_not_found(BTreeModifyInternalContext *context)
 				values[i] = bound->keys[i].value;
 				isnull[i] = bound->keys[i].isnull;
 			}
+
+			/*
+			 * For any remaining attributes in the leaf tuple descriptor
+			 * (e.g., included columns), leave them as NULL.
+			 * The bound->nkeys should match the key columns in the index.
+			 */
+			Assert(bound->nkeys <= idx->leafTupdesc->natts);
 
 			/*
 			 * Create synthetic tuple from key fields.
