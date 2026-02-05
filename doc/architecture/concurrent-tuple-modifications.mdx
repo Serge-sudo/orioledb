@@ -406,7 +406,7 @@ When two transactions try to simultaneously delete (or modify) the same tuple in
 1. The first transaction (T1) creates an undo record and marks the tuple as modified/deleted
 2. The second transaction (T2) detects the conflict and waits for T1 using `wait_for_oxid()`
 3. When T1 commits or aborts, T2 is notified and wakes up
-4. T2 refines the page and re-evaluates the conflict:
+4. T2 refinds the page and re-evaluates the conflict:
    - If T1 committed: T2 sees the new state and acts accordingly
    - If T1 aborted: T2 rolls back T1's changes itself and proceeds with its operation
 5. Undo logs maintain the complete history, allowing rollback and snapshot visibility
