@@ -25,11 +25,15 @@
 #include "catalog/o_tables.h"
 #include "recovery/recovery.h"
 #include "recovery/wal.h"
+#include "tableam/descr.h"
+#include "tableam/key_range.h"
 #include "transam/undo.h"
 #include "transam/oxid.h"
+#include "tuple/format.h"
 #include "utils/page_pool.h"
 #include "utils/stopevent.h"
 
+#include "catalog/index.h"
 #include "miscadmin.h"
 
 #define IsRelationTree(desc) (ORelOidsIsValid(desc->oids) && !IS_SYS_TREE_OIDS(desc->oids))
@@ -82,6 +86,7 @@ BTreeModifyCallbackInfo nullCallbackInfo =
 
 static const LOCKMODE hwLockModes[] = {AccessShareLock, RowShareLock, ExclusiveLock, AccessExclusiveLock};
 
+static bool o_index_is_under_concurrent_build(BTreeDescr *desc);
 static void unlock_release(BTreeModifyInternalContext *context, bool unlock);
 static ConflictResolution o_btree_modify_handle_conflicts(BTreeModifyInternalContext *context);
 static OBTreeModifyResult o_btree_modify_handle_tuple_not_found(BTreeModifyInternalContext *context);
@@ -101,6 +106,41 @@ static OBTreeModifyResult o_btree_normal_modify(BTreeDescr *desc,
 												BTreeLocationHint *hint,
 												BTreeLeafTupleDeletedStatus deleted,
 												BTreeModifyCallbackInfo *callbackInfo);
+
+/*
+ * Helper function to check if an index is under concurrent build.
+ * Returns true if the index is a secondary index that is ready but not yet valid.
+ */
+static bool
+o_index_is_under_concurrent_build(BTreeDescr *desc)
+{
+	OIndexDescr *idx;
+	Relation	indexRel;
+	bool		result;
+
+	/* Only secondary indexes */
+	if (desc->type != oIndexSecondary)
+		return false;
+
+	/* Get index descriptor */
+	if (!IS_SYS_TREE_OIDS(desc->oids))
+		idx = (OIndexDescr *) desc->arg;
+	else
+		return false;
+
+	if (!idx)
+		return false;
+
+	indexRel = RelationIdGetRelation(idx->oids.reloid);
+	if (!RelationIsValid(indexRel))
+		return false;
+
+	/* Index is under build when it's ready but not yet valid */
+	result = indexRel->rd_index->indisready && !indexRel->rd_index->indisvalid;
+
+	RelationClose(indexRel);
+	return result;
+}
 
 /*
  * Perform modification of btree leaf tuple, when page is alredy located
@@ -632,6 +672,8 @@ o_btree_modify_handle_conflicts(BTreeModifyInternalContext *context)
 static OBTreeModifyResult
 o_btree_modify_handle_tuple_not_found(BTreeModifyInternalContext *context)
 {
+	BTreeDescr *desc = context->pageFindContext->desc;
+
 	/*
 	 * Matching tuple is not found.
 	 *
@@ -643,6 +685,61 @@ o_btree_modify_handle_tuple_not_found(BTreeModifyInternalContext *context)
 		context->action == BTreeOperationDelete ||
 		context->action == BTreeOperationLock)
 	{
+		/*
+		 * Case 1: Handle DELETE on secondary index during concurrent build.
+		 * If we're deleting from a secondary index that's under concurrent
+		 * build and the tuple is not found (because it was inserted after
+		 * the build snapshot), we need to insert a synthetic ANTI_NON_DELETED
+		 * tuple instead of failing.
+		 */
+		if (context->action == BTreeOperationDelete &&
+			desc->type == oIndexSecondary &&
+			o_index_is_under_concurrent_build(desc))
+		{
+			OIndexDescr *idx = (OIndexDescr *) desc->arg;
+			OBTreeKeyBound *bound;
+			Datum		values[INDEX_MAX_KEYS];
+			bool		isnull[INDEX_MAX_KEYS];
+			OTuple		synthetic_tuple;
+			int			i;
+
+			Assert(context->keyType == BTreeKeyBound);
+			bound = (OBTreeKeyBound *) context->key;
+
+			/* Extract values from key bound */
+			for (i = 0; i < bound->nkeys; i++)
+			{
+				values[i] = bound->keys[i].value;
+				isnull[i] = bound->keys[i].isnull;
+			}
+
+			/* Create synthetic tuple from key fields */
+			synthetic_tuple = o_form_tuple(idx->leafTupdesc,
+										   &idx->leafSpec,
+										   0,	/* version */
+										   values,
+										   isnull,
+										   NULL);	/* no bridge data */
+
+			/* Set up context for inserting the synthetic tuple */
+			context->tuple = synthetic_tuple;
+			context->tupleType = BTreeKeyLeafTuple;
+			context->replace = false;
+			context->leafTuphdr.deleted = BTreeLeafTupleAntiNonDeleted;
+			context->leafTuphdr.xactInfo = OXID_GET_XACT_INFO(BootstrapTransactionId,
+															  RowLockUpdate,
+															  false);
+
+			/* Insert the synthetic tuple with ANTI_NON_DELETED state */
+			o_btree_modify_insert_update(context);
+
+			/* Clean up synthetic tuple */
+			pfree(synthetic_tuple.data);
+
+			unlock_release(context, false);
+			return OBTreeModifyResultDeleted;
+		}
+
 		unlock_release(context, true);
 		return OBTreeModifyResultNotFound;
 	}
