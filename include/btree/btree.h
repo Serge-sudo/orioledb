@@ -87,6 +87,22 @@ typedef enum BTreeOperationType
 	BTreeOperationDelete
 } BTreeOperationType;
 
+/*
+ * Tuple deletion status in B-tree leaf.
+ *
+ * Normal states:
+ * - BTreeLeafTupleNonDeleted: Tuple is not deleted (normal state)
+ * - BTreeLeafTupleDeleted: Tuple has been deleted
+ * - BTreeLeafTupleMovedPartitions: Tuple was moved to another partition
+ * - BTreeLeafTuplePKChanged: Primary key was changed for this tuple
+ *
+ * Anti-tuple states (used during concurrent index builds):
+ * - BTreeLeafTupleAntiNonDeleted: Synthetic "anti-tuple" marking a deletion
+ *   that occurred during concurrent index build for a tuple that was inserted
+ *   after the build snapshot. The tuple appears as non-deleted initially.
+ * - BTreeLeafTupleAntiDeleted: Anti-tuple after it has been deleted. Used to
+ *   track the complete lifecycle of tuples during concurrent index builds.
+ */
 typedef enum BTreeLeafTupleDeletedStatus
 {
 	BTreeLeafTupleNonDeleted = 0,

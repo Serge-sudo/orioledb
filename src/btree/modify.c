@@ -713,7 +713,11 @@ o_btree_modify_handle_tuple_not_found(BTreeModifyInternalContext *context)
 				isnull[i] = bound->keys[i].isnull;
 			}
 
-			/* Create synthetic tuple from key fields */
+			/*
+			 * Create synthetic tuple from key fields.
+			 * Version is set to 0 since this is a synthetic tuple created
+			 * for marking deletion, not representing actual table data.
+			 */
 			synthetic_tuple = o_form_tuple(idx->leafTupdesc,
 										   &idx->leafSpec,
 										   0,	/* version */
@@ -721,22 +725,29 @@ o_btree_modify_handle_tuple_not_found(BTreeModifyInternalContext *context)
 										   isnull,
 										   NULL);	/* no bridge data */
 
-			/* Set up context for inserting the synthetic tuple */
-			context->tuple = synthetic_tuple;
-			context->tupleType = BTreeKeyLeafTuple;
-			context->replace = false;
-			context->leafTuphdr.deleted = BTreeLeafTupleAntiNonDeleted;
-			context->leafTuphdr.xactInfo = OXID_GET_XACT_INFO(BootstrapTransactionId,
-															  RowLockUpdate,
-															  false);
+			PG_TRY();
+			{
+				/* Set up context for inserting the synthetic tuple */
+				context->tuple = synthetic_tuple;
+				context->tupleType = BTreeKeyLeafTuple;
+				context->replace = false;
+				context->leafTuphdr.deleted = BTreeLeafTupleAntiNonDeleted;
+				context->leafTuphdr.xactInfo = OXID_GET_XACT_INFO(BootstrapTransactionId,
+																  RowLockUpdate,
+																  false);
 
-			/* Insert the synthetic tuple with ANTI_NON_DELETED state */
-			o_btree_modify_insert_update(context);
+				/* Insert the synthetic tuple with ANTI_NON_DELETED state */
+				o_btree_modify_insert_update(context);
 
-			/* Clean up synthetic tuple */
-			pfree(synthetic_tuple.data);
+				unlock_release(context, false);
+			}
+			PG_FINALLY();
+			{
+				/* Clean up synthetic tuple */
+				pfree(synthetic_tuple.data);
+			}
+			PG_END_TRY();
 
-			unlock_release(context, false);
 			return OBTreeModifyResultDeleted;
 		}
 
