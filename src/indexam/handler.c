@@ -17,13 +17,16 @@
 
 #include "orioledb.h"
 
+#include "btree/iterator.h"
 #include "btree/modify.h"
 #include "catalog/indices.h"
 #include "catalog/o_tables.h"
 #include "indexam/handler.h"
+#include "tableam/handler.h"
 #include "tableam/index_scan.h"
 #include "tableam/operations.h"
 #include "tableam/tree.h"
+#include "tuple/format.h"
 #include "tuple/slot.h"
 #include "utils/compress.h"
 #include "utils/planner.h"
@@ -34,6 +37,7 @@
 #include "access/relation.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
+#include "executor/executor.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
@@ -325,6 +329,9 @@ orioledb_ambuild(Relation heap, Relation index, IndexInfo *indexInfo)
 				o_define_index_validate(tbl_oids, index, indexInfo, NULL);
 			o_define_index(heap, index, InvalidOid, reindex, InvalidIndexNumber, false, result);
 		}
+
+		if (o_table)
+			o_table_free(o_table);
 	}
 
 	return result;
@@ -966,16 +973,115 @@ orioledb_amdelete(Relation rel, Datum *values, bool *isnull,
 	return result.success;
 }
 
+/*
+ * orioledb_ambulkdelete() -- bulk deletion of index entries
+ *
+ * Note: This function does NOT actually delete any tuples from the index.
+ * It is primarily used during concurrent index creation validation phase,
+ * where the callback gathers primary key tuples from the index and always
+ * returns false (meaning "do not delete").
+ *
+ * For orioledb, instead of passing ItemPointers like vanilla PostgreSQL,
+ * we pass the actual primary key tuples to the callback by storing them
+ * in the callback_state. The callback (e.g., validate_index_callback) can
+ * then collect these tuples into a tuplesort for later validation.
+ *
+ * If the callback returns true (requesting deletion), we throw an error since
+ * deletion is not supported.
+ */
 IndexBulkDeleteResult *
 orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 					  IndexBulkDeleteCallback callback, void *callback_state)
 {
 	OBTOptions *options = (OBTOptions *) info->index->rd_options;
+	ORelOids	oids;
+	OIndexDescr *index_descr;
+	OTableDescr *descr;
+	BTreeIterator *it;
+	OSnapshot	oSnapshot;
+	OTuple		tuple;
+	double		num_tuples = 0;
+	ItemPointerData	itemptr;
+	bool		should_delete;
 
 	if (options && !options->orioledb_index)
 		return btbulkdelete(info, stats, callback, callback_state);
 
-	elog(ERROR, "Not implemented: %s", PG_FUNCNAME_MACRO);
+	/* Get index descriptor */
+	ORelOidsSetFromRel(oids, info->index);
+	index_descr = o_fetch_index_descr(oids, oIndexInvalid, false, NULL);
+	if (index_descr == NULL)
+		elog(ERROR, "index descriptor not found for index %u", info->index->rd_id);
+	
+	descr = o_fetch_table_descr(index_descr->tableOids);
+	if (descr == NULL)
+		elog(ERROR, "table descriptor not found for index %u", info->index->rd_id);
+
+	/* Initialize snapshot for iteration */
+	oSnapshot = o_in_progress_snapshot;
+
+	/* Create iterator to scan all tuples in the index */
+	it = o_btree_iterator_create(&index_descr->desc, NULL, BTreeKeyNone,
+								 &oSnapshot, ForwardScanDirection);
+
+	/* Iterate through all tuples in the index */
+	while (true)
+	{
+		CommitSeqNo tupleCsn;
+		
+		/* Fetch next tuple */
+		tuple = o_btree_iterator_fetch(it, &tupleCsn, NULL, BTreeKeyNone, false, NULL);
+		
+		if (O_TUPLE_IS_NULL(tuple))
+			break;
+
+		num_tuples++;
+
+		/*
+		 * For orioledb, we pass the primary key tuple itself to the callback
+		 * instead of just an ItemPointer. The callback can then collect these
+		 * tuples (e.g., into a tuplesort) for validation purposes.
+		 * 
+		 * We store the tuple and index descriptor in callback_state for the 
+		 * callback to access and extract the PK fields.
+		 */
+		if (callback_state)
+		{
+			((OValidateIndexState *) callback_state)->current_tuple = tuple;
+			((OValidateIndexState *) callback_state)->index_descr = index_descr;
+		}
+
+		/* Call the callback with a dummy ItemPointer */
+		ItemPointerSetInvalid(&itemptr);
+		should_delete = callback(&itemptr, callback_state);
+
+		/*
+		 * If callback returns true (requesting deletion), throw an error.
+		 * Deletion is not supported in orioledb_ambulkdelete.
+		 */
+		if (should_delete)
+		{
+			/* Clean up before erroring out */
+			btree_iterator_free(it);
+			
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("bulk deletion is not supported for orioledb indexes"),
+					 errdetail("Index: %s", RelationGetRelationName(info->index))));
+		}
+	}
+
+	/* Clean up */
+	btree_iterator_free(it);
+
+	/* Allocate and initialize stats if not provided */
+	if (stats == NULL)
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+
+	/* Update statistics */
+	stats->num_index_tuples = num_tuples;
+	stats->estimated_count = false;
+
 	return stats;
 }
 

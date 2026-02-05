@@ -75,6 +75,7 @@ OBJS = src/btree/btree.o \
 	   src/tableam/key_range.o \
 	   src/tableam/key_bitmap.o \
 	   src/tableam/operations.o \
+	   src/tableam/reindex_concurrent_hook.o \
 	   src/tableam/scan.o \
 	   src/tableam/tree.o \
 	   src/tableam/vacuum.o \

@@ -604,6 +604,58 @@ o_define_index(Relation heap, Relation index, Oid indoid, bool reindex,
 
 	if (!reuse_relnode && is_build)
 	{
+		bool		is_concurrent_primary_replacement = false;
+
+		/*
+		 * For REINDEX CONCURRENTLY: PostgreSQL creates a temporary
+		 * concurrent index (e.g., name_ccnew) that is not marked as
+		 * primary. However, if this concurrent index is replacing a
+		 * primary index, we need to build it with all table columns,
+		 * not just the key columns.
+		 *
+		 * Detect this case by checking:
+		 * 1. Index is not marked as primary (!indisprimary)
+		 * 2. Table has a primary index (has_primary)
+		 * 3. Index name ends with "_ccnew" (concurrent index suffix)
+		 * 4. Base name matches the primary index name
+		 *
+		 * This detection must happen here (not in orioledb_ambuild) because
+		 * we need to avoid the o_index_drop call in the reindex path for
+		 * concurrent builds, which are multi-transactional.
+		 */
+		if (!index->rd_index->indisprimary && o_table->has_primary)
+		{
+			const char *index_name = NameStr(index->rd_rel->relname);
+			size_t		index_name_len = strlen(index_name);
+			const char *suffix = "_ccnew";
+			size_t		suffix_len = strlen(suffix);
+
+			/* Check if index name ends with "_ccnew" */
+			if (index_name_len > suffix_len &&
+				strcmp(index_name + index_name_len - suffix_len, suffix) == 0)
+			{
+				/* Get the base name without "_ccnew" suffix */
+				char	   *base_name = pnstrdup(index_name, index_name_len - suffix_len);
+				const char *primary_name = NameStr(o_table->indices[PrimaryIndexNumber].name);
+
+				/* Check if base name matches primary index name */
+				if (strcmp(base_name, primary_name) == 0)
+				{
+					is_concurrent_primary_replacement = true;
+
+					/*
+					 * Update the table_index structure to reflect all table columns.
+					 * This ensures the concurrent index is built like a primary index
+					 * with all columns, not just the key columns.
+					 */
+					table_index->nfields = heap->rd_att->natts;
+					table_index->nkeyfields = heap->rd_att->natts;
+				}
+
+				pfree(base_name);
+			}
+		}
+
 		o_tables_table_meta_unlock(NULL, InvalidOid);
 		if (STOPEVENTS_ENABLED())
 		{

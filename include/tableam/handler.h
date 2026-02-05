@@ -221,4 +221,101 @@ typedef ParallelOScanDescData *ParallelOScanDesc;
 
 extern bool in_nontransactional_truncate;
 
+/*
+ * Cleanup old concurrent index structure after validation
+ */
+extern void orioledb_index_validate_cleanup_old_concurrent(Relation heapRelation,
+														   Relation indexRelation);
+
+/*
+ * Hooks for REINDEX CONCURRENTLY stages to synchronize orioledb system trees
+ * with PostgreSQL's system catalogs (pg_index).
+ *
+ * These functions should be called from PostgreSQL's reindex concurrent logic
+ * at the appropriate stages to keep orioledb's metadata synchronized.
+ *
+ * General function for setting any combination of index state flags:
+ */
+
+/*
+ * Flags for index state synchronization with PostgreSQL's pg_index
+ * These correspond to indislive, indisready, and indisvalid in pg_index
+ */
+typedef struct IndexStateFlags
+{
+	bool		set_live;		/* Set or clear indislive flag */
+	bool		live_value;		/* Value for indislive */
+	bool		set_ready;		/* Set or clear indisready flag */
+	bool		ready_value;	/* Value for indisready */
+	bool		set_valid;		/* Set or clear indisvalid flag */
+	bool		valid_value;	/* Value for indisvalid */
+} IndexStateFlags;
+
+/*
+ * General function for setting index state flags.
+ * Call this AFTER updating pg_index with the corresponding flags.
+ * 
+ * Example:
+ *   IndexStateFlags flags = {0};
+ *   flags.set_ready = true;
+ *   flags.ready_value = true;
+ *   flags.set_valid = true;
+ *   flags.valid_value = true;
+ *   orioledb_index_set_state_flags(heapRel, indexRel, &flags);
+ */
+extern void orioledb_index_set_state_flags(Relation heapRelation,
+											Relation indexRelation,
+											IndexStateFlags *flags);
+
+/*
+ * Convenience wrappers for common operations:
+ */
+
+/* Set indisready flag */
+extern void orioledb_reindex_concurrent_set_ready(Relation heapRelation,
+												   Relation indexRelation,
+												   bool ready);
+
+/* Mark old index as dead (indislive=false) */
+extern void orioledb_reindex_concurrent_set_dead(Relation heapRelation,
+												  Relation oldIndex,
+												  Relation newIndex);
+
+/* Swap relfilenodes between old and new index */
+extern void orioledb_reindex_concurrent_swap(Relation heapRelation,
+											  Relation oldIndex,
+											  Relation newIndex);
+
+/* Mark new index as valid (indisvalid=true) */
+extern void orioledb_reindex_concurrent_set_valid(Relation heapRelation,
+												   Relation oldIndex,
+												   Relation newIndex);
+
+/* Mark old index as invalid (indisvalid=false) */
+extern void orioledb_reindex_concurrent_set_invalid(Relation heapRelation,
+													 Relation oldIndex,
+													 Relation newIndex);
+
+/* Final cleanup of old index structure */
+extern void orioledb_reindex_concurrent_cleanup(Relation heapRelation,
+												 Relation oldIndex,
+												 Relation newIndex);
+
+/*
+ * State for orioledb index validation
+ * Extends PostgreSQL's ValidateIndexState with orioledb-specific fields
+ */
+typedef struct OValidateIndexState
+{
+	/* Fields matching PostgreSQL's ValidateIndexState */
+	Tuplesortstate *tuplesort;
+	double		htups;			/* # heap tuples processed */
+	double		itups;			/* # index tuples from ambulkdelete */
+	double		tups_inserted;	/* # missing tuples inserted */
+	
+	/* Orioledb-specific fields */
+	OTuple		current_tuple;	/* Current tuple being processed by ambulkdelete */
+	OIndexDescr *index_descr;	/* Index descriptor for extracting PK from tuples */
+} OValidateIndexState;
+
 #endif
