@@ -729,6 +729,76 @@ CREATE INDEX o_test_max_parallel_maintenance_workers_idx_build_ix1
 	ON o_test_max_parallel_maintenance_workers_idx_build (val_2);
 COMMIT;
 
+-- Test concurrent index build with DELETE operations
+-- This test verifies that both race conditions are handled:
+-- 1. DELETE on tuple inserted after build snapshot (ANTI_NON_DELETED)
+-- 2. INSERT on tuple deleted during build (ANTI_DELETED)
+
+CREATE TABLE t_concurrent_build (
+	id int PRIMARY KEY,
+	val int
+) USING orioledb;
+
+-- Insert enough data to make index build take time
+INSERT INTO t_concurrent_build SELECT i, i * 100 FROM generate_series(1, 50000) i;
+
+-- Create a simple done table to signal when background job completes
+CREATE TABLE concurrent_build_done (step int);
+
+-- Start concurrent index build in background
+\! psql -d contrib_regression -c "SET SESSION search_path = 'indices_build'; CREATE INDEX CONCURRENTLY t_concurrent_build_idx ON t_concurrent_build (val); INSERT INTO concurrent_build_done VALUES (1);" &
+
+-- Wait for build phase to start (5 seconds)
+SELECT pg_sleep(5);
+
+-- Case 1: INSERT new tuple (key=99999) - will be deleted later
+-- Case 2: DELETE existing tuple (key=100) - will be reinserted later
+INSERT INTO t_concurrent_build VALUES (99999, 999900);
+DELETE FROM t_concurrent_build WHERE id = 100;
+
+-- Wait for validation phase and some concurrent activity (10 seconds)
+SELECT pg_sleep(10);
+
+-- Case 1: DELETE the tuple we just inserted (should find ANTI_NON_DELETED)
+DELETE FROM t_concurrent_build WHERE id = 99999;
+
+-- Case 2: Re-INSERT the tuple we deleted (should find ANTI_DELETED)
+INSERT INTO t_concurrent_build VALUES (100, 10000);
+
+-- Wait for index build to complete
+SELECT pg_sleep(5);
+
+-- Wait for background job completion signal
+DO $$
+DECLARE
+	done_count int := 0;
+	wait_count int := 0;
+BEGIN
+	WHILE done_count = 0 AND wait_count < 30 LOOP
+		SELECT COUNT(*) INTO done_count FROM concurrent_build_done WHERE step = 1;
+		IF done_count = 0 THEN
+			PERFORM pg_sleep(1);
+			wait_count := wait_count + 1;
+		END IF;
+	END LOOP;
+END $$;
+
+-- Verify the index was created
+SELECT COUNT(*) FROM pg_indexes WHERE tablename = 't_concurrent_build' AND indexname = 't_concurrent_build_idx';
+
+-- Check that both keys are in correct state
+SELECT id, val FROM t_concurrent_build WHERE id IN (100, 99999) ORDER BY id;
+
+-- Print index structure to verify no anti-states remain
+-- (they should all be converted to final states by validation)
+SELECT * FROM orioledb.orioledb_idx_structure('t_concurrent_build'::regclass, 't_concurrent_build_idx', 'nuei', 3);
+
+-- Verify index works correctly
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM t_concurrent_build WHERE val = 10000;
+SELECT id FROM t_concurrent_build WHERE val = 10000;
+RESET enable_seqscan;
+
 SELECT orioledb_parallel_debug_stop();
 DROP EXTENSION orioledb CASCADE;
 DROP SCHEMA indices_build CASCADE;

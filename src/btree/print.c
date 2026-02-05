@@ -422,6 +422,10 @@ print_page_contents_recursive(BTreeDescr *desc, OInMemoryBlkno blkno,
 							appendStringInfo(outbuf, "moved partitions");
 						else if (tuphdr.deleted == BTreeLeafTuplePKChanged)
 							appendStringInfo(outbuf, "PK changed");
+						else if (tuphdr.deleted == BTreeLeafTupleAntiNonDeleted)
+							appendStringInfo(outbuf, "anti-non-deleted");
+						else if (tuphdr.deleted == BTreeLeafTupleAntiDeleted)
+							appendStringInfo(outbuf, "anti-deleted");
 					}
 					needsComma |= btree_print_undo_location(desc->undoType, (UndoLocation) tuphdr.undoLocation, outbuf, printData, needsComma);
 
