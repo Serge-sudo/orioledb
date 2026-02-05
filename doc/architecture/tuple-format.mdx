@@ -1,0 +1,138 @@
+---
+id: tuple-format
+sidebar_label: Tuple Format
+---
+
+# OrioleDB Tuple Format
+
+OrioleDB implements a compact and efficient tuple format optimized for MVCC (Multi-Version Concurrency Control) operations. This document describes the structure of tuple headers and how they relate to transaction management.
+
+## Tuple Header Structure
+
+The OrioleDB tuple header is defined in `include/tuple/format.h` as `OTupleHeaderData`:
+
+```c
+typedef struct
+{
+    uint16  hasnulls:1,    // 1-bit flag: whether tuple has null values
+            len:15;        // 15-bit field: tuple length in bytes
+    uint16  natts;         // Number of attributes in the tuple
+    uint32  version;       // Version number for MVCC
+} OTupleHeaderData;
+```
+
+The tuple header is very compact at only **8 bytes** (after alignment with `SizeOfOTupleHeader`).
+
+### Header Fields
+
+1. **hasnulls** (1 bit): A flag indicating whether the tuple contains any NULL values. If set, a null bitmap follows the header.
+
+2. **len** (15 bits): The total length of the tuple in bytes, including the header. The maximum tuple length is 32,767 bytes (2^15 - 1).
+
+3. **natts** (16 bits): The number of attributes (columns) in the tuple.
+
+4. **version** (32 bits): A version number used for MVCC to track tuple versions within a transaction and for version comparison during updates.
+
+## Version Field and MVCC
+
+The `version` field in the tuple header plays a crucial role in OrioleDB's MVCC implementation:
+
+- **Version Tracking**: Each tuple has a version number that is incremented when the tuple is updated. This allows OrioleDB to distinguish between different versions of the same row.
+
+- **Version Comparison**: When fetching tuples, OrioleDB can use the version field to determine which tuple version matches the required snapshot. See `o_tuple_get_version()` and `o_tuple_set_version()` functions in `src/tuple/format.c`.
+
+- **Update Detection**: During updates, the version number is incremented by 1 to create a new tuple version:
+  ```c
+  o_tuple_set_version(&id->leafSpec, newtup, o_tuple_get_version(tup) + 1);
+  ```
+
+## Relationship Between Version, CSN, and XID
+
+### What the Tuple Header Contains
+
+The tuple header **contains**:
+- **version**: A 32-bit version number for tracking tuple versions
+
+The tuple header **does NOT directly contain**:
+- **CSN (Commit Sequence Number)**: Not stored in tuple header
+- **XID (Transaction ID)**: Not stored in tuple header
+
+### Where CSN and XID are Stored
+
+**CSN (Commit Sequence Number)** and **XID** are managed separately in OrioleDB's transaction management system:
+
+1. **OXid (Transaction ID)**: OrioleDB uses a 64-bit transaction identifier called `OXid` (defined in `include/orioledb.h`):
+   ```c
+   typedef uint64 OXid;
+   ```
+   
+   Transaction IDs are stored in the **undo log** and tracked in the transaction metadata structures, not in tuple headers.
+
+2. **CSN (Commit Sequence Number)**: CSN is stored in transaction metadata structures like `OSnapshot` (defined in `include/transam/oxid.h`):
+   ```c
+   typedef struct OSnapshot
+   {
+       CommitSeqNo csn;      // Commit Sequence Number
+       XLogRecPtr  xlogptr;  // Transaction log pointer
+       XLogRecPtr  xmin;     // Minimum transaction log pointer
+       CommandId   cid;      // Command ID within transaction
+   } OSnapshot;
+   ```
+
+3. **Transaction Mapping**: The mapping between OXid and CSN is maintained in shared memory via `OXidMapItem`:
+   ```c
+   typedef struct
+   {
+       pg_atomic_uint64 csn;        // Commit Sequence Number
+       pg_atomic_uint64 commitPtr;  // Commit pointer
+   } OXidMapItem;
+   ```
+
+### How Transaction Visibility Works
+
+OrioleDB determines tuple visibility using a combination of:
+
+1. **Undo Log Chains**: Tuple headers are connected in chains where the head is on the data page and older versions are in the undo log (see [Row-level Undo](overview.mdx#undo-log)).
+
+2. **Transaction Metadata**: Each undo record contains transaction information (OXid), and the system looks up the CSN for that transaction to determine visibility.
+
+3. **Version Comparison**: The `version` field in the tuple header helps identify which version of the tuple to use when multiple versions exist.
+
+The snapshot isolation is implemented by comparing the CSN of the transaction that created/modified a tuple with the CSN of the current transaction's snapshot. If the tuple's transaction CSN is less than or equal to the snapshot CSN, and the transaction is committed, the tuple is visible.
+
+## Tuple Storage Layout
+
+The complete tuple storage layout on a page is:
+
+```
++------------------+
+| OTupleHeader     | (8 bytes aligned)
++------------------+
+| Null bitmap      | (if hasnulls is set, MAXALIGN(BITMAPLEN(natts)))
++------------------+
+| Attribute data   | (variable length)
++------------------+
+```
+
+- If `hasnulls` is 0, the null bitmap is omitted, and attribute data immediately follows the header.
+- If `hasnulls` is 1, a bitmap follows the header indicating which attributes are NULL.
+
+## Fixed Format Tuples
+
+OrioleDB also supports a "fixed format" optimization for tuples without variable-length attributes and without NULLs. Fixed format tuples use the `O_TUPLE_FLAGS_FIXED_FORMAT` flag and can omit the standard tuple header entirely in favor of a simpler format spec.
+
+## Summary
+
+To answer the original question: **What does the OrioleDB tuple header contain?**
+
+The OrioleDB tuple header (`OTupleHeaderData`) contains:
+- **hasnulls**: 1-bit flag for NULL presence
+- **len**: 15-bit tuple length
+- **natts**: 16-bit attribute count  
+- **version**: 32-bit version number for MVCC
+
+The tuple header **does NOT contain** CSN or XID directly. These are stored separately in:
+- **OXid**: 64-bit transaction ID stored in undo log and transaction metadata
+- **CSN**: Commit Sequence Number stored in `OXidMapItem` and `OSnapshot` structures
+
+The compact 8-byte header design allows OrioleDB to efficiently store tuples while maintaining the necessary information for MVCC through the undo log system and separate transaction metadata structures.
