@@ -118,6 +118,7 @@ static OBTreeModifyCallbackAction o_update_callback(BTreeDescr *descr,
 													RowLockMode *lock_mode,
 													BTreeLocationHint *hint,
 													void *arg);
+static bool o_index_is_under_concurrent_build(OIndexDescr *idx);
 static OBTreeModifyCallbackAction o_update_deleted_callback(BTreeDescr *descr,
 															OTuple tup, OTuple *newtup,
 															OXid oxid, OTupleXactInfo xactInfo,
@@ -145,6 +146,31 @@ static OBTreeModifyCallbackAction o_lock_deleted_callback(BTreeDescr *descr, OTu
 static inline bool is_keys_eq(BTreeDescr *desc, OBTreeKeyBound *k1, OBTreeKeyBound *k2);
 static void o_report_duplicate(Relation rel, OIndexDescr *id,
 							   TupleTableSlot *slot);
+
+/*
+ * Helper function to check if an index is under concurrent build.
+ * An index is under concurrent build when indisready=true but indisvalid=false.
+ */
+static bool
+o_index_is_under_concurrent_build(OIndexDescr *idx)
+{
+	Relation	indexRel;
+	bool		result;
+
+	/* Secondary indexes only */
+	if (idx->desc.type != oIndexSecondary)
+		return false;
+
+	indexRel = RelationIdGetRelation(idx->oids.reloid);
+	if (!RelationIsValid(indexRel))
+		return false;
+
+	/* Index is under build when it's ready but not yet valid */
+	result = indexRel->rd_index->indisready && !indexRel->rd_index->indisvalid;
+
+	RelationClose(indexRel);
+	return result;
+}
 
 static TupleTableSlot *
 update_arg_get_slot(OModifyCallbackArg *arg)

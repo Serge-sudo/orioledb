@@ -92,7 +92,9 @@ typedef enum BTreeLeafTupleDeletedStatus
 	BTreeLeafTupleNonDeleted = 0,
 	BTreeLeafTupleDeleted = 1,
 	BTreeLeafTupleMovedPartitions = 2,
-	BTreeLeafTuplePKChanged = 3
+	BTreeLeafTuplePKChanged = 3,
+	BTreeLeafTupleAntiNonDeleted = 4,
+	BTreeLeafTupleAntiDeleted = 5
 } BTreeLeafTupleDeletedStatus;
 
 typedef struct
@@ -321,13 +323,13 @@ typedef enum RowLockMode
  * flag.
  */
 #define XACT_INFO_LOCK_ONLY_BIT \
-	UINT64CONST(0x1000000000000000)
+	UINT64CONST(0x0800000000000000)
 #define XACT_INFO_LOCK_MODE_MASK \
-	UINT64CONST(0x0C00000000000000)
+	UINT64CONST(0x0600000000000000)
 #define XACT_INFO_LOCK_OXID_MASK \
-	UINT64CONST(0x03FFFFFFFFFFFFFF)
+	UINT64CONST(0x01FFFFFFFFFFFFFF)
 #define XACT_INFO_LOCK_MODE_SHIFT \
-	(58)
+	(57)
 #define	XACT_INFO_IS_LOCK_ONLY(xactInfo) \
 	((xactInfo) & XACT_INFO_LOCK_ONLY_BIT)
 #define XACT_INFO_MAP_CSN(xactInfo) \
