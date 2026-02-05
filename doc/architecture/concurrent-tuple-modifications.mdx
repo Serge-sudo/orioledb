@@ -1,0 +1,416 @@
+---
+id: concurrent-tuple-modifications
+sidebar_label: Concurrent Tuple Modifications
+---
+
+# Concurrent Tuple Modifications
+
+This document explains what happens when two or more transactions try to simultaneously modify (update or delete) the same tuple in OrioleDB, with a focus on undo log management and wait mechanisms.
+
+## Overview
+
+OrioleDB implements Multi-Version Concurrency Control (MVCC) using an undo log mechanism. When multiple transactions attempt to modify the same tuple concurrently, OrioleDB employs a sophisticated conflict resolution system that involves:
+
+1. **Row-level locks** stored in undo chains
+2. **Transaction waiting mechanisms** via `wait_for_tuple()` and `wait_for_oxid()`
+3. **Undo log chains** tracking transaction history
+4. **Conflict detection and resolution** through transaction IDs (OXid) and commit sequence numbers (CSN)
+
+## Scenario: Two Transactions Deleting the Same Tuple
+
+Let's examine what happens when two transactions try to delete the same tuple simultaneously.
+
+### Initial Setup
+
+```sql
+CREATE TABLE example (
+    id int PRIMARY KEY,
+    value text
+) USING orioledb;
+
+INSERT INTO example VALUES (1, 'initial value');
+```
+
+### Concurrent Delete Operations
+
+```bash title="Transaction 1 (T1)"
+BEGIN;
+DELETE FROM example WHERE id = 1;  -- Executes first
+-- Transaction T1 is still in progress
+```
+
+```bash title="Transaction 2 (T2)"
+BEGIN;
+DELETE FROM example WHERE id = 1;  -- Attempts to delete
+-- (waiting for T1 to complete)
+```
+
+## Step-by-Step Execution Flow
+
+### Step 1: Transaction T1 Deletes the Tuple
+
+When T1 executes the DELETE:
+
+1. **Tuple Modification**: T1 marks the tuple as deleted in the B-tree leaf page
+2. **Undo Record Creation**: An undo record is created and added to the undo log:
+   - Records the previous state of the tuple (not deleted, with original xmin)
+   - Stores the location in the undo chain
+   - Links to any previous undo records for this tuple
+3. **Transaction Info Update**: The tuple's header is updated with:
+   - `xmin`: T1's transaction ID (OXid)
+   - `deleted`: Set to `BTreeLeafTupleDeleted`
+   - `undoLocation`: Points to the newly created undo record
+4. **Lock Information**: T1 implicitly holds an exclusive lock on the tuple
+
+### Step 2: Transaction T2 Attempts to Delete
+
+When T2 tries to delete the same tuple, the following occurs in `o_btree_modify_handle_conflicts()`:
+
+1. **Conflict Detection** (`src/btree/modify.c:428-587`):
+   ```c
+   if (row_lock_conflicts(tuphdr, &context->conflictTupHdr, ...))
+   ```
+   - T2 finds that the tuple's `xmin` belongs to T1 (a different transaction)
+   - T2 detects that T1's transaction is still in progress (COMMITSEQNO_IS_INPROGRESS)
+
+2. **Wait Callback Invocation**:
+   - If a `waitCallback` is registered, it's called to determine the action
+   - The callback returns `OBTreeCallbackActionXidWait` for conflicting deletes
+
+3. **Page Unlock**: The page is unlocked before waiting to prevent deadlocks
+
+4. **Wait for Transaction T1** (`src/btree/modify.c:563-567`):
+   ```c
+   wait_for_tuple(desc, curTuple, oxid,
+                  context->lockMode,
+                  context->lockStatus,
+                  &context->hwLockTag,
+                  &context->hwLockMode);
+   ```
+
+### Step 3: Wait Mechanism Details
+
+The `wait_for_tuple()` function (`src/btree/modify.c:400-425`):
+
+1. **Hardware Lock Acquisition**:
+   - If T2 doesn't already hold a lock, it acquires a tuple-level lock:
+   ```c
+   SET_LOCKTAG_TUPLE(*hwLockTag,
+                     desc->oids.datoid,
+                     desc->oids.reloid,
+                     hash,
+                     0);
+   *hwLockMode = hwLockModes[lockMode];
+   (void) LockAcquire(hwLockTag, *hwLockMode, false, false);
+   ```
+
+2. **Wait for OXid** (`src/transam/oxid.c:816-855`):
+   - Calls `wait_for_oxid(oxid, false)` where `oxid` is T1's transaction ID
+   - This function:
+     - Maps the OXid to get its commit sequence number (CSN)
+     - If the transaction is still in progress (COMMITSEQNO_IS_INPROGRESS):
+       - Extracts the virtual transaction ID (vxid) from the process map
+       - Calls `VirtualXactLock(vxid, true)` to wait for T1's completion
+     - This blocks T2 until T1 commits or aborts
+
+3. **Process Waiting**:
+   ```c
+   GET_CUR_PROCDATA()->waitingForOxid = true;
+   result = VirtualXactLock(vxid, true);
+   GET_CUR_PROCDATA()->waitingForOxid = false;
+   ```
+   - T2's process is marked as waiting for an OXid
+   - PostgreSQL's lock manager handles the actual waiting
+   - T2 is notified when T1 releases its virtual transaction lock
+
+### Step 4: Transaction T1 Commits or Aborts
+
+#### Case A: T1 Commits
+
+```bash title="Transaction 1"
+COMMIT;  -- T1 commits
+```
+
+When T1 commits:
+
+1. **CSN Assignment**: T1 is assigned a commit sequence number
+2. **Undo Log Update**: The undo records remain in the undo log but are marked with T1's CSN
+3. **Virtual Lock Release**: T1 releases its virtual transaction lock
+4. **Notification**: T2 is notified via `oxid_notify()` that T1 has completed
+
+T2 wakes up and continues:
+
+1. **Page Refind** (`src/btree/modify.c:575-581`):
+   ```c
+   result = refind_page(pageFindContext,
+                        context->key,
+                        context->keyType,
+                        0,
+                        pageFindContext->items[pageFindContext->index].blkno,
+                        pageFindContext->items[pageFindContext->index].pageChangeCount);
+   ```
+
+2. **Retry Conflict Resolution**:
+   - Returns `ConflictResolutionRetry` to re-examine the tuple
+   - T2 sees that T1 has committed (csn is now normal, not in-progress)
+   - Since the tuple is already deleted by T1, T2's delete finds no tuple
+
+3. **Result**: T2's delete returns 0 rows affected (tuple already deleted)
+
+#### Case B: T1 Aborts
+
+```bash title="Transaction 1"
+ROLLBACK;  -- T1 aborts
+```
+
+When T1 aborts:
+
+1. **Undo Processing**: T1's changes are rolled back using the undo log:
+   - The undo record is processed by `page_item_rollback()`
+   - The tuple is restored to its pre-delete state (not deleted)
+2. **CSN Update**: T1 is marked as aborted (COMMITSEQNO_IS_ABORTED)
+3. **Virtual Lock Release**: T1 releases its virtual transaction lock
+
+T2 wakes up and continues:
+
+1. **Page Refind**: Similar to the commit case
+2. **Automatic Rollback** (`src/btree/modify.c:502-516`):
+   ```c
+   if (COMMITSEQNO_IS_ABORTED(csn))
+   {
+       // Transaction changes should be undone by the transaction owner.
+       // But we rollback those changes ourself instead of waiting.
+       START_CRIT_SECTION();
+       page_block_reads(blkno);
+       if (!page_item_rollback(desc, page, loc, true,
+                               &context->conflictTupHdr,
+                               context->conflictUndoLocation))
+           context->cmp = -1;
+       MARK_DIRTY(desc, blkno);
+       END_CRIT_SECTION();
+   }
+   ```
+   - T2 performs the rollback itself instead of waiting for T1
+   - This optimization avoids additional synchronization overhead
+
+3. **Delete Execution**: T2 now successfully deletes the tuple:
+   - Creates its own undo record
+   - Marks the tuple as deleted with T2's OXid
+   - Chains the new undo record to the previous undo chain
+
+## Undo Log Management
+
+### Undo Chain Structure
+
+Each tuple maintains an undo chain that tracks its modification history:
+
+```
+Current Tuple State (in B-tree leaf page)
+    |
+    | undoLocation
+    v
+Undo Record (T2's modification)
+    |
+    | prevUndoLocation
+    v
+Undo Record (T1's modification)
+    |
+    | prevUndoLocation
+    v
+Original Tuple State
+```
+
+### Undo Record Contents
+
+For a delete operation, the undo record contains:
+
+- **Location information**: Position in the undo log circular buffer
+- **Previous tuple state**: The tuple before deletion (not deleted flag, original data)
+- **Transaction info**: OXid, lock mode, CSN
+- **Chain link**: Pointer to the previous undo record in the chain
+- **Operation type**: Modification/deletion indicator
+
+### Undo Log Types
+
+OrioleDB uses multiple undo log types (`src/transam/undo.c`):
+
+1. **Regular undo log**: For normal table modifications
+2. **Index undo log**: For index-specific operations
+3. **System undo log**: For system catalog changes
+
+### Space Reclamation
+
+Undo log space is reclaimed when:
+
+1. **No Active Snapshots**: All transactions that might need to see old versions have completed
+2. **Retention Location**: The undo log maintains a "retained location" based on the oldest active transaction
+3. **Circular Buffer**: Old undo records are overwritten as the circular buffer advances
+
+## Serialization and Isolation
+
+### Serialization Conflicts
+
+When using serializable isolation level (`src/btree/modify.c:525-531`):
+
+```c
+if (csn >= context->opCsn && IsolationUsesXactSnapshot() &&
+    IsRelationTree(desc))
+{
+    ereport(ERROR,
+            (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+             errmsg("could not serialize access due to concurrent update")));
+}
+```
+
+If T2 started before T1 committed, but T1's CSN is greater than or equal to T2's snapshot CSN, a serialization error is raised to maintain serializable consistency.
+
+### Read Committed Isolation
+
+Under read committed isolation:
+- T2 waits for T1 to complete
+- After T1 commits, T2 sees the new state (deleted tuple)
+- T2's delete affects 0 rows
+- No error is raised
+
+### Repeatable Read Isolation
+
+Under repeatable read isolation:
+- T2 uses its snapshot CSN for visibility checks
+- T2 waits for T1 to complete
+- After T1 commits:
+  - If T1's CSN is within T2's snapshot, T2 sees the tuple as not deleted
+  - If T1's CSN is after T2's snapshot started, a serialization error may occur
+
+## Lock Modes and Row-Level Locks
+
+### Lock Modes
+
+OrioleDB supports multiple row-level lock modes:
+
+- `RowLockUpdate`: FOR UPDATE (exclusive)
+- `RowLockNoKeyUpdate`: FOR NO KEY UPDATE
+- `RowLockShare`: FOR SHARE
+- `RowLockKeyShare`: FOR KEY SHARE (weakest)
+
+### Lock Conflict Resolution
+
+Delete operations implicitly use `RowLockUpdate` mode. Lock conflicts are resolved in `row_lock_conflicts()`:
+
+1. **Same transaction**: No conflict, may need undo for savepoint support
+2. **Different transaction**:
+   - Check if lock modes conflict
+   - If conflict, return true to trigger waiting
+   - Lock-only undo records of committed/aborted transactions are removed from the chain
+
+## Edge Cases and Special Scenarios
+
+### Multiple Concurrent Deletes
+
+With three or more transactions:
+
+```bash
+T1: DELETE FROM example WHERE id = 1;  -- First
+T2: DELETE FROM example WHERE id = 1;  -- Waits for T1
+T3: DELETE FROM example WHERE id = 1;  -- Waits for T1
+```
+
+- T2 and T3 both wait for T1
+- When T1 commits, both T2 and T3 wake up
+- They serialize based on lock acquisition order
+- Only the first one to refind the page successfully deletes (if T1 aborted)
+- The others find the tuple already deleted
+
+### Primary Key Updates
+
+Primary key updates are implemented as DELETE + INSERT:
+
+```bash
+T1: UPDATE example SET id = 2 WHERE id = 1;  -- Delete(id=1) + Insert(id=2)
+T2: DELETE FROM example WHERE id = 1;         -- Waits for T1
+```
+
+Special handling in `doc/architecture/row-level-concurrency.mdx`:
+- T2 may follow the update chain or get an error
+- Depends on timing and whether T2 sees the tuple as "moved" to a new primary key
+
+### Savepoint Rollback
+
+When using savepoints:
+
+```bash
+BEGIN;
+SAVEPOINT sp1;
+DELETE FROM example WHERE id = 1;  -- Creates undo record
+ROLLBACK TO SAVEPOINT sp1;          -- Uses undo log to restore
+DELETE FROM example WHERE id = 1;  -- May reuse or create new undo record
+COMMIT;
+```
+
+The `savepointUndoLocation` in the modify context determines whether to create new undo records or reuse existing ones.
+
+## Performance Considerations
+
+### Lock Contention
+
+- **Advisory locks**: Used for tuple-level coordination (`SET_LOCKTAG_TUPLE`)
+- **Lock acquisition order**: Consistent ordering prevents deadlocks
+- **Lock modes**: Weaker locks allow more concurrency (e.g., FOR KEY SHARE)
+
+### Undo Log Write Coordination
+
+From `include/transam/undo.h`:
+
+```c
+typedef struct UndoMeta
+{
+    LWLock      undoWriteLock;  // Serializes undo writes
+    // ... other fields
+} UndoMeta;
+```
+
+- Undo writes are serialized per undo log type
+- Multiple transactions can prepare undo records in parallel
+- Actual writing to the undo log is coordinated by `undoWriteLock`
+
+### Wait Queue Management
+
+- PostgreSQL's lock manager maintains wait queues
+- FIFO ordering for fairness
+- Deadlock detection runs periodically
+- Virtual transaction locks are lightweight compared to table-level locks
+
+## Code References
+
+Key functions involved in concurrent tuple modification handling:
+
+1. **`o_btree_modify_handle_conflicts()`** (`src/btree/modify.c:428-620`): Main conflict detection and resolution
+2. **`wait_for_tuple()`** (`src/btree/modify.c:400-425`): Initiates waiting for a conflicting transaction
+3. **`wait_for_oxid()`** (`src/transam/oxid.c:816-855`): Core waiting mechanism using virtual transaction locks
+4. **`row_lock_conflicts()`** (`src/btree/undo.c`): Determines if row-level locks conflict
+5. **`page_item_rollback()`** (`src/btree/undo.c`): Rolls back changes using undo log
+6. **`oxid_notify()`** (`src/transam/oxid.c:857-920`): Notifies waiting transactions when a transaction completes
+
+## Testing
+
+See the isolation test suite for examples of concurrent modifications:
+
+- `test/specs/concurrent_update_delete.spec`: Tests concurrent updates and deletes
+- `test/specs/rll.spec`: Row-level lock tests
+- `test/specs/rll_deadlock.spec`: Deadlock scenarios with row locks
+- `test/sql/row_level_locks.sql`: Various row lock combinations
+
+## Summary
+
+When two transactions try to simultaneously delete (or modify) the same tuple in OrioleDB:
+
+1. The first transaction (T1) creates an undo record and marks the tuple as modified/deleted
+2. The second transaction (T2) detects the conflict and waits for T1 using `wait_for_oxid()`
+3. When T1 commits or aborts, T2 is notified and wakes up
+4. T2 refines the page and re-evaluates the conflict:
+   - If T1 committed: T2 sees the new state and acts accordingly
+   - If T1 aborted: T2 rolls back T1's changes itself and proceeds with its operation
+5. Undo logs maintain the complete history, allowing rollback and snapshot visibility
+6. Hardware locks (tuple-level locks) coordinate access and prevent race conditions
+7. The undo chain links all versions of the tuple for MVCC visibility
+
+This design ensures both correctness and performance for concurrent tuple modifications in OrioleDB.
