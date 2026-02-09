@@ -1172,8 +1172,13 @@ orioledb_index_validate(Relation heapRelation,
 													 maintenance_work_mem,
 													 false,
 													 NULL);
-	state.htups = state.itups = state.tups_inserted = 0;
+	state.htups = state.itups = state.tups_inserted = state.tups_deleted = 0;
 	state.current_tuple.data = NULL; /* Initialize */
+	state.index_descr = NULL; /* Will be set by ambulkdelete */
+	state.table_descr = descr;
+	state.index_oids.datoid = MyDatabaseId;
+	state.index_oids.reloid = indexRelation->rd_rel->oid;
+	state.index_oids.relnode = indexRelation->rd_rel->relfilenode;
 
 	/*
 	 * Scan the index and gather up all the primary key tuples into a tuplesort object.
@@ -1227,8 +1232,8 @@ orioledb_index_validate(Relation heapRelation,
 	index_insert_cleanup(indexRelation, indexInfo);
 
 	elog(DEBUG2,
-		 "orioledb_index_validate found %.0f heap tuples, %.0f index tuples; inserted %.0f missing tuples",
-		 state.htups, state.itups, state.tups_inserted);
+		 "orioledb_index_validate found %.0f heap tuples, %.0f index tuples; inserted %.0f missing tuples, deleted %.0f spurious tuples",
+		 state.htups, state.itups, state.tups_inserted, state.tups_deleted);
 
 	/* Roll back any GUC changes executed by index functions */
 	AtEOXact_GUC(false, save_nestlevel);
@@ -1342,65 +1347,49 @@ debug_print_validate_tuple(OTuple tuple, OTableDescr *table_descr, OIndexDescr *
  * validate_index_callback - Callback for index validation
  *
  * This callback is invoked by orioledb_ambulkdelete for each tuple in the index.
- * It extracts the primary key portion from the index tuple and collects it into
- * the tuplesort for later comparison with heap tuples.
+ * It stores the FULL secondary index tuple into the tuplesort for later comparison
+ * with heap tuples. The tuplesort will sort by primary key for merge-join validation.
  */
 static bool
 validate_index_callback(ItemPointer itemptr, void *callback_state)
 {
 	OValidateIndexState *state = (OValidateIndexState *) callback_state;
-	OTuple		pkTuple;
+	OTuple		fullIndexTuple;
 	OIndexDescr *id = state->index_descr;
 	OTableDescr *table_descr = state->table_descr;
-	OIndexDescr *primary = GET_PRIMARY(table_descr);
-	Datum		values[INDEX_MAX_KEYS];
-	bool		isnull[INDEX_MAX_KEYS];
-	int			i;
-	int			pk_from;
-	bool		pk_isnull;
 
 	/*
 	 * For orioledb, the actual tuple is stored in state->current_tuple
-	 * by orioledb_ambulkdelete. For secondary indexes, this tuple contains
-	 * both the indexed columns and the primary key fields. We need to extract
-	 * only the primary key portion, similar to o_fill_pindex_tuple_key_bound.
+	 * by orioledb_ambulkdelete. For validation with deletion support, we need
+	 * to store the FULL secondary index tuple (not just PK) so we can later
+	 * delete entries that don't correspond to any primary tuple.
+	 *
+	 * The tuplesort will sort these tuples by PK (using a custom comparator),
+	 * enabling efficient merge-join with the primary index scan.
 	 */
 	if (!O_TUPLE_IS_NULL(state->current_tuple))
 	{
-		/*
-		 * Extract the primary key fields from the index tuple.
-		 * Similar to o_fill_pindex_tuple_key_bound, but we extract values
-		 * to form a tuple rather than filling a bound structure.
-		 */
-		if (id->desc.type == oIndexBridge)
-			pk_from = 1;
-		else
-			pk_from = id->nFields - id->nPrimaryFields;
-
-		for (i = 0; i < id->nPrimaryFields; i++)
-		{
-			AttrNumber	attnum = id->primaryFieldsAttnums[i];
-
-			values[i] = o_fastgetattr(state->current_tuple, attnum,
-									  id->leafTupdesc, &id->leafSpec, &pk_isnull);
-			isnull[i] = pk_isnull;
-		}
-
-		/* Form a tuple with only the primary key fields */
-		pkTuple = o_form_tuple(primary->leafTupdesc, &primary->leafSpec,
-							   0, values, isnull, NULL);
+		size_t tuple_len = o_btree_len(&id->desc, state->current_tuple, OTupleLength);
+		
+		/* Make a copy of the full secondary index tuple */
+		fullIndexTuple.data = (Pointer) palloc(tuple_len);
+		memcpy(fullIndexTuple.data, state->current_tuple.data, tuple_len);
+		fullIndexTuple.formatFlags = state->current_tuple.formatFlags;
 		
 		/* Debug: Print tuple before adding to tuplesort */
-		debug_print_validate_tuple(pkTuple, table_descr, id);
+		debug_print_validate_tuple(fullIndexTuple, table_descr, id);
 		
-		/* Put only the PK tuple into the tuplesort */
-		tuplesort_putotuple(state->tuplesort, pkTuple);
+		/* 
+		 * Put the FULL secondary index tuple into tuplesort.
+		 * The tuplesort comparator will extract and compare PK fields for sorting.
+		 */
+		tuplesort_putotuple(state->tuplesort, fullIndexTuple);
 		
-		/* Free the formed tuple */
-		pfree(pkTuple.data);
+		/* Free the allocated copy */
+		pfree(fullIndexTuple.data);
 	}
 
-	/* Return false to indicate we don't want to delete this tuple */
+	/* Return false to indicate we don't want to delete this tuple during the scan */
 	return false;
 }
 
@@ -1458,7 +1447,12 @@ orioledb_index_validate_scan(Relation heapRelation,
 	descr = relation_get_descr(heapRelation);
 	Assert(descr != NULL);
 
-	O_LOAD_SNAPSHOT(&oSnapshot, snapshot);
+	/*
+	 * Use SnapshotAny to see ALL tuples including in-progress ones.
+	 * This is necessary for validation to properly handle concurrent modifications
+	 * and ensure we see all tuples that might exist in secondary indexes.
+	 */
+	O_LOAD_SNAPSHOT(&oSnapshot, SnapshotAny);
 	
 	/* 
 	 * Use iterator instead of sequential scan to ensure tuples are returned
@@ -1518,6 +1512,8 @@ orioledb_index_validate_scan(Relation heapRelation,
 		for (;;)
 		{
 			int32		cmp;
+			OTuple		indexTuplePK;
+			OIndexDescr *secIndex;
 
 			if (!indexTupleValid && !indexDone)
 			{
@@ -1530,6 +1526,10 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 			if (indexDone)
 			{
+				/*
+				 * No more tuples in secondary index. 
+				 * Insert missing tuple into secondary index.
+				 */
 				if (index_insert(indexRelation, values, isnull, heapRowIdDatum,
 								 heapRelation, checkUnique, false, indexInfo))
 					state->tups_inserted++;
@@ -1537,28 +1537,96 @@ orioledb_index_validate_scan(Relation heapRelation,
 			}
 
 			/* 
-			 * Compare index tuple with heap tuple using the primary index's 
-			 * comparison function. This ensures we're comparing in the correct
-			 * primary key order.
+			 * Extract PK from the full secondary index tuple for comparison.
+			 * The indexTuple now contains the FULL secondary index tuple,
+			 * so we need to extract just the PK portion for comparison.
+			 */
+			secIndex = state->index_descr;
+			indexTuplePK = o_btree_tuple_make_key(&secIndex->desc, indexTuple, NULL, false);
+			
+			/* 
+			 * Compare PK from secondary index tuple with PK from heap tuple.
+			 * This ensures we're comparing in the correct primary key order.
 			 */
 			cmp = o_btree_cmp(&GET_PRIMARY(descr)->desc,
-							  indexTuple.data, BTreeKeyNonLeafKey,
+							  indexTuplePK.data, BTreeKeyNonLeafKey,
 							  heapTuple.data, BTreeKeyNonLeafKey);
+			
+			/* Free the extracted PK */
+			if (indexTuplePK.data != NULL)
+				pfree(indexTuplePK.data);
+			
 			if (cmp < 0)
 			{
+				/*
+				 * Secondary index has a tuple that primary index doesn't have.
+				 * This means we need to DELETE this spurious entry from the secondary index.
+				 * We have the full secondary index tuple, so we can delete it directly.
+				 */
+				TupleTableSlot *deleteSlot;
+				OTableModifyResult deleteResult;
+				OIndexNumber ix_num;
+				
+				/* Find the index number for this secondary index */
+				ix_num = find_tree_in_descr(descr, state->index_oids);
+				if (ix_num != InvalidIndexNumber)
+				{
+					/* Create a slot to hold the secondary index tuple for deletion */
+					deleteSlot = MakeSingleTupleTableSlot(secIndex->leafTupdesc, &TTSOpsOrioleDB);
+					
+					/* Store the full secondary index tuple in the slot */
+					tts_orioledb_store_tuple(deleteSlot, indexTuple, descr,
+											COMMITSEQNO_INPROGRESS, ix_num, true, NULL);
+					
+					/* Delete the tuple from the secondary index using o_tbl_index_delete */
+					deleteResult = o_tbl_index_delete(secIndex, ix_num, deleteSlot,
+													 get_current_oxid_if_any(), 
+													 COMMITSEQNO_INPROGRESS);
+					
+					if (deleteResult.success)
+					{
+						state->tups_deleted++;
+						elog(DEBUG2, "validate_index: deleted spurious tuple from secondary index");
+					}
+					else
+					{
+						elog(WARNING, "validate_index: failed to delete spurious tuple from secondary index");
+					}
+					
+					ExecDropSingleTupleTableSlot(deleteSlot);
+				}
+				
+				/* Move to next index tuple */
 				indexTupleValid = false;
+				
+				/* Free the index tuple data */
+				if (!O_TUPLE_IS_NULL(indexTuple) && indexTuple.data != NULL)
+					pfree(indexTuple.data);
+				
 				continue;
 			}
 
 			if (cmp > 0)
 			{
+				/*
+				 * Heap has a tuple that secondary index doesn't have.
+				 * Insert the missing tuple into secondary index.
+				 */
 				if (index_insert(indexRelation, values, isnull, heapRowIdDatum,
 								 heapRelation, checkUnique, false, indexInfo))
 					state->tups_inserted++;
 			}
 			else
 			{
+				/*
+				 * Both have the same tuple (cmp == 0). 
+				 * Move to next index tuple.
+				 */
 				indexTupleValid = false;
+				
+				/* Free the index tuple data */
+				if (!O_TUPLE_IS_NULL(indexTuple) && indexTuple.data != NULL)
+					pfree(indexTuple.data);
 			}
 			break;
 		}
