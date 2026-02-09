@@ -1355,11 +1355,12 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 				if (tupHdr->undoLocation >= buildstate->undo1 && tupHdr->undoLocation <= buildstate->undo2)
 				{
 					/* Tuples inserted between undo1 and undo2 need to be inserted into index */
-					if (!XACT_INFO_IS_FINISHED(tupHdr->OTupleXactInfo))
+					if (!XACT_INFO_IS_FINISHED(tupHdr->xactInfo))
 					{
-						/* Store tuples for non-complete transactions to local undo log */
+						/* Store tuples for non-complete transactions */
 						Datum *values;
 						bool *nulls;
+						int natts;
 
 						buildstate->noncomplete_xact = true;
 						if(!buildstate->noncomplete_xact_tupstore)
@@ -1368,17 +1369,33 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 						}
 						if(!buildstate->noncomplete_xact_tupdesc)
 						{
-							/* construct tuple descriptor (index attributes, xid) */
+							/* Construct tuple descriptor: index attributes + xactInfo */
+							natts = idx->leafTupdesc->natts;
+							buildstate->noncomplete_xact_tupdesc = CreateTemplateTupleDesc(natts + 1);
+							
+							/* Copy index attribute definitions */
+							for (int i = 0; i < natts; i++)
+							{
+								TupleDescCopyEntry(buildstate->noncomplete_xact_tupdesc, i + 1,
+												   idx->leafTupdesc, i + 1);
+							}
+							
+							/* Add xactInfo attribute */
+							TupleDescInitEntry(buildstate->noncomplete_xact_tupdesc, natts + 1,
+											   "xactinfo", INT8OID, -1, 0);
 						}
-						values = palloc(sizeof(Datum) * buildstate->noncomplete_xact_tupdesc->natts);
-						nulls = palloc(sizeod(bool) * buildstate->noncomplete_xact_tupdesc->natts);
+						
+						natts = idx->leafTupdesc->natts;
+						values = palloc(sizeof(Datum) * (natts + 1));
+						nulls = palloc(sizeof(bool) * (natts + 1));
+						
+						/* Get index tuple values from primary slot */
 						tts_orioledb_get_index_values(primarySlot, idx, values, nulls, true);
-						o_btree_check_size_of_tuple(o_tuple_size(secondaryTup,
-													&idx->leafSpec),
-													idx->name.data, true);
-						/* Construct tuple (index attributes, xid) */
+						
+						/* Store xactInfo as last attribute */
 						nulls[natts] = false;
-						values[natts] = tupHdr->OTupleXactInfo;
+						values[natts] = UInt64GetDatum(tupHdr->xactInfo);
+						
 						tuplestore_putvalues(buildstate->noncomplete_xact_tupstore,
 											 buildstate->noncomplete_xact_tupdesc, values, nulls);
 						pfree(values);
@@ -1592,6 +1609,7 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 			TupleTableSlot *slot;
 			bool		isnull;
 			OTuple		secondaryTup;
+			int			deleted_count = 0;
 			
 			/* Create a slot for reading from the tuplestore */
 			slot = MakeSingleTupleTableSlot(buildstate.noncomplete_xact_tupdesc, &TTSOpsMinimalTuple);
@@ -1608,13 +1626,20 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 				OTupleXactInfo xactInfo;
 				OXid		oxid;
 				CommitSeqNo	csn;
-				int			natts = buildstate.noncomplete_xact_tupdesc->natts;
+				int			natts = idx->leafTupdesc->natts;
+				Datum	   *values;
+				bool	   *nulls;
 				
 				/* Last attribute is the xactInfo */
-				xactInfo = DatumGetUInt64(slot_getattr(slot, natts, &isnull));
+				xactInfo = DatumGetUInt64(slot_getattr(slot, natts + 1, &isnull));
 				Assert(!isnull);
 				
 				oxid = XACT_INFO_GET_OXID(xactInfo);
+				
+				/* Wait for transaction to finish */
+				if (!xid_is_finished(oxid))
+					wait_for_oxid(oxid);
+				
 				csn = oxid_get_csn(oxid);
 				
 				/* Check if transaction was aborted */
@@ -1622,12 +1647,37 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 				{
 					/*
 					 * Transaction rolled back. The validator added this tuple
-					 * to the secondary index, so we need to remove it.
-					 * TODO: Implement tuple removal from secondary index.
+					 * to the secondary index during stage 2, so we need to remove it.
 					 */
-					elog(WARNING, "Transaction rollback during concurrent index build - tuple removal not fully implemented yet");
+					values = palloc(sizeof(Datum) * natts);
+					nulls = palloc(sizeof(bool) * natts);
+					
+					/* Extract the index tuple values (excluding xactInfo) */
+					for (int i = 0; i < natts; i++)
+					{
+						values[i] = slot_getattr(slot, i + 1, &nulls[i]);
+					}
+					
+					/* Reconstruct the secondary tuple for deletion */
+					secondaryTup = o_form_tuple(&idx->leafSpec, values, nulls);
+					
+					/* Delete the tuple from the secondary index */
+					o_btree_autonomous_delete(&idx->desc, secondaryTup, 
+											  BTreeKeyLeafTuple, NULL);
+					
+					deleted_count++;
+					
+					pfree(secondaryTup.data);
+					pfree(values);
+					pfree(nulls);
 				}
 				/* If committed (COMMITSEQNO_IS_COMMITTED), the tuple is already correctly in the index */
+			}
+			
+			if (deleted_count > 0)
+			{
+				elog(NOTICE, "Removed %d tuples from index %s due to transaction rollback during concurrent build",
+					 deleted_count, idx->name.data);
 			}
 			
 			ExecDropSingleTupleTableSlot(slot);
