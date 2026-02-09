@@ -53,6 +53,18 @@ typedef struct
 
 	LWLock		punchHolesLock;
 	uint32		punchHolesChkpNum;
+
+	/*
+	 * Concurrent index build validation boundary.
+	 * During validation phase of a secondary index build, this stores the
+	 * current primary key value up to which validation has been completed.
+	 * Concurrent transactions can only modify secondary index entries for PKs
+	 * less than or equal to this boundary.
+	 * validationBoundaryLen of 0 means no validation in progress.
+	 */
+	LWLock		validationBoundaryLock;
+	uint16		validationBoundaryLen;
+	char		validationBoundaryData[256];	/* Serialized PK tuple */
 } BTreeMetaPage;
 
 StaticAssertDecl(sizeof(BTreeMetaPage) <= ORIOLEDB_BLCKSZ,

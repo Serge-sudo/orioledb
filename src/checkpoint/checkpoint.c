@@ -302,6 +302,7 @@ checkpoint_shmem_init(Pointer ptr, bool found)
 		checkpoint_state->copyBlknoTrancheId = LWLockNewTrancheId();
 		checkpoint_state->oMetaTrancheId = LWLockNewTrancheId();
 		checkpoint_state->punchHolesTrancheId = LWLockNewTrancheId();
+		checkpoint_state->validationBoundaryTrancheId = LWLockNewTrancheId();
 		LWLockInitialize(&checkpoint_state->oTablesMetaLock,
 						 checkpoint_state->oTablesMetaTrancheId);
 		LWLockInitialize(&checkpoint_state->oSysTreesLock,
@@ -377,6 +378,8 @@ checkpoint_shmem_init(Pointer ptr, bool found)
 						  "orioledb_meta");
 	LWLockRegisterTranche(checkpoint_state->punchHolesTrancheId,
 						  "PunchHolesTranche");
+	LWLockRegisterTranche(checkpoint_state->validationBoundaryTrancheId,
+						  "ValidationBoundaryTranche");
 	LWLockRegisterTranche(checkpoint_state->oXidQueueTrancheId,
 						  "OXidQueueTranche");
 	LWLockRegisterTranche(checkpoint_state->oXidQueueFlushTrancheId,

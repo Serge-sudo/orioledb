@@ -189,6 +189,7 @@ typedef struct
 	int			copyBlknoTrancheId;
 	int			oMetaTrancheId;
 	int			punchHolesTrancheId;
+	int			validationBoundaryTrancheId;
 	pg_atomic_uint64 xidRecLastPos;
 	pg_atomic_uint64 xidRecFlushPos;
 	XidFileRec	xidRecQueue[FLEXIBLE_ARRAY_MEMBER];
