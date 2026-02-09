@@ -696,6 +696,36 @@ o_btree_modify_insert_update(BTreeModifyInternalContext *context)
 	BTreeDescr *desc = pageFindContext->desc;
 	int			tuplen;
 
+	/*
+	 * For secondary indexes during concurrent index build validation,
+	 * check if the PK satisfies the validation boundary WHILE HOLDING PAGE LOCK.
+	 * If not, unlock and skip the operation - the validator will handle it.
+	 */
+	if (desc->type != oIndexPrimary && desc->arg != NULL)
+	{
+		OTableDescr *tableDescr = (OTableDescr *) desc->arg;
+		BTreeDescr *primaryDesc = &GET_PRIMARY(tableDescr)->desc;
+		OTuple		pkTuple;
+		bool		pkSatisfiesBoundary;
+		
+		/* Extract PK from the tuple being inserted/updated */
+		pkTuple = o_btree_tuple_make_key(desc, context->tuple, NULL, false, NULL);
+		
+		/* Check validation boundary while holding the page lock */
+		pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(primaryDesc, pkTuple);
+		
+		if (!pkSatisfiesBoundary)
+		{
+			/*
+			 * PK is beyond the validation boundary. The validator hasn't
+			 * processed this PK yet, so we should not modify the secondary index.
+			 * Unlock and return - the validator will add this entry later.
+			 */
+			unlock_release(context, true);
+			return;
+		}
+	}
+
 	if (context->undoIsReserved && context->needsUndo)
 	{
 		o_btree_modify_add_undo_record(context);
@@ -792,6 +822,36 @@ o_btree_modify_delete(BTreeModifyInternalContext *context)
 	page = O_GET_IN_MEMORY_PAGE(blkno);
 
 	BTREE_PAGE_READ_LEAF_ITEM(tuphdr, curTuple, page, &loc);
+
+	/*
+	 * For secondary indexes during concurrent index build validation,
+	 * check if the PK satisfies the validation boundary WHILE HOLDING PAGE LOCK.
+	 * If not, unlock and skip the operation - the validator will handle it.
+	 */
+	if (desc->type != oIndexPrimary && desc->arg != NULL)
+	{
+		OTableDescr *tableDescr = (OTableDescr *) desc->arg;
+		BTreeDescr *primaryDesc = &GET_PRIMARY(tableDescr)->desc;
+		OTuple		pkTuple;
+		bool		pkSatisfiesBoundary;
+		
+		/* Extract PK from the tuple being deleted */
+		pkTuple = o_btree_tuple_make_key(desc, curTuple, NULL, false, NULL);
+		
+		/* Check validation boundary while holding the page lock */
+		pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(primaryDesc, pkTuple);
+		
+		if (!pkSatisfiesBoundary)
+		{
+			/*
+			 * PK is beyond the validation boundary. The validator hasn't
+			 * processed this PK yet, so there's nothing to delete from the
+			 * secondary index. Unlock and return success.
+			 */
+			unlock_release(context, true);
+			return OBTreeModifyResultDeleted;
+		}
+	}
 
 	if (!context->needsUndo)
 	{

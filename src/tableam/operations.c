@@ -1296,50 +1296,25 @@ o_tbl_index_delete(OIndexDescr *id, OIndexNumber ix_num, TupleTableSlot *slot,
 
 	/*
 	 * For secondary indexes during concurrent index build validation,
-	 * check if the primary key is within the validation boundary.
-	 * Create an undo record tracking whether we actually performed the operation.
-	 * 
-	 * NOTE: This check happens without holding a page lock. The boundary could
-	 * advance between check and operation, but this is safe - rollback will
-	 * recheck with proper locking to handle validator-added entries correctly.
+	 * we create an undo record tracking the operation. The boundary check
+	 * will happen later when the page lock is held.
 	 */
 	if (id->desc.type != oIndexPrimary && ix_num != BridgeIndexNumber)
 	{
 		OTableDescr *descr = (OTableDescr *) id->desc.arg;
-		OTuple		pkTuple;
-		OBTreeKeyBound pkBound;
-		bool		pkSatisfiesBoundary;
 
 		if (descr != NULL)
 		{
-			tts_orioledb_fill_key_bound(slot, GET_PRIMARY(descr), &pkBound);
-			pkTuple.data = (Pointer) &pkBound;
-			pkTuple.formatFlags = 0;
-
-			pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(&GET_PRIMARY(descr)->desc, pkTuple);
-
 			/*
 			 * Create undo record for this secondary index operation.
-			 * Record whether we actually performed it or skipped due to boundary.
+			 * The undo record will track what actually happened during the operation.
 			 */
 			if (ix_num > 0 && ix_num < descr->nIndices)  /* Valid secondary index */
 			{
 				make_secondary_index_undo_record(descr, ix_num,
 												 BTreeOperationDelete,
 												 slot,
-												 pkSatisfiesBoundary);
-			}
-
-			if (!pkSatisfiesBoundary)
-			{
-				/*
-				 * PK is beyond the validation boundary. Return success without
-				 * deleting - the validator hasn't added this entry yet.
-				 * The undo record tracks that we skipped this operation.
-				 */
-				memset(&result, 0, sizeof(result));
-				result.success = true;
-				return result;
+												 true);  /* Will be updated based on actual result */
 			}
 		}
 	}
@@ -1441,32 +1416,14 @@ o_tbl_index_insert(OTableDescr *descr,
 
 	if (!primary)
 	{
-		OTuple		pkTuple;
-		OBTreeKeyBound pkBound;
-		bool		pkSatisfiesBoundary;
 		OIndexNumber indexNum = InvalidIndexNumber;
 
 		/*
 		 * For secondary indexes during concurrent index build validation,
-		 * check if the primary key is within the validation boundary.
-		 * Create an undo record tracking whether we actually performed the operation.
-		 * 
-		 * NOTE: This check happens without holding a page lock. In theory, the
-		 * boundary could advance between this check and the actual btree operation.
-		 * However, this is acceptable because:
-		 * 1. If boundary advances after check but before operation, we might skip
-		 *    an operation that the validator will also do - this is safe (idempotent)
-		 * 2. The undo record tracks what we decided, and rollback will recheck
-		 *    with proper locking to handle validator-added entries correctly
-		 * 3. The performance benefit of early return outweighs the complexity of
-		 *    passing boundary check into the locked btree operation
+		 * we create an undo record tracking the operation. This allows proper
+		 * rollback handling if the validator adds entries concurrently.
 		 */
-		tts_orioledb_fill_key_bound(slot, GET_PRIMARY(descr), &pkBound);
-		pkTuple.data = (Pointer) &pkBound;
-		pkTuple.formatFlags = 0;
-
-		pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(&GET_PRIMARY(descr)->desc, pkTuple);
-
+		
 		/* Find the index number in the descriptor's indices array */
 		for (OIndexNumber i = 0; i < descr->nIndices; i++)
 		{
@@ -1479,25 +1436,15 @@ o_tbl_index_insert(OTableDescr *descr,
 
 		/*
 		 * Create undo record for this secondary index operation.
-		 * Record whether we actually performed it or skipped due to boundary.
+		 * The undo record will track what actually happened during the operation.
+		 * The boundary check will occur later when the page lock is held.
 		 */
 		if (indexNum != InvalidIndexNumber && indexNum > 0)  /* Skip primary at index 0 */
 		{
 			make_secondary_index_undo_record(descr, indexNum,
 											 BTreeOperationInsert,
 											 slot,
-											 pkSatisfiesBoundary);
-		}
-
-		if (!pkSatisfiesBoundary)
-		{
-			/*
-			 * PK is beyond the validation boundary. Return success without
-			 * modifying the secondary index - the validator will handle this entry.
-			 * The undo record tracks that we skipped this operation.
-			 */
-			((OTableSlot *) slot)->version = 0;
-			return OBTreeModifyResultInserted;
+											 true);  /* Will be set by btree_modify based on actual result */
 		}
 
 		if (own_tup)
