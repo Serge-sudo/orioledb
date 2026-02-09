@@ -1549,10 +1549,23 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 
 	if (concurrent)
 	{
+		/*
+		 * Capture undo2 after the index is attached and ready to receive updates.
+		 * This marks the end of the concurrent build window. Any tuples with
+		 * undoLocation between undo1 and undo2 were modified during the concurrent
+		 * index build and need to be validated.
+		 */
+		UndoStackLocations undoLocs = get_cur_undo_locations(UndoLogTypeHeap);
+		buildstate.undo2 = undoLocs.location;
+		
 		buildstate.concurrentStage = 2;
-		buildstate.noncomplete_xact_exists = false;
-		noncomplete_xact_tupstore = NULL;
-		noncomplete_xact_tupdesc = NULL;
+		buildstate.noncomplete_xact = false;
+		buildstate.noncomplete_xact_tupstore = NULL;
+		buildstate.noncomplete_xact_tupdesc = NULL;
+
+		/* Initialize validation boundary to 0 (start of PK range) */
+		if (buildstate.btleader && buildstate.btleader->btshared)
+			pg_atomic_init_u64(&buildstate.btleader->btshared->validation_boundary, 0);
 
 		/* Begin serial stage2 tuplesort */
 		sortstates = palloc0(sizeof(Pointer));
@@ -1570,12 +1583,55 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 		pfree(sortstates);
 
 		/*
-		 * Wait for all xacts for tuples between undo1 and undo2 finished. If rolled back then delete inserted tuple
-		 * from index
+		 * Wait for all transactions affecting tuples between undo1 and undo2 to finish.
+		 * If a transaction rolls back, we need to remove the tuple that the validator
+		 * added to the secondary index.
 		 */
-		if (buildstate.noncomplete_xact_exists)
+		if (buildstate.noncomplete_xact && buildstate.noncomplete_xact_tupstore)
 		{
+			TupleTableSlot *slot;
+			bool		isnull;
+			OTuple		secondaryTup;
 			
+			/* Create a slot for reading from the tuplestore */
+			slot = MakeSingleTupleTableSlot(buildstate.noncomplete_xact_tupdesc, &TTSOpsMinimalTuple);
+			
+			/* Rewind the tuplestore to the beginning */
+			tuplestore_rescan(buildstate.noncomplete_xact_tupstore);
+			
+			/*
+			 * Process each stored tuple. For each tuple, check if the transaction
+			 * committed or rolled back, and handle accordingly.
+			 */
+			while (tuplestore_gettupleslot(buildstate.noncomplete_xact_tupstore, true, false, slot))
+			{
+				OTupleXactInfo xactInfo;
+				OXid		oxid;
+				CommitSeqNo	csn;
+				int			natts = buildstate.noncomplete_xact_tupdesc->natts;
+				
+				/* Last attribute is the xactInfo */
+				xactInfo = DatumGetUInt64(slot_getattr(slot, natts, &isnull));
+				Assert(!isnull);
+				
+				oxid = XACT_INFO_GET_OXID(xactInfo);
+				csn = oxid_get_csn(oxid);
+				
+				/* Check if transaction was aborted */
+				if (COMMITSEQNO_IS_ABORTED(csn))
+				{
+					/*
+					 * Transaction rolled back. The validator added this tuple
+					 * to the secondary index, so we need to remove it.
+					 * TODO: Implement tuple removal from secondary index.
+					 */
+					elog(WARNING, "Transaction rollback during concurrent index build - tuple removal not fully implemented yet");
+				}
+				/* If committed (COMMITSEQNO_IS_COMMITTED), the tuple is already correctly in the index */
+			}
+			
+			ExecDropSingleTupleTableSlot(slot);
+			tuplestore_end(buildstate.noncomplete_xact_tupstore);
 		}
 	}
 
