@@ -1457,16 +1457,11 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 	O_LOAD_SNAPSHOT(&oSnapshot, snapshot);
 	
-	/*
-	 * Validation boundary is initially not set (validationBoundaryLen == 0).
-	 * It will be updated as we progress through the primary key scan, allowing
-	 * concurrent transactions to modify secondary index entries for PKs that
-	 * we have already validated.
-	 */
-	
 	/* 
 	 * Use iterator instead of sequential scan to ensure tuples are returned
 	 * in primary key order. This is essential for the merge join algorithm.
+	 * The validation boundary starts unset (validationBoundaryLen == 0) and
+	 * will be updated as we progress through the scan.
 	 */
 	iterator = o_btree_iterator_create(&GET_PRIMARY(descr)->desc, NULL, BTreeKeyNone,
 									   &oSnapshot, ForwardScanDirection);

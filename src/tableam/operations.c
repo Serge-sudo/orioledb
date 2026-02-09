@@ -1399,11 +1399,22 @@ o_tbl_index_insert(OTableDescr *descr,
 		 * check if the primary key is within the validation boundary.
 		 * If PK > boundary, concurrent transactions should not modify this
 		 * secondary index entry yet, as the validator hasn't processed it.
+		 *
+		 * TODO: Handle rollback case properly. If we skip secondary insert here
+		 * because PK > boundary, but later the validator adds the entry, and then
+		 * our transaction rolls back, we need to remove the validator's entry.
+		 * This requires storing state about skipped inserts and checking during
+		 * rollback if the validator has since processed this PK.
 		 */
 		tts_orioledb_fill_key_bound(slot, GET_PRIMARY(descr), &pkBound);
 		pkTuple.data = (Pointer) &pkBound;
 		pkTuple.formatFlags = 0;
 
+		/*
+		 * Note: pkTuple.data points to stack memory (pkBound), but this is safe
+		 * because btree_pk_satisfies_validation_boundary() only uses it for
+		 * immediate comparison and doesn't store the pointer.
+		 */
 		if (!btree_pk_satisfies_validation_boundary(&GET_PRIMARY(descr)->desc, pkTuple))
 		{
 			/*

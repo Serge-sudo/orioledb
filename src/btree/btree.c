@@ -426,8 +426,9 @@ btree_set_validation_boundary(BTreeDescr *desc, OTuple boundary)
 	Assert(!O_TUPLE_IS_NULL(boundary));
 
 	boundaryLen = o_btree_len(desc, boundary, OTupleLength);
-	if (boundaryLen > sizeof(metaPage->validationBoundaryData))
-		elog(ERROR, "validation boundary tuple too large: %d bytes", boundaryLen);
+	if (boundaryLen > MAX_VALIDATION_BOUNDARY_SIZE)
+		elog(ERROR, "validation boundary tuple too large: %d bytes (maximum: %d bytes)",
+			 boundaryLen, MAX_VALIDATION_BOUNDARY_SIZE);
 
 	metaPage = BTREE_GET_META(desc);
 	LWLockAcquire(&metaPage->validationBoundaryLock, LW_EXCLUSIVE);
@@ -506,7 +507,7 @@ btree_pk_satisfies_validation_boundary(BTreeDescr *desc, OTuple pk)
 	BTreeMetaPage *metaPage;
 	OTuple		boundary;
 	uint16		len;
-	char		boundaryData[256];
+	char		boundaryData[MAX_VALIDATION_BOUNDARY_SIZE];
 	int			cmp;
 
 	Assert(desc != NULL);

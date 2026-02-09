@@ -18,6 +18,7 @@
 #include "s3/queue.h"
 
 #define NUM_SEQ_SCANS_ARRAY_SIZE	32
+#define MAX_VALIDATION_BOUNDARY_SIZE 256	/* Maximum size of serialized PK tuple for validation boundary */
 
 /* The structure of BTree meta page.  Referenced by metaPageBlkno. */
 typedef struct
@@ -64,7 +65,7 @@ typedef struct
 	 */
 	LWLock		validationBoundaryLock;
 	uint16		validationBoundaryLen;
-	char		validationBoundaryData[256];	/* Serialized PK tuple */
+	char		validationBoundaryData[MAX_VALIDATION_BOUNDARY_SIZE];
 } BTreeMetaPage;
 
 StaticAssertDecl(sizeof(BTreeMetaPage) <= ORIOLEDB_BLCKSZ,
