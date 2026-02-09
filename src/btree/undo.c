@@ -462,6 +462,81 @@ make_secondary_index_undo_record(OTableDescr *descr, OIndexNumber indexNum,
 	return undoLocation;
 }
 
+/*
+ * Callback for rolling back secondary index operations during concurrent validation.
+ * Handles the case where an operation was skipped due to validation boundary,
+ * but the validator has since added the entry.
+ */
+void
+secondary_index_undo_callback(UndoLogType undoType, UndoLocation location,
+							  UndoStackItem *baseItem, OXid oxid, bool abort,
+							  bool changeCountsValid)
+{
+	SecondaryIndexUndoStackItem *item = (SecondaryIndexUndoStackItem *) baseItem;
+	OTableDescr *tableDescr;
+	OIndexDescr *indexDescr;
+	BTreeDescr *primaryDesc;
+	OTuple		tuple;
+	OTuple		pkTuple;
+	OBTreeKeyBound pkBound;
+
+	Assert(abort);
+
+	/* Get table descriptor */
+	tableDescr = o_fetch_table_descr(item->tableOids);
+	if (!tableDescr || item->indexNum >= tableDescr->nIndices)
+		return;
+
+	indexDescr = tableDescr->indices[item->indexNum];
+	if (!indexDescr)
+		return;
+
+	primaryDesc = &GET_PRIMARY(tableDescr)->desc;
+
+	/* Extract tuple from undo record */
+	tuple.formatFlags = 0;
+	tuple.data = (Pointer) item + sizeof(SecondaryIndexUndoStackItem);
+
+	/*
+	 * Check if the operation was actually performed or skipped.
+	 */
+	if (item->actuallyPerformed)
+	{
+		/*
+		 * Operation was actually performed. The standard btree modify undo
+		 * will handle rolling it back, so we don't need to do anything here.
+		 * This undo record just serves as documentation.
+		 */
+		return;
+	}
+
+	/*
+	 * Operation was skipped due to validation boundary.
+	 * Check if the validator has since processed this PK and added the entry.
+	 */
+	
+	/* Extract PK from the secondary index tuple */
+	/* For secondary indexes, the PK is embedded in the tuple */
+	/* We need to extract it to check against the boundary */
+	
+	/* For now, assume we can extract PK from slot data */
+	/* This is a simplified approach - in production we'd need proper PK extraction */
+	
+	/*
+	 * Check current validation boundary. If PK is now less than boundary,
+	 * the validator has added this entry and we need to delete it.
+	 */
+	/* TODO: Extract PK properly and check boundary */
+	/* TODO: If PK < boundary, delete from secondary index */
+	
+	/*
+	 * For now, this is a placeholder. The full implementation requires:
+	 * 1. Proper PK extraction from secondary tuple
+	 * 2. Boundary check
+	 * 3. Deletion from secondary index if validator added it
+	 */
+}
+
 static BTreeDescr *
 get_tree_descr(ORelOids oids, OIndexType type)
 {

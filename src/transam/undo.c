@@ -150,6 +150,11 @@ UndoItemTypeDescr undoItemTypeDescrs[] = {
 		.callback = o_invalidate_comparator_callback,
 		.callOnCommit = true
 	},
+	{
+		.type = SecondaryIndexUndoItemType,
+		.callback = secondary_index_undo_callback,
+		.callOnCommit = false
+	},
 };
 
 

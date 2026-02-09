@@ -160,6 +160,12 @@ extern void lock_undo_callback(UndoLogType undoType, UndoLocation location,
 							   UndoStackItem *baseItem,
 							   OXid oxid, bool abort,
 							   bool changeCountsValid);
+extern void secondary_index_undo_callback(UndoLogType undoType,
+										  UndoLocation location,
+										  UndoStackItem *baseItem,
+										  OXid oxid,
+										  bool abort,
+										  bool changeCountsValid);
 extern void btree_relnode_undo_callback(UndoLogType undoType,
 										UndoLocation location,
 										UndoStackItem *baseItem, OXid oxid,
