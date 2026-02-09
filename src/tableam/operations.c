@@ -1391,6 +1391,29 @@ o_tbl_index_insert(OTableDescr *descr,
 
 	if (!primary)
 	{
+		OTuple		pkTuple;
+		OBTreeKeyBound pkBound;
+
+		/*
+		 * For secondary indexes during concurrent index build validation,
+		 * check if the primary key is within the validation boundary.
+		 * If PK > boundary, concurrent transactions should not modify this
+		 * secondary index entry yet, as the validator hasn't processed it.
+		 */
+		tts_orioledb_fill_key_bound(slot, GET_PRIMARY(descr), &pkBound);
+		pkTuple.data = (Pointer) &pkBound;
+		pkTuple.formatFlags = 0;
+
+		if (!btree_pk_satisfies_validation_boundary(&GET_PRIMARY(descr)->desc, pkTuple))
+		{
+			/*
+			 * PK is beyond the validation boundary. Return success without
+			 * modifying the secondary index - the validator will handle this entry.
+			 */
+			((OTableSlot *) slot)->version = 0;
+			return OBTreeModifyResultInserted;
+		}
+
 		if (own_tup)
 		{
 			fill_key_bound(slot, id, &knew);

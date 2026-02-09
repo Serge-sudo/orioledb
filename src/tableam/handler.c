@@ -1457,6 +1457,13 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 	O_LOAD_SNAPSHOT(&oSnapshot, snapshot);
 	
+	/*
+	 * Validation boundary is initially not set (validationBoundaryLen == 0).
+	 * It will be updated as we progress through the primary key scan, allowing
+	 * concurrent transactions to modify secondary index entries for PKs that
+	 * we have already validated.
+	 */
+	
 	/* 
 	 * Use iterator instead of sequential scan to ensure tuples are returned
 	 * in primary key order. This is essential for the merge join algorithm.
@@ -1558,9 +1565,22 @@ orioledb_index_validate_scan(Relation heapRelation,
 			break;
 		}
 
+		/*
+		 * Update the validation boundary to the current PK tuple.
+		 * This allows concurrent transactions to modify secondary index entries
+		 * for this and earlier PKs, since we've now validated them.
+		 */
+		btree_set_validation_boundary(&GET_PRIMARY(descr)->desc, heapTuple);
+
 		ExecClearTuple(primarySlot);
 		pfree(tup.data);
 	}
+
+	/*
+	 * Clear the validation boundary - validation is now complete.
+	 * All concurrent transactions can now freely modify all secondary index entries.
+	 */
+	btree_clear_validation_boundary(&GET_PRIMARY(descr)->desc);
 
 	ExecDropSingleTupleTableSlot(primarySlot);
 	FreeExecutorState(estate);
