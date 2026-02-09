@@ -1444,6 +1444,9 @@ orioledb_index_validate_scan(Relation heapRelation,
 	OSnapshot	oSnapshot;
 	Datum		heapRowIdDatum;
 	bool		rowIdIsNull;
+	OIndexDescr *index_descr;
+	uint64		pk_counter = 0;
+	ORelOids	index_oids;
 
 	Assert(state != NULL);
 	Assert(state->tuplesort != NULL);
@@ -1454,6 +1457,15 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 	descr = relation_get_descr(heapRelation);
 	Assert(descr != NULL);
+	
+	/* Get the index descriptor being validated */
+	ORelOidsSetFromRel(index_oids, indexRelation);
+	index_descr = o_fetch_index_descr(index_oids, oIndexInvalid, false, NULL);
+	if (index_descr == NULL)
+		elog(ERROR, "index descriptor not found for index %u", indexRelation->rd_id);
+
+	/* Initialize validation boundary to 0 - no validation done yet */
+	btree_set_validation_boundary(&index_descr->desc, 0);
 
 	O_LOAD_SNAPSHOT(&oSnapshot, snapshot);
 	
@@ -1484,6 +1496,19 @@ orioledb_index_validate_scan(Relation heapRelation,
 		tts_orioledb_store_tuple(primarySlot, tup, descr, tupleCsn, PrimaryIndexNumber, true, &hint);
 		slot_getallattrs(primarySlot);
 		state->htups++;
+
+		/*
+		 * Update validation boundary periodically as we progress through the PK.
+		 * This allows concurrent transactions to modify secondary index entries
+		 * for PKs that have already been validated.
+		 * We use a simple counter-based encoding for now.
+		 */
+		pk_counter++;
+		if (pk_counter % 1000 == 0)
+		{
+			/* Update boundary to allow concurrent modifications up to this PK */
+			btree_set_validation_boundary(&index_descr->desc, pk_counter);
+		}
 
 		MemoryContextReset(econtext->ecxt_per_tuple_memory);
 
@@ -1565,6 +1590,12 @@ orioledb_index_validate_scan(Relation heapRelation,
 	ExecDropSingleTupleTableSlot(primarySlot);
 	FreeExecutorState(estate);
 	btree_iterator_free(iterator);
+	
+	/*
+	 * Set final validation boundary to UINT64_MAX to indicate validation is complete
+	 * and all concurrent modifications are now allowed.
+	 */
+	btree_set_validation_boundary(&index_descr->desc, UINT64_MAX);
 }
 
 

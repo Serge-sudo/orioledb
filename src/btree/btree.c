@@ -309,6 +309,67 @@ btree_bridge_ctid_get_and_inc(BTreeDescr *desc, bool *overflow)
 	return result;
 }
 
+/*
+ * Get the current validation boundary for concurrent index build.
+ * Returns the encoded pk value up to which validation has been completed.
+ */
+uint64
+btree_get_validation_boundary(BTreeDescr *desc)
+{
+	BTreeMetaPage *metaPageBlkno = BTREE_GET_META(desc);
+
+	Assert(ORootPageIsValid(desc) && OMetaPageIsValid(desc));
+	return pg_atomic_read_u64(&metaPageBlkno->validation_boundary);
+}
+
+/*
+ * Set the validation boundary for concurrent index build.
+ * This should be called by the validator as it progresses through the pk.
+ */
+void
+btree_set_validation_boundary(BTreeDescr *desc, uint64 boundary)
+{
+	BTreeMetaPage *metaPageBlkno = BTREE_GET_META(desc);
+
+	Assert(ORootPageIsValid(desc) && OMetaPageIsValid(desc));
+	pg_atomic_write_u64(&metaPageBlkno->validation_boundary, boundary);
+}
+
+/*
+ * Check if a primary key is allowed to be modified based on the validation boundary.
+ * Returns true if the pk is less than the current boundary (meaning the validator
+ * has already processed this range and concurrent modifications are allowed).
+ * Returns false if pk is greater than or equal to the boundary.
+ * 
+ * For now, we use a simple numeric comparison. In a more complete implementation,
+ * this would need to properly encode/compare complex pk tuples.
+ */
+bool
+btree_check_pk_against_boundary(BTreeDescr *desc, OTuple pk)
+{
+	uint64		boundary;
+	uint64		pk_encoded;
+
+	/* If no validation is in progress, allow all modifications */
+	boundary = btree_get_validation_boundary(desc);
+	if (boundary == 0)
+		return true;
+
+	/*
+	 * Simplified encoding: For now, we assume pk can be encoded as uint64.
+	 * In a complete implementation, this needs proper tuple comparison logic.
+	 * This is a placeholder that would need to be replaced with proper
+	 * pk encoding based on the index key structure.
+	 */
+	if (pk.data == NULL || desc->ops->len(desc, pk, OKeyLength) == 0)
+		return true;
+
+	/* TODO: Implement proper pk encoding based on index structure */
+	pk_encoded = 0; /* Placeholder */
+
+	return pk_encoded < boundary;
+}
+
 static inline OIndexDescr *
 o_get_tree_def(BTreeDescr *desc)
 {

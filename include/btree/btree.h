@@ -362,6 +362,9 @@ extern void o_btree_cleanup_pages(OInMemoryBlkno root, OInMemoryBlkno metaPageBl
 extern ItemPointerData btree_ctid_get_and_inc(BTreeDescr *desc);
 extern ItemPointerData btree_bridge_ctid_get_and_inc(BTreeDescr *desc, bool *overflow);
 extern void btree_ctid_update_if_needed(BTreeDescr *desc, ItemPointerData ctid);
+extern uint64 btree_get_validation_boundary(BTreeDescr *desc);
+extern void btree_set_validation_boundary(BTreeDescr *desc, uint64 boundary);
+extern bool btree_check_pk_against_boundary(BTreeDescr *desc, OTuple pk);
 extern void btree_desc_stopevent_params_internal(BTreeDescr *desc,
 												 JsonbParseState **state);
 extern void btree_page_stopevent_params_internal(BTreeDescr *desc, Page p,
