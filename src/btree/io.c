@@ -2425,6 +2425,7 @@ evict_btree(BTreeDescr *desc, uint32 checkpoint_number)
 	file_header.leafPagesNum = pg_atomic_read_u32(&metaPage->leafPagesNum);
 	file_header.ctid = pg_atomic_read_u64(&metaPage->ctid);
 	file_header.bridgeCtid = pg_atomic_read_u64(&metaPage->bridge_ctid);
+	file_header.validationBoundary = pg_atomic_read_u64(&metaPage->validation_boundary);
 	file_header.numFreeBlocks = pg_atomic_read_u64(&metaPage->numFreeBlocks);
 #ifdef USE_ASSERT_CHECKING
 	for (i = 0; i < NUM_SEQ_SCANS_ARRAY_SIZE; i++)

@@ -43,6 +43,15 @@ typedef struct
 	pg_atomic_uint64 bridge_ctid;
 	pg_atomic_uint32 leafPagesNum;
 
+	/*
+	 * Validation boundary for concurrent index build.
+	 * Indicates the current position (as encoded pk) up to which the validator
+	 * has processed tuples in the validation phase. Concurrent transactions
+	 * can only modify secondary index entries if their target pk is less than
+	 * this boundary.
+	 */
+	pg_atomic_uint64 validation_boundary;
+
 	/* Number of running sequential scans depending on the checkpoint number */
 	pg_atomic_uint32 numSeqScans[NUM_SEQ_SCANS_ARRAY_SIZE];
 

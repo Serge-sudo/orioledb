@@ -2545,6 +2545,7 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 	header.leafPagesNum = pg_atomic_read_u32(&meta_page->leafPagesNum);
 	header.ctid = pg_atomic_read_u64(&meta_page->ctid);
 	header.bridgeCtid = pg_atomic_read_u64(&meta_page->bridge_ctid);
+	header.validationBoundary = pg_atomic_read_u64(&meta_page->validation_boundary);
 
 	if (!orioledb_s3_mode && !is_compressed)
 	{
@@ -5246,6 +5247,7 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 	pg_atomic_write_u32(&meta_page->leafPagesNum, file_header.leafPagesNum);
 	pg_atomic_write_u64(&meta_page->ctid, file_header.ctid);
 	pg_atomic_write_u64(&meta_page->bridge_ctid, file_header.bridgeCtid);
+	pg_atomic_write_u64(&meta_page->validation_boundary, file_header.validationBoundary);
 
 	if (*evicted_data)
 	{

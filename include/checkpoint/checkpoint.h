@@ -25,6 +25,7 @@ struct CheckpointFileHeader
 {
 	uint64		ctid;
 	uint64		bridgeCtid;
+	uint64		validationBoundary;
 	uint64		rootDownlink;
 	uint64		datafileLength;
 	uint64		numFreeBlocks;
