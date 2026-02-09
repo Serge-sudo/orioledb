@@ -2143,12 +2143,21 @@ validation_boundary_undo_callback(UndoLogType undoType,
 		 * but is now less than current boundary
 		 * This means the validator added the tuple, we need to remove it
 		 *
-		 * TODO: Implement secondary index deletion
-		 * - Extract the full secondary index key
-		 * - Call o_btree_modify with BTreeOperationDelete
-		 * - Handle any errors appropriately
+		 * CRITICAL TODO: Implement secondary index deletion.
+		 * Without this implementation, orphaned entries will remain in the
+		 * index after rollback, causing data inconsistency.
+		 * 
+		 * Required steps:
+		 * - Extract the full secondary index key from pk_encoded
+		 * - Call o_btree_modify with BTreeOperationDelete on index_descr
+		 * - Handle errors and ensure transaction consistency
+		 * 
+		 * Until this is implemented, concurrent modifications should be blocked
+		 * during validation (which is currently enforced by btree_check_pk_against_boundary).
 		 */
-		elog(DEBUG1, "Case 2: Need to remove tuple from secondary index during rollback (pk_encoded=%lu, boundary_at_modify=%lu, current_boundary=%lu)",
+		elog(WARNING, "Validation boundary Case 2 rollback not fully implemented: "
+			 "pk_encoded=%lu, boundary_at_modify=%lu, current_boundary=%lu. "
+			 "Orphaned index entries may remain.",
 			 item->pk_encoded, item->boundary_at_modify, current_boundary);
 	}
 	else

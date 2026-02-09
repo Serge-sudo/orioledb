@@ -352,7 +352,7 @@ btree_check_pk_against_boundary(BTreeDescr *desc, OTuple pk)
 
 	/* If no validation is in progress, allow all modifications */
 	boundary = btree_get_validation_boundary(desc);
-	if (boundary == 0)
+	if (boundary == VALIDATION_BOUNDARY_NONE || boundary == VALIDATION_BOUNDARY_COMPLETE)
 		return true;
 
 	/*
@@ -360,12 +360,19 @@ btree_check_pk_against_boundary(BTreeDescr *desc, OTuple pk)
 	 * In a complete implementation, this needs proper tuple comparison logic.
 	 * This is a placeholder that would need to be replaced with proper
 	 * pk encoding based on the index key structure.
+	 * 
+	 * TODO: Implement proper pk encoding based on index structure.
+	 * Until proper encoding is implemented, conservatively block all modifications
+	 * during validation to maintain correctness.
 	 */
 	if (pk.data == NULL || desc->ops->len(desc, pk, OKeyLength) == 0)
 		return true;
 
-	/* TODO: Implement proper pk encoding based on index structure */
-	pk_encoded = 0; /* Placeholder */
+	/* 
+	 * Placeholder: Return false to block modifications during validation
+	 * until proper PK encoding is implemented. This is safe but overly restrictive.
+	 */
+	pk_encoded = UINT64_MAX;  /* Forces all modifications to be blocked */
 
 	return pk_encoded < boundary;
 }

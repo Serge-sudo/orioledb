@@ -38,6 +38,12 @@ typedef uint64 OTupleXactInfo;
 #define TOASTIndexNumber (0xFFFE)
 #define InvalidIndexNumber (0xFFFF)
 
+/*
+ * Validation boundary constants for concurrent index build.
+ */
+#define VALIDATION_BOUNDARY_NONE (0)		/* No validation in progress */
+#define VALIDATION_BOUNDARY_COMPLETE (UINT64_MAX)	/* Validation complete, all modifications allowed */
+
 typedef enum BTreeKeyType
 {
 	BTreeKeyLeafTuple,

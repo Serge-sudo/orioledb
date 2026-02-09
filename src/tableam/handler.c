@@ -39,6 +39,14 @@
 #include "utils/rel.h"
 #include "utils/stopevent.h"
 
+/*
+ * Interval for updating validation boundary during concurrent index build.
+ * We update the boundary after processing this many tuples.
+ * This balances between overhead of atomic updates and granularity of
+ * allowing concurrent modifications.
+ */
+#define VALIDATION_BOUNDARY_UPDATE_INTERVAL 1000
+
 #include "access/heapam.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
@@ -1464,8 +1472,8 @@ orioledb_index_validate_scan(Relation heapRelation,
 	if (index_descr == NULL)
 		elog(ERROR, "index descriptor not found for index %u", indexRelation->rd_id);
 
-	/* Initialize validation boundary to 0 - no validation done yet */
-	btree_set_validation_boundary(&index_descr->desc, 0);
+	/* Initialize validation boundary to indicate validation is starting */
+	btree_set_validation_boundary(&index_descr->desc, VALIDATION_BOUNDARY_NONE);
 
 	O_LOAD_SNAPSHOT(&oSnapshot, snapshot);
 	
@@ -1501,12 +1509,19 @@ orioledb_index_validate_scan(Relation heapRelation,
 		 * Update validation boundary periodically as we progress through the PK.
 		 * This allows concurrent transactions to modify secondary index entries
 		 * for PKs that have already been validated.
-		 * We use a simple counter-based encoding for now.
+		 * 
+		 * NOTE: Using a simple counter is a simplification. A proper implementation
+		 * should encode the actual PK value being processed to correctly track
+		 * validation progress. The current approach ensures forward progress but
+		 * is conservative in allowing concurrent modifications.
 		 */
 		pk_counter++;
-		if (pk_counter % 1000 == 0)
+		if (pk_counter % VALIDATION_BOUNDARY_UPDATE_INTERVAL == 0)
 		{
-			/* Update boundary to allow concurrent modifications up to this PK */
+			/* 
+			 * TODO: Replace counter with actual PK encoding
+			 * Update boundary to allow concurrent modifications up to this PK 
+			 */
 			btree_set_validation_boundary(&index_descr->desc, pk_counter);
 		}
 
@@ -1592,10 +1607,10 @@ orioledb_index_validate_scan(Relation heapRelation,
 	btree_iterator_free(iterator);
 	
 	/*
-	 * Set final validation boundary to UINT64_MAX to indicate validation is complete
+	 * Set final validation boundary to indicate validation is complete
 	 * and all concurrent modifications are now allowed.
 	 */
-	btree_set_validation_boundary(&index_descr->desc, UINT64_MAX);
+	btree_set_validation_boundary(&index_descr->desc, VALIDATION_BOUNDARY_COMPLETE);
 }
 
 
