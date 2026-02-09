@@ -452,6 +452,7 @@ o_tbl_insert_with_arbiter(Relation rel,
 	ioc_arg.lockMode = tuple_lock_mode_to_row_lock_mode(lockmode);
 	ioc_arg.scanSlot = lockedSlot;
 	ioc_arg.tupUndoLocation = InvalidUndoLocation;
+	ioc_arg.secondarySkipped = false;
 
 	while (true)
 	{
@@ -515,6 +516,15 @@ o_tbl_insert_with_arbiter(Relation rel,
 		if (success)
 		{
 			BTreeDescr *primary = &GET_PRIMARY(descr)->desc;
+
+			/*
+			 * Check if any secondary index operations were skipped due to validation boundary.
+			 * If so, mark the undo record so rollback can handle it properly.
+			 */
+			if (ioc_arg.secondarySkipped && UndoLocationIsValid(ioc_arg.tupUndoLocation))
+			{
+				set_undo_secondary_skipped(UndoLogRegular, ioc_arg.tupUndoLocation, true);
+			}
 
 			pgstat_count_heap_insert(rel, 1);
 
@@ -1451,14 +1461,14 @@ o_tbl_index_insert(OTableDescr *descr,
 			 * PK is beyond the validation boundary. Return success without
 			 * modifying the secondary index - the validator will handle this entry.
 			 *
-			 * TODO: On rollback, if the boundary has since progressed past this PK,
-			 * we need to remove the entry that the validator added. This requires
-			 * either:
-			 * 1. Storing skip information in the undo record
-			 * 2. Maintaining an auxiliary structure tracking skipped operations
-			 * 3. During rollback, checking current boundary and explicitly deleting
-			 *    from secondary indexes if PK < boundary
+			 * Mark the callback arg so the undo record can be updated.
 			 */
+			if (callbackInfo && callbackInfo->arg)
+			{
+				InsertOnConflictCallbackArg *ioc_arg = (InsertOnConflictCallbackArg *) callbackInfo->arg;
+				ioc_arg->secondarySkipped = true;
+			}
+
 			((OTableSlot *) slot)->version = 0;
 			return OBTreeModifyResultInserted;
 		}

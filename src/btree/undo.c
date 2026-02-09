@@ -357,6 +357,9 @@ make_undo_record(BTreeDescr *desc, OTuple tuple, bool is_tuple,
 		item->tuphdr.chainHasLocks = curTupHdr->chainHasLocks;
 	}
 
+	/* Initialize secondarySkipped to false by default */
+	item->secondarySkipped = false;
+
 	add_new_undo_stack_item(desc->undoType, undoLocation);
 
 	undoLocation += offsetof(BTreeModifyUndoStackItem, tuphdr);

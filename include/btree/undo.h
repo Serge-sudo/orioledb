@@ -60,6 +60,7 @@ typedef struct
 	OInMemoryBlkno blkno;
 	uint32		pageChangeCount;
 	BTreeLeafTuphdr tuphdr;
+	bool		secondarySkipped;	/* True if secondary index operation was skipped due to validation boundary */
 } BTreeModifyUndoStackItem;
 
 typedef struct
@@ -102,6 +103,9 @@ extern UndoLocation make_undo_record(BTreeDescr *desc, OTuple tuple,
 extern void make_waiter_undo_record(BTreeDescr *desc, OInMemoryBlkno blkno,
 									int pgprocno,
 									OPageWaiterShmemState *lockerState);
+extern void set_undo_secondary_skipped(UndoLogType undoType,
+									   UndoLocation undoLocation,
+									   bool skipped);
 extern void get_page_from_undo(BTreeDescr *desc, UndoLocation undo_loc, Pointer key,
 							   BTreeKeyType kind, Pointer dest,
 							   bool *is_left, bool *is_right, OFixedKey *lokey,
