@@ -1400,11 +1400,28 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 											 buildstate->noncomplete_xact_tupdesc, values, nulls);
 						pfree(values);
 						pfree(nulls);
+						
+						elog(DEBUG1, "Concurrent index build: stored incomplete transaction tuple (oxid=%lu, undoLocation=%lu) for later validation in index %s",
+							 (unsigned long)XACT_INFO_GET_OXID(tupHdr->xactInfo),
+							 (unsigned long)tupHdr->undoLocation,
+							 idx->name.data);
+					}
+					else
+					{
+						elog(DEBUG1, "Concurrent index build: adding tuple to secondary index %s (undoLocation in range [%lu, %lu], transaction finished)",
+							 idx->name.data,
+							 (unsigned long)buildstate->undo1,
+							 (unsigned long)buildstate->undo2);
 					}
 				}
 				else
 				{
-					/* Tuples inserted before undo1 and after ubdo2 are already in the index. Skip them. */
+					/* Tuples inserted before undo1 and after undo2 are already in the index. Skip them. */
+					elog(DEBUG2, "Concurrent index build: skipping tuple in index %s (undoLocation=%lu outside range [%lu, %lu])",
+						 idx->name.data,
+						 (unsigned long)tupHdr->undoLocation,
+						 (unsigned long)buildstate->undo1,
+						 (unsigned long)buildstate->undo2);
 					continue;
 				}
 			}
@@ -1610,6 +1627,8 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 			bool		isnull;
 			OTuple		secondaryTup;
 			int			deleted_count = 0;
+			int			committed_count = 0;
+			int			total_stored = 0;
 			
 			/* Create a slot for reading from the tuplestore */
 			slot = MakeSingleTupleTableSlot(buildstate.noncomplete_xact_tupdesc, &TTSOpsMinimalTuple);
@@ -1630,6 +1649,8 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 				Datum	   *values;
 				bool	   *nulls;
 				
+				total_stored++;
+				
 				/* Last attribute is the xactInfo */
 				xactInfo = DatumGetUInt64(slot_getattr(slot, natts + 1, &isnull));
 				Assert(!isnull);
@@ -1638,7 +1659,11 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 				
 				/* Wait for transaction to finish */
 				if (!xid_is_finished(oxid))
+				{
+					elog(DEBUG1, "Concurrent index build: waiting for transaction oxid=%lu to finish for index %s",
+						 (unsigned long)oxid, idx->name.data);
 					wait_for_oxid(oxid);
+				}
 				
 				csn = oxid_get_csn(oxid);
 				
@@ -1661,6 +1686,9 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 					/* Reconstruct the secondary tuple for deletion */
 					secondaryTup = o_form_tuple(&idx->leafSpec, values, nulls);
 					
+					elog(DEBUG1, "Concurrent index build: removing tuple from index %s (transaction oxid=%lu rolled back, validator had added it)",
+						 idx->name.data, (unsigned long)oxid);
+					
 					/* Delete the tuple from the secondary index */
 					o_btree_autonomous_delete(&idx->desc, secondaryTup, 
 											  BTreeKeyLeafTuple, NULL);
@@ -1671,14 +1699,18 @@ build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 					pfree(values);
 					pfree(nulls);
 				}
-				/* If committed (COMMITSEQNO_IS_COMMITTED), the tuple is already correctly in the index */
+				else if (COMMITSEQNO_IS_COMMITTED(csn))
+				{
+					/* Transaction committed, tuple is correctly in the index */
+					elog(DEBUG1, "Concurrent index build: keeping tuple in index %s (transaction oxid=%lu committed, validator had added it)",
+						 idx->name.data, (unsigned long)oxid);
+					committed_count++;
+				}
 			}
 			
-			if (deleted_count > 0)
-			{
-				elog(NOTICE, "Removed %d tuples from index %s due to transaction rollback during concurrent build",
-					 deleted_count, idx->name.data);
-			}
+			/* Log summary of incomplete transaction handling */
+			elog(NOTICE, "Concurrent index build for %s: processed %d incomplete transactions - %d committed (kept), %d aborted (removed)",
+				 idx->name.data, total_stored, committed_count, deleted_count);
 			
 			ExecDropSingleTupleTableSlot(slot);
 			tuplestore_end(buildstate.noncomplete_xact_tupstore);
