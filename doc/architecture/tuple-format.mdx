@@ -35,16 +35,94 @@ The tuple header is very compact at only **8 bytes** (after alignment with `Size
 
 ## Version Field and MVCC
 
-The `version` field in the tuple header plays a crucial role in OrioleDB's MVCC implementation:
+The `version` field in the tuple header plays a crucial role in OrioleDB's MVCC implementation. Unlike traditional PostgreSQL which stores transaction IDs (xmin/xmax) in tuple headers, OrioleDB uses a lightweight version number combined with undo log chains.
 
-- **Version Tracking**: Each tuple has a version number that is incremented when the tuple is updated. This allows OrioleDB to distinguish between different versions of the same row.
+### How Version Works
 
-- **Version Comparison**: When fetching tuples, OrioleDB can use the version field to determine which tuple version matches the required snapshot. See `o_tuple_get_version()` and `o_tuple_set_version()` functions in `src/tuple/format.c`.
+#### 1. **Version Assignment**
 
-- **Update Detection**: During updates, the version number is incremented by 1 to create a new tuple version:
+- **New tuples** start with version 0 when first inserted:
   ```c
-  o_tuple_set_version(&id->leafSpec, newtup, o_tuple_get_version(tup) + 1);
+  // Initial insert
+  tuple = o_form_tuple(descr, &spec, version=0, values, isnull, NULL);
   ```
+
+- **Updated tuples** increment the version number by 1 for each update within the same transaction:
+  ```c
+  // Update callback in src/tableam/operations.c
+  o_tuple_set_version(&id->leafSpec, newtup, 
+                      o_tuple_get_version(tup) + 1);
+  ```
+
+This creates a sequence: INSERT (v=0) → UPDATE (v=1) → UPDATE (v=2) → ...
+
+#### 2. **Version-Based Visibility**
+
+When fetching a specific row version, OrioleDB walks the undo log chain and uses version comparison to find the correct tuple:
+
+```c
+// fetch_row_version_callback in src/tableam/handler.c
+if (o_tuple_get_version(tuple) <= requested_version)
+    return OTupleFetchMatch;  // Found the right version
+else
+    return OTupleFetchNext;   // Keep searching in undo chain
+```
+
+This searches the undo chain for the **latest tuple version ≤ the requested version**, allowing point-in-time recovery of specific tuple states.
+
+#### 3. **Self-Update Optimization**
+
+Version numbers enable an important optimization: when the same transaction updates a tuple multiple times, OrioleDB can determine if an undo record is needed:
+
+```c
+// o_toast_needs_undo in src/tuple/toast.c
+if (oldDeleted && o_tuple_get_version(oldTuple) + 1 == o_tuple_get_version(newTuple))
+    return false;  // Same transaction self-update, no undo needed
+```
+
+If the version incremented by exactly 1, it's a self-update by the current transaction, so the old version doesn't need to be preserved in the undo log (it can be reconstructed).
+
+#### 4. **TOAST Coordination**
+
+For large objects stored via TOAST, the version field ensures that TOAST chunks match the primary tuple version:
+
+```c
+// tableVersionCallback in src/tuple/toast.c
+if (o_tuple_get_version(toast_chunk) <= o_tuple_get_version(primary_tuple))
+    return OTupleFetchMatch;  // TOAST chunk belongs to this version
+```
+
+This prevents fetching TOAST data from newer tuple versions when reading an older snapshot.
+
+### Version vs. CSN/XID
+
+The version field serves a different purpose than CSN (Commit Sequence Number) and XID (Transaction ID):
+
+- **Version**: Tracks updates *within* the same logical row, mainly for same-transaction updates
+- **CSN**: Determines transaction commit order and visibility across different transactions
+- **XID**: Identifies which transaction created/modified a tuple (stored in undo log, not tuple header)
+
+When determining tuple visibility, OrioleDB:
+1. Uses the **undo log chain** to traverse tuple versions
+2. Checks the **XID** (from undo records) against the **CSN** (from transaction metadata) to determine if that version is visible to the current snapshot
+3. Uses the **version** field to select the specific version within the visible range
+
+### Practical Example
+
+```sql
+-- Transaction T1
+INSERT INTO table VALUES (1, 'a');  -- Creates tuple with version=0
+
+BEGIN;
+UPDATE table SET col='b' WHERE id=1;  -- Updates to version=1
+UPDATE table SET col='c' WHERE id=1;  -- Updates to version=2
+-- At this point, T1 can see version=2 (latest)
+-- Other transactions see version=0 (before T1 started)
+COMMIT;
+-- After commit, all transactions see version=2
+```
+
+The version field allows T1 to track its own updates (v=0→1→2) while other transactions continue to see version=0 through the undo chain until T1 commits.
 
 ## Relationship Between Version, CSN, and XID
 
