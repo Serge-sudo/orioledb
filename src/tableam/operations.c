@@ -1294,6 +1294,36 @@ o_tbl_index_delete(OIndexDescr *id, OIndexNumber ix_num, TupleTableSlot *slot,
 
 	O_TUPLE_SET_NULL(nullTup);
 
+	/*
+	 * For secondary indexes during concurrent index build validation,
+	 * check if the primary key is within the validation boundary.
+	 * If PK > boundary, skip the delete - the validator hasn't added it yet.
+	 */
+	if (id->desc.type != oIndexPrimary && ix_num != BridgeIndexNumber)
+	{
+		OTableDescr *descr = (OTableDescr *) id->desc.arg;
+		OTuple		pkTuple;
+		OBTreeKeyBound pkBound;
+
+		if (descr != NULL)
+		{
+			tts_orioledb_fill_key_bound(slot, GET_PRIMARY(descr), &pkBound);
+			pkTuple.data = (Pointer) &pkBound;
+			pkTuple.formatFlags = 0;
+
+			if (!btree_pk_satisfies_validation_boundary(&GET_PRIMARY(descr)->desc, pkTuple))
+			{
+				/*
+				 * PK is beyond the validation boundary. Return success without
+				 * deleting - the validator hasn't added this entry yet.
+				 */
+				memset(&result, 0, sizeof(result));
+				result.success = true;
+				return result;
+			}
+		}
+	}
+
 	fill_key_bound(slot, id, &bound);
 	o_btree_load_shmem(&id->desc);
 	res = o_btree_modify(&id->desc, BTreeOperationDelete,
@@ -1420,6 +1450,14 @@ o_tbl_index_insert(OTableDescr *descr,
 			/*
 			 * PK is beyond the validation boundary. Return success without
 			 * modifying the secondary index - the validator will handle this entry.
+			 *
+			 * TODO: On rollback, if the boundary has since progressed past this PK,
+			 * we need to remove the entry that the validator added. This requires
+			 * either:
+			 * 1. Storing skip information in the undo record
+			 * 2. Maintaining an auxiliary structure tracking skipped operations
+			 * 3. During rollback, checking current boundary and explicitly deleting
+			 *    from secondary indexes if PK < boundary
 			 */
 			((OTableSlot *) slot)->version = 0;
 			return OBTreeModifyResultInserted;

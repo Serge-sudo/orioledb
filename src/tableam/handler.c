@@ -1444,6 +1444,8 @@ orioledb_index_validate_scan(Relation heapRelation,
 	OSnapshot	oSnapshot;
 	Datum		heapRowIdDatum;
 	bool		rowIdIsNull;
+	OInMemoryBlkno lastBlkno = OInvalidInMemoryBlkno;
+	OTuple		pageBoundary = {0};
 
 	Assert(state != NULL);
 	Assert(state->tuplesort != NULL);
@@ -1561,14 +1563,43 @@ orioledb_index_validate_scan(Relation heapRelation,
 		}
 
 		/*
-		 * Update the validation boundary to the current PK tuple.
-		 * This allows concurrent transactions to modify secondary index entries
-		 * for this and earlier PKs, since we've now validated them.
+		 * Update the validation boundary when we move to a new page.
+		 * This reduces lock contention compared to updating on every tuple.
 		 */
-		btree_set_validation_boundary(&GET_PRIMARY(descr)->desc, heapTuple);
+		if (hint.blkno != lastBlkno && lastBlkno != OInvalidInMemoryBlkno)
+		{
+			if (!O_TUPLE_IS_NULL(pageBoundary))
+			{
+				btree_set_validation_boundary(&GET_PRIMARY(descr)->desc, pageBoundary);
+				pfree(pageBoundary.data);
+				O_TUPLE_SET_NULL(pageBoundary);
+			}
+		}
+		
+		/* Remember the last tuple on this page as the potential boundary */
+		if (hint.blkno != lastBlkno)
+		{
+			lastBlkno = hint.blkno;
+		}
+		
+		/* Keep a copy of the current heap tuple to use as boundary at page end */
+		if (!O_TUPLE_IS_NULL(pageBoundary))
+			pfree(pageBoundary.data);
+		pageBoundary.data = (Pointer) palloc(o_btree_len(&GET_PRIMARY(descr)->desc, heapTuple, OTupleLength));
+		memcpy(pageBoundary.data, heapTuple.data, o_btree_len(&GET_PRIMARY(descr)->desc, heapTuple, OTupleLength));
+		pageBoundary.formatFlags = heapTuple.formatFlags;
 
 		ExecClearTuple(primarySlot);
 		pfree(tup.data);
+	}
+
+	/*
+	 * Set the final boundary if we have one from the last page.
+	 */
+	if (!O_TUPLE_IS_NULL(pageBoundary))
+	{
+		btree_set_validation_boundary(&GET_PRIMARY(descr)->desc, pageBoundary);
+		pfree(pageBoundary.data);
 	}
 
 	/*
