@@ -2079,7 +2079,7 @@ redefine_indices(Relation rel, OTable *new_o_table, bool primary)
 		{
 			o_define_index_validate(new_o_table->oids, ind, NULL, NULL);
 			relation_close(ind, AccessShareLock);
-			o_define_index(rel, NULL, ind->rd_rel->oid, false, InvalidIndexNumber, NULL);
+			o_define_index(rel, NULL, ind->rd_rel->oid, false, InvalidIndexNumber, false, NULL);
 			closed = true;
 		}
 		if (!closed)
@@ -2443,7 +2443,7 @@ orioledb_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
 						relation_close(rel, AccessShareLock);
 						closed = true;
 						if (!in_rewrite && (rel->rd_index->indisprimary || ix_num != InvalidIndexNumber))
-							o_define_index(tbl, NULL, rel->rd_rel->oid, false, ix_num, NULL);
+							o_define_index(tbl, NULL, rel->rd_rel->oid, false, ix_num, false, NULL);
 
 						o_table_free(o_table);
 					}

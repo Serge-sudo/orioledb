@@ -116,6 +116,10 @@ typedef struct oIdxShared
 	Size		o_table_size;
 	Size		old_o_table_size;
 	bool		isrebuild;
+	
+	/* Concurrent index build validation boundary */
+	pg_atomic_uint64 validation_boundary;	/* Current PK boundary during validation phase */
+	
 	char		o_table_serialized[];
 	/* old_o_table_serialized follows */
 } oIdxShared;
@@ -125,7 +129,7 @@ extern Sharedsort *recovery_sharedsort;
 
 extern void o_define_index_validate(ORelOids oids, Relation index, IndexInfo *indexInfo, OTable *o_table);
 extern void o_define_index(Relation heap, Relation index, Oid indoid, bool reindex,
-						   OIndexNumber old_ix_num, IndexBuildResult *result);
+						   OIndexNumber old_ix_num, bool concurrent, IndexBuildResult *result);
 
 extern void o_index_drop(Relation tbl, OIndexNumber ix_num);
 extern OIndexNumber o_find_ix_num_by_name(OTableDescr *descr,
@@ -142,6 +146,7 @@ extern void recreate_o_table(OTable *old_o_table, OTable *o_table);
 extern void build_secondary_index(OTable *o_table, OTableDescr *descr,
 								  OIndexNumber ix_num,
 								  bool in_dedicated_recovery_worker,
+								  bool concurrent,
 								  IndexBuildResult *result);
 PGDLLEXPORT void _o_index_parallel_build_main(dsm_segment *seg, shm_toc *toc);
 extern void _o_index_parallel_build_inner(dsm_segment *seg, shm_toc *toc,

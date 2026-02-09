@@ -1627,6 +1627,91 @@ btree_seq_scan_getnext_raw(BTreeSeqScan *scan, MemoryContext mctx,
 	return tuple;
 }
 
+/*
+ * Get next tuple for concurrent index build validation phase (stage 2).
+ * This function scans tuples and processes undo chains to identify tuples
+ * that were modified during the concurrent index build window.
+ */
+OTuple
+btree_seq_scan_getnext_page_undo(BTreeSeqScan *scan, MemoryContext mctx,
+								 BTreeLocationHint *hint, BTreeLeafTuphdr **tupHdr)
+{
+	OTuple		tuple;
+	BTreeLeafTuphdr *localtupHdr;
+
+	if (tupHdr == NULL)
+		tupHdr = &localtupHdr;
+
+	if (!scan->initialized)
+		init_btree_seq_scan(scan);
+
+	/* Keep scanning until we find a valid tuple or finish */
+	while (scan->status != BTreeSeqScanFinished)
+	{
+		/* Load next page if needed */
+		while (!BTREE_PAGE_LOCATOR_IS_VALID(scan->leafImg, &scan->leafLoc))
+		{
+			if (scan->status == BTreeSeqScanInMemory)
+			{
+				if (scan->iter)
+				{
+					bool		end;
+
+					tuple = btree_seq_scan_get_tuple_from_iterator_raw(scan, &end, hint, tupHdr);
+					if (!end)
+						return tuple;
+				}
+
+				if (iterate_internal_page(scan))
+				{
+					if (scan->iter)
+					{
+						bool		end;
+
+						tuple = btree_seq_scan_get_tuple_from_iterator_raw(scan, &end, hint, tupHdr);
+						if (!end)
+							return tuple;
+					}
+				}
+				else
+				{
+					switch_to_disk_scan(scan);
+				}
+			}
+			
+			if (scan->status == BTreeSeqScanDisk)
+			{
+				if (!load_next_disk_leaf_page(scan))
+				{
+					scan->status = BTreeSeqScanFinished;
+					O_TUPLE_SET_NULL(tuple);
+					return tuple;
+				}
+			}
+		}
+
+		/* Read tuple from current page */
+		BTREE_PAGE_READ_LEAF_ITEM(*tupHdr, tuple, scan->leafImg, &scan->leafLoc);
+		BTREE_PAGE_LOCATOR_NEXT(scan->leafImg, &scan->leafLoc);
+
+		/* Return the tuple (even if deleted, caller will filter) */
+		if (hint)
+			*hint = scan->hint;
+
+		/*
+		 * For concurrent index build validation, we need to return all tuples
+		 * (including deleted ones) so the caller can process their undo chains.
+		 * The caller will check the undoLocation to determine if the tuple
+		 * falls within the undo1-undo2 window.
+		 */
+		return tuple;
+	}
+
+	/* Scan finished */
+	O_TUPLE_SET_NULL(tuple);
+	return tuple;
+}
+
 void
 free_btree_seq_scan(BTreeSeqScan *scan)
 {

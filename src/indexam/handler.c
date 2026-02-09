@@ -201,11 +201,15 @@ orioledb_ambuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	if (in_nontransactional_truncate || (!index->rd_index->indisprimary && !OidIsValid(o_saved_relrewrite)))
 	{
 		ORelOids	tbl_oids;
+		bool		concurrent = false;
+
+		if (indexInfo && indexInfo->ii_Concurrent)
+			concurrent = true;
 
 		ORelOidsSetFromRel(tbl_oids, heap);
 		if (!in_nontransactional_truncate)
 			o_define_index_validate(tbl_oids, index, indexInfo, NULL);
-		o_define_index(heap, index, InvalidOid, reindex, InvalidIndexNumber, result);
+		o_define_index(heap, index, InvalidOid, reindex, InvalidIndexNumber, concurrent, result);
 	}
 
 	return result;

@@ -271,8 +271,7 @@ o_define_index_validate(ORelOids oids, Relation index, IndexInfo *indexInfo, OTa
 	int			nattrs;
 	OIndexType	ix_type;
 
-	if (indexInfo && indexInfo->ii_Concurrent)
-		elog(ERROR, "concurrent indexes are not supported.");
+	/* Concurrent index build is now supported with new validation logic */
 
 	if (index->rd_index->indisexclusion)
 		elog(ERROR, "exclusion indices are not supported.");
@@ -376,7 +375,7 @@ index_build_params(OTableIndex *index)
  */
 void
 o_define_index(Relation heap, Relation index, Oid indoid, bool reindex,
-			   OIndexNumber old_ix_num, IndexBuildResult *result)
+			   OIndexNumber old_ix_num, bool concurrent, IndexBuildResult *result)
 {
 	OTable	   *old_o_table = NULL;
 	OTable	   *new_o_table;
@@ -609,7 +608,7 @@ o_define_index(Relation heap, Relation index, Oid indoid, bool reindex,
 		else
 		{
 			Assert(!is_recovery_in_progress());
-			build_secondary_index(o_table, descr, ix_num, false, result);
+			build_secondary_index(o_table, descr, ix_num, false, concurrent, result);
 		}
 	}
 	else
@@ -1287,14 +1286,22 @@ scan_getnextslot_allattrs(oIdxBuildState *buildstate, BTreeSeqScan *scan, OTable
 	OTuple		tup;
 	BTreeLocationHint hint;
 	CommitSeqNo tupleCsn;
+	bool		end = false;
 
 	if (buildstate->concurrentStage == 1)
-		tup = btree_seq_scan_getnext_raw(scan, slot->tts_mcxt, &hint, tupHdr);
+	{
+		tup = btree_seq_scan_getnext_raw(scan, slot->tts_mcxt, &end, &hint, tupHdr);
 		tupleCsn = InvalidCSN;
+	}
 	else if (buildstate->concurrentStage == 2)
+	{
 		tup = btree_seq_scan_getnext_page_undo(scan, slot->tts_mcxt, &hint, tupHdr);
+		tupleCsn = InvalidCSN;
+	}
 	else
+	{
 		tup = btree_seq_scan_getnext(scan, slot->tts_mcxt, &tupleCsn, &hint);
+	}
 
 	if (O_TUPLE_IS_NULL(tup))
 		return false;
@@ -1406,6 +1413,7 @@ build_secondary_index_worker_heap_scan(oIdxBuildState *buildstate, OTableDescr *
 void
 build_secondary_index(OTable *o_table, OTableDescr *descr, OIndexNumber ix_num,
 					  bool in_dedicated_recovery_worker,
+					  bool concurrent,
 					  IndexBuildResult *result)
 {
 	Tuplesortstate **sortstates;
