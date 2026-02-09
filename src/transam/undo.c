@@ -2554,31 +2554,3 @@ o_add_rewind_relfilenode_undo_item(RelFileNode *onCommit, RelFileNode *onAbort,
 
 	release_undo_size(UndoLogSystem);
 }
-
-/*
- * Set the secondarySkipped flag on an existing undo record.
- * This is used to mark when secondary index operations were skipped due to
- * validation boundary, so rollback can handle them appropriately.
- */
-void
-set_undo_secondary_skipped(UndoLogType undoType, UndoLocation undoLocation,
-						   bool skipped)
-{
-	BTreeModifyUndoStackItem *item;
-	UndoLocation itemLocation;
-
-	if (!UndoLocationIsValid(undoLocation))
-		return;
-
-	/* Adjust undo location to point to the beginning of the item */
-	itemLocation = undoLocation - offsetof(BTreeModifyUndoStackItem, tuphdr);
-
-	/* Access the undo record */
-	item = (BTreeModifyUndoStackItem *) GET_UNDO_REC(undoType, itemLocation);
-	
-	/* Only update if this is a modify undo item */
-	if (item->header.type == ModifyUndoItemType)
-	{
-		item->secondarySkipped = skipped;
-	}
-}

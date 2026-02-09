@@ -24,8 +24,10 @@
 #include "recovery/recovery.h"
 #include "rewind/rewind.h"
 #include "tableam/descr.h"
+#include "tableam/operations.h"
 #include "transam/oxid.h"
 #include "transam/undo.h"
+#include "tuple/slot.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 #include "utils/stopevent.h"
@@ -357,9 +359,6 @@ make_undo_record(BTreeDescr *desc, OTuple tuple, bool is_tuple,
 		item->tuphdr.chainHasLocks = curTupHdr->chainHasLocks;
 	}
 
-	/* Initialize secondarySkipped to false by default */
-	item->secondarySkipped = false;
-
 	add_new_undo_stack_item(desc->undoType, undoLocation);
 
 	undoLocation += offsetof(BTreeModifyUndoStackItem, tuphdr);
@@ -411,6 +410,56 @@ make_waiter_undo_record(BTreeDescr *desc, OInMemoryBlkno blkno, int pgprocno,
 
 	add_new_undo_stack_item_to_process(desc->undoType, undoLocation, pgprocno,
 									   lockerState->localXid);
+}
+
+/*
+ * Make an undo record for a secondary index operation during concurrent validation.
+ * This records whether the operation was actually performed or skipped due to
+ * validation boundary, enabling proper rollback handling.
+ */
+UndoLocation
+make_secondary_index_undo_record(OTableDescr *descr, OIndexNumber indexNum,
+								 BTreeOperationType action,
+								 TupleTableSlot *slot,
+								 bool actuallyPerformed)
+{
+	SecondaryIndexUndoStackItem *item;
+	UndoLocation undoLocation;
+	OIndexDescr *indexDescr;
+	OTuple		tup;
+	LocationIndex tupleLen;
+	LocationIndex size;
+	
+	Assert(descr != NULL);
+	Assert(indexNum > 0 && indexNum < descr->nIndices);
+	
+	indexDescr = descr->indices[indexNum];
+	
+	/* Create tuple from slot */
+	tup = tts_orioledb_make_secondary_tuple(slot, indexDescr, true);
+	tupleLen = o_tuple_size(tup, &indexDescr->leafSpec);
+	
+	size = sizeof(SecondaryIndexUndoStackItem) + tupleLen;
+	item = (SecondaryIndexUndoStackItem *) get_undo_record(UndoLogRegular,
+														   &undoLocation,
+														   MAXALIGN(size));
+	
+	item->header.itemSize = size;
+	item->header.type = SecondaryIndexUndoItemType;
+	item->header.indexType = indexDescr->desc.type;
+	item->action = action;
+	item->oids = indexDescr->oids;
+	item->tableOids = descr->oids;
+	item->indexNum = indexNum;
+	item->actuallyPerformed = actuallyPerformed;
+	
+	/* Copy tuple data */
+	memcpy((Pointer) item + sizeof(SecondaryIndexUndoStackItem),
+		   tup.data, tupleLen);
+	
+	add_new_undo_stack_item(UndoLogRegular, undoLocation);
+	
+	return undoLocation;
 }
 
 static BTreeDescr *

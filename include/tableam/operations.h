@@ -53,7 +53,6 @@ typedef struct
 	OIndexNumber conflictIxNum;
 	bool		copyPrimaryOxid;
 	RowLockMode lockMode;
-	bool		secondarySkipped;	/* True if any secondary index operation was skipped due to validation boundary */
 } InsertOnConflictCallbackArg;
 
 typedef struct

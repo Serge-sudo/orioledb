@@ -240,6 +240,7 @@ typedef enum
 	RewindRelFileNodeUndoItemType,
 	SysCacheDeleteUndoItemType,
 	InvalidateComparatorUndoItemType,
+	SecondaryIndexUndoItemType,
 } UndoItemType;
 
 struct UndoStackItem
