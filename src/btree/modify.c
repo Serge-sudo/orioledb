@@ -694,31 +694,42 @@ o_btree_modify_insert_update(BTreeModifyInternalContext *context)
 {
 	OBTreeFindPageContext *pageFindContext = context->pageFindContext;
 	BTreeDescr *desc = pageFindContext->desc;
+	BTreeModifyCallbackInfo *callbackInfo = context->callbackInfo;
 	int			tuplen;
 
 	/*
-	 * For secondary indexes during concurrent index build validation,
+	 * For primary index modification during concurrent secondary index build,
 	 * check if the PK satisfies the validation boundary WHILE HOLDING PAGE LOCK.
-	 * If not, unlock and skip the operation - the validator will handle it.
+	 * Store the result in the callback arg for use by secondary index operations.
 	 */
-	if (desc->type != oIndexPrimary && desc->arg != NULL)
+	if (desc->type == oIndexPrimary && desc->arg != NULL && callbackInfo != NULL && callbackInfo->arg != NULL)
 	{
 		OTableDescr *tableDescr = (OTableDescr *) desc->arg;
-		BTreeDescr *primaryDesc = &GET_PRIMARY(tableDescr)->desc;
-		OTuple		pkTuple;
+		InsertOnConflictCallbackArg *ioc_arg = (InsertOnConflictCallbackArg *) callbackInfo->arg;
 		bool		pkSatisfiesBoundary;
 		
-		/* Extract PK from the tuple being inserted/updated */
-		pkTuple = o_btree_tuple_make_key(desc, context->tuple, NULL, false, NULL);
+		/* Check validation boundary while holding the page lock on primary */
+		pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(desc, context->tuple);
 		
-		/* Check validation boundary while holding the page lock */
-		pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(primaryDesc, pkTuple);
+		/* Store result for use by secondary index operations */
+		ioc_arg->pkSatisfiesBoundary = pkSatisfiesBoundary;
+	}
+
+	/*
+	 * For secondary index modification during concurrent index build,
+	 * use the cached boundary check result from the primary index operation.
+	 * If PK doesn't satisfy boundary, skip the operation - validator will handle it.
+	 */
+	if (desc->type != oIndexPrimary && desc->arg != NULL && callbackInfo != NULL && callbackInfo->arg != NULL)
+	{
+		InsertOnConflictCallbackArg *ioc_arg = (InsertOnConflictCallbackArg *) callbackInfo->arg;
 		
-		if (!pkSatisfiesBoundary)
+		if (!ioc_arg->pkSatisfiesBoundary)
 		{
 			/*
-			 * PK is beyond the validation boundary. The validator hasn't
-			 * processed this PK yet, so we should not modify the secondary index.
+			 * PK is beyond the validation boundary (determined during primary
+			 * index modification). The validator hasn't processed this PK yet,
+			 * so we should not modify the secondary index.
 			 * Unlock and return - the validator will add this entry later.
 			 */
 			unlock_release(context, true);
@@ -809,6 +820,7 @@ o_btree_modify_delete(BTreeModifyInternalContext *context)
 {
 	OBTreeFindPageContext *pageFindContext = context->pageFindContext;
 	BTreeDescr *desc = pageFindContext->desc;
+	BTreeModifyCallbackInfo *callbackInfo = context->callbackInfo;
 	uint32		pageChangeCount;
 	UndoLocation undoLocation;
 	OInMemoryBlkno blkno;
@@ -824,29 +836,39 @@ o_btree_modify_delete(BTreeModifyInternalContext *context)
 	BTREE_PAGE_READ_LEAF_ITEM(tuphdr, curTuple, page, &loc);
 
 	/*
-	 * For secondary indexes during concurrent index build validation,
+	 * For primary index modification during concurrent secondary index build,
 	 * check if the PK satisfies the validation boundary WHILE HOLDING PAGE LOCK.
-	 * If not, unlock and skip the operation - the validator will handle it.
+	 * Store the result in the callback arg for use by secondary index operations.
 	 */
-	if (desc->type != oIndexPrimary && desc->arg != NULL)
+	if (desc->type == oIndexPrimary && desc->arg != NULL && callbackInfo != NULL && callbackInfo->arg != NULL)
 	{
 		OTableDescr *tableDescr = (OTableDescr *) desc->arg;
-		BTreeDescr *primaryDesc = &GET_PRIMARY(tableDescr)->desc;
-		OTuple		pkTuple;
+		OModifyCallbackArg *mod_arg = (OModifyCallbackArg *) callbackInfo->arg;
 		bool		pkSatisfiesBoundary;
 		
-		/* Extract PK from the tuple being deleted */
-		pkTuple = o_btree_tuple_make_key(desc, curTuple, NULL, false, NULL);
+		/* Check validation boundary while holding the page lock on primary */
+		pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(desc, curTuple);
 		
-		/* Check validation boundary while holding the page lock */
-		pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(primaryDesc, pkTuple);
+		/* Store result for use by secondary index operations */
+		mod_arg->pkSatisfiesBoundary = pkSatisfiesBoundary;
+	}
+
+	/*
+	 * For secondary index modification during concurrent index build,
+	 * use the cached boundary check result from the primary index operation.
+	 * If PK doesn't satisfy boundary, skip the operation - validator will handle it.
+	 */
+	if (desc->type != oIndexPrimary && desc->arg != NULL && callbackInfo != NULL && callbackInfo->arg != NULL)
+	{
+		OModifyCallbackArg *mod_arg = (OModifyCallbackArg *) callbackInfo->arg;
 		
-		if (!pkSatisfiesBoundary)
+		if (!mod_arg->pkSatisfiesBoundary)
 		{
 			/*
-			 * PK is beyond the validation boundary. The validator hasn't
-			 * processed this PK yet, so there's nothing to delete from the
-			 * secondary index. Unlock and return success.
+			 * PK is beyond the validation boundary (determined during primary
+			 * index modification). The validator hasn't processed this PK yet,
+			 * so there's nothing to delete from the secondary index.
+			 * Unlock and return success.
 			 */
 			unlock_release(context, true);
 			return OBTreeModifyResultDeleted;

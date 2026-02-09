@@ -53,6 +53,8 @@ typedef struct
 	OIndexNumber conflictIxNum;
 	bool		copyPrimaryOxid;
 	RowLockMode lockMode;
+	bool		pkSatisfiesBoundary;	/* Set during primary index modification,
+										 * used by secondary index operations */
 } InsertOnConflictCallbackArg;
 
 typedef struct
@@ -72,6 +74,8 @@ typedef struct
 	bool		changingPart;
 	Bitmapset  *keyAttrs;
 	int			options;
+	bool		pkSatisfiesBoundary;	/* Set during primary index modification,
+										 * used by secondary index operations */
 } OModifyCallbackArg;
 
 typedef struct

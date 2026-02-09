@@ -611,6 +611,7 @@ orioledb_tuple_update(Relation relation, Datum tupleid, TupleTableSlot *slot,
 											   INDEX_ATTR_BITMAP_KEY);
 	marg.modifyCid = cid;
 	marg.tupleCid = InvalidCommandId;
+	marg.pkSatisfiesBoundary = true;  /* Default to true, will be set during primary index modification */
 	o_set_current_command(cid);
 
 	mres = o_tbl_update(descr, slot, &old_pkey, relation, oxid,

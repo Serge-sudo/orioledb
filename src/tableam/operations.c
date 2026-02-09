@@ -452,6 +452,7 @@ o_tbl_insert_with_arbiter(Relation rel,
 	ioc_arg.lockMode = tuple_lock_mode_to_row_lock_mode(lockmode);
 	ioc_arg.scanSlot = lockedSlot;
 	ioc_arg.tupUndoLocation = InvalidUndoLocation;
+	ioc_arg.pkSatisfiesBoundary = true;  /* Default to true, will be set during primary index modification */
 
 	while (true)
 	{
@@ -1291,6 +1292,8 @@ o_tbl_index_delete(OIndexDescr *id, OIndexNumber ix_num, TupleTableSlot *slot,
 	};
 	OBTreeKeyBound bound;
 	OTuple		nullTup;
+
+	marg.pkSatisfiesBoundary = true;  /* Default to true, will be set during primary index modification */
 
 	O_TUPLE_SET_NULL(nullTup);
 
