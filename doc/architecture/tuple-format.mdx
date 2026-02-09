@@ -43,8 +43,8 @@ The `version` field in the tuple header plays a crucial role in OrioleDB's MVCC 
 
 - **New tuples** start with version 0 when first inserted:
   ```c
-  // Initial insert
-  tuple = o_form_tuple(descr, &spec, version=0, values, isnull, NULL);
+  // Initial insert - version parameter is 0
+  tuple = o_form_tuple(descr, &spec, 0, values, isnull, NULL);
   ```
 
 - **Updated tuples** increment the version number by 1 for each update within the same transaction:
@@ -111,11 +111,11 @@ When determining tuple visibility, OrioleDB:
 
 ```sql
 -- Transaction T1
-INSERT INTO table VALUES (1, 'a');  -- Creates tuple with version=0
+INSERT INTO users VALUES (1, 'a');  -- Creates tuple with version=0
 
 BEGIN;
-UPDATE table SET col='b' WHERE id=1;  -- Updates to version=1
-UPDATE table SET col='c' WHERE id=1;  -- Updates to version=2
+UPDATE users SET col='b' WHERE id=1;  -- Updates to version=1
+UPDATE users SET col='c' WHERE id=1;  -- Updates to version=2
 -- At this point, T1 can see version=2 (latest)
 -- Other transactions see version=0 (before T1 started)
 COMMIT;
