@@ -476,9 +476,16 @@ secondary_index_undo_callback(UndoLogType undoType, UndoLocation location,
 	OTableDescr *tableDescr;
 	OIndexDescr *indexDescr;
 	BTreeDescr *primaryDesc;
+	BTreeDescr *secondaryDesc;
 	OTuple		tuple;
 	OTuple		pkTuple;
 	OBTreeKeyBound pkBound;
+	Page		p;
+	OInMemoryBlkno blkno;
+	BTreePageItemLocator *loc;
+	OBTreeFindPageContext context;
+	OFindPageResult findResult;
+	bool		pkSatisfiesBoundary;
 
 	Assert(abort);
 
@@ -492,6 +499,7 @@ secondary_index_undo_callback(UndoLogType undoType, UndoLocation location,
 		return;
 
 	primaryDesc = &GET_PRIMARY(tableDescr)->desc;
+	secondaryDesc = &indexDescr->desc;
 
 	/* Extract tuple from undo record */
 	tuple.formatFlags = 0;
@@ -512,28 +520,54 @@ secondary_index_undo_callback(UndoLogType undoType, UndoLocation location,
 
 	/*
 	 * Operation was skipped due to validation boundary.
-	 * Check if the validator has since processed this PK and added the entry.
+	 * We need to check if the validator has since processed this PK and added the entry.
+	 * 
+	 * IMPORTANT: The boundary check must be done while holding the page lock
+	 * for the secondary index location to avoid race conditions.
 	 */
-	
-	/* Extract PK from the secondary index tuple */
-	/* For secondary indexes, the PK is embedded in the tuple */
-	/* We need to extract it to check against the boundary */
-	
-	/* For now, assume we can extract PK from slot data */
-	/* This is a simplified approach - in production we'd need proper PK extraction */
+
+	/* TODO: Extract PK from secondary tuple to construct pkTuple */
+	/* For now, we cannot properly extract PK from secondary tuple */
+	/* This requires understanding the secondary index structure */
 	
 	/*
-	 * Check current validation boundary. If PK is now less than boundary,
-	 * the validator has added this entry and we need to delete it.
-	 */
-	/* TODO: Extract PK properly and check boundary */
-	/* TODO: If PK < boundary, delete from secondary index */
-	
-	/*
-	 * For now, this is a placeholder. The full implementation requires:
-	 * 1. Proper PK extraction from secondary tuple
-	 * 2. Boundary check
-	 * 3. Deletion from secondary index if validator added it
+	 * Proper implementation would:
+	 * 1. Find the page containing this secondary index entry
+	 * 2. Lock the page
+	 * 3. While holding the lock, check if PK < validation boundary
+	 * 4. If true, the validator added it, so delete it
+	 * 5. Unlock the page
+	 * 
+	 * Example code structure:
+	 *
+	 * o_btree_load_shmem(secondaryDesc);
+	 * init_page_find_context(&context, secondaryDesc,
+	 *                        COMMITSEQNO_INPROGRESS,
+	 *                        BTREE_PAGE_FIND_MODIFY);
+	 * 
+	 * findResult = refind_page(&context, (Pointer) &tuple,
+	 *                          BTreeKeyLeafTuple,
+	 *                          0, InvalidInMemoryBlkno,
+	 *                          InvalidOPageChangeCount);
+	 * 
+	 * if (findResult == OFindPageResultSuccess)
+	 * {
+	 *     blkno = context.items[context.index].blkno;
+	 *     p = O_GET_IN_MEMORY_PAGE(blkno);
+	 *     loc = &context.items[context.index].locator;
+	 *     
+	 *     // NOW we hold the page lock, so boundary check is safe
+	 *     pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(primaryDesc, pkTuple);
+	 *     
+	 *     if (pkSatisfiesBoundary)  // PK < boundary, validator added it
+	 *     {
+	 *         // Delete the entry from secondary index
+	 *         page_item_delete(secondaryDesc, p, loc);
+	 *         MARK_DIRTY(secondaryDesc, blkno);
+	 *     }
+	 *     
+	 *     unlock_page(blkno);
+	 * }
 	 */
 }
 

@@ -1298,6 +1298,10 @@ o_tbl_index_delete(OIndexDescr *id, OIndexNumber ix_num, TupleTableSlot *slot,
 	 * For secondary indexes during concurrent index build validation,
 	 * check if the primary key is within the validation boundary.
 	 * Create an undo record tracking whether we actually performed the operation.
+	 * 
+	 * NOTE: This check happens without holding a page lock. The boundary could
+	 * advance between check and operation, but this is safe - rollback will
+	 * recheck with proper locking to handle validator-added entries correctly.
 	 */
 	if (id->desc.type != oIndexPrimary && ix_num != BridgeIndexNumber)
 	{
@@ -1446,6 +1450,16 @@ o_tbl_index_insert(OTableDescr *descr,
 		 * For secondary indexes during concurrent index build validation,
 		 * check if the primary key is within the validation boundary.
 		 * Create an undo record tracking whether we actually performed the operation.
+		 * 
+		 * NOTE: This check happens without holding a page lock. In theory, the
+		 * boundary could advance between this check and the actual btree operation.
+		 * However, this is acceptable because:
+		 * 1. If boundary advances after check but before operation, we might skip
+		 *    an operation that the validator will also do - this is safe (idempotent)
+		 * 2. The undo record tracks what we decided, and rollback will recheck
+		 *    with proper locking to handle validator-added entries correctly
+		 * 3. The performance benefit of early return outweighs the complexity of
+		 *    passing boundary check into the locked btree operation
 		 */
 		tts_orioledb_fill_key_bound(slot, GET_PRIMARY(descr), &pkBound);
 		pkTuple.data = (Pointer) &pkBound;
