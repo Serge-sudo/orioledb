@@ -618,16 +618,8 @@ secondary_index_undo_callback(UndoLogType undoType, UndoLocation location,
 			/* Mark the page as modified */
 			MARK_DIRTY(secondaryDesc, blkno);
 			
-			/* Check if page became too sparse and might need merging */
-			if (blkno != secondaryDesc->rootInfo.rootPageBlkno && is_page_too_sparse(secondaryDesc, p))
-			{
-				/* Try to merge this page with siblings */
-				btree_try_merge_and_unlock(secondaryDesc, blkno, true, true);
-			}
-			else
-			{
-				unlock_page(blkno);
-			}
+			/* Unlock the page */
+			unlock_page(blkno);
 		}
 		else
 		{
