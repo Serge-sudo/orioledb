@@ -150,12 +150,4 @@ extern bool o_is_index_predicate_satisfied(OIndexDescr *idx,
 										   ExprContext *econtext);
 extern void o_truncate_table(ORelOids oids);
 
-/* Undo callback for validation boundary tracking */
-extern void validation_boundary_undo_callback(UndoLogType undoType,
-											  UndoLocation location,
-											  UndoStackItem *baseItem,
-											  OXid oxid,
-											  bool abort,
-											  bool changeCountsValid);
-
 #endif

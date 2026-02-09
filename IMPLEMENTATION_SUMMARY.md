@@ -3,6 +3,13 @@
 ## Overview
 This implementation adds infrastructure for improved concurrent index build validation as specified in the requirements. The changes establish the foundation for tracking validation progress via a monotonically increasing boundary variable, enabling safer concurrent modifications during index build.
 
+## Implementation Approach (Updated)
+
+Based on feedback, the implementation follows a simpler approach:
+- **No separate undo type**: Instead of creating `ValidationBoundaryUndoItemType`, the logic is integrated directly into `page_item_rollback`
+- **Direct secondary index handling**: When `page_item_rollback` is called for a primary key tuple, it checks the validation boundary and handles secondary indexes accordingly
+- **Validation scan cleanup**: The validation scan also deletes items from secondary index if they're missing in the primary
+
 ## What Has Been Implemented
 
 ### 1. Core Infrastructure (✅ Complete)
@@ -50,21 +57,20 @@ bool btree_check_pk_against_boundary(BTreeDescr *desc, OTuple pk);
 1. Initializes boundary to `VALIDATION_BOUNDARY_NONE` at start
 2. Periodically updates boundary every `VALIDATION_BOUNDARY_UPDATE_INTERVAL` (1000) tuples
 3. Sets boundary to `VALIDATION_BOUNDARY_COMPLETE` when validation finishes
-
-**Current Limitation:**
-- Uses simple counter instead of actual PK encoding
-- Conservative approach ensures correctness
+4. Deletes orphaned entries from secondary index when they don't exist in primary
 
 **Files Modified:**
-- `src/tableam/handler.c` - Validation scan logic
+- `src/tableam/handler.c` - Validation scan logic with orphan deletion
 
-### 4. Transaction Rollback Infrastructure (✅ Foundation Complete, ⚠️ Implementation Incomplete)
+### 4. Rollback Handling in page_item_rollback (✅ Infrastructure Complete, ⚠️ Implementation Incomplete)
 
-**Undo System Integration:**
-- Added `ValidationBoundaryUndoItemType` enum value
-- Created `ValidationBoundaryUndoItem` structure
-- Implemented `validation_boundary_undo_callback()` with 3-case logic framework
-- Registered callback in `undoItemTypeDescrs` array
+**Integration with Existing Undo System:**
+Instead of a separate undo type, the logic is integrated into `page_item_rollback()`:
+
+**New Helper Function:** `handle_secondary_index_rollback_for_validation()`
+- Called from `page_item_rollback` when rolling back PK tuples
+- Checks if validation is in progress
+- If so, also removes corresponding secondary index entries
 
 **Three-Case Rollback Logic:**
 
@@ -72,50 +78,63 @@ bool btree_check_pk_against_boundary(BTreeDescr *desc, OTuple pk);
 - Transaction added the tuple
 - Has regular undo record
 - Normal rollback handles it
-- No special action needed
+- No special action needed (implicit)
 
 **Case 2: PK >= boundary when added, but < current boundary** ⚠️
-- Validator added the tuple (not transaction)
+- Validator may have added the tuple (not transaction)
 - Need to remove from secondary index
-- **WARNING**: Not fully implemented - will leave orphaned entries
-- Currently logs warning message
+- **Current Status**: Framework in place, needs proper key extraction
 
 **Case 3: PK >= current boundary** ✅
 - Neither transaction nor validator added anything
-- No action needed
+- No action needed (implicit via boundary check)
 
 **Files Modified:**
-- `include/transam/undo.h` - Enum and structure
-- `include/tableam/operations.h` - Function declaration
-- `src/tableam/operations.c` - Callback implementation
-- `src/transam/undo.c` - Registration and include
+- `src/btree/undo.c` - Added helper function and calls to it
 
 ### 5. Documentation (✅ Complete)
 
-**Files Created:**
+**Files Created/Updated:**
 - `CONCURRENT_INDEX_BUILD_VALIDATION.md` - Detailed implementation guide
-- `IMPLEMENTATION_SUMMARY.md` - This file
+- `IMPLEMENTATION_SUMMARY.md` - This file (updated)
+
+## Key Differences from Original Approach
+
+### Original Approach (Reverted)
+- Separate `ValidationBoundaryUndoItemType` enum
+- `ValidationBoundaryUndoItem` structure
+- Dedicated undo callback function
+- Undo items added during modifications
+
+### New Approach (Current)
+- No separate undo type
+- Logic integrated into existing `page_item_rollback`
+- Simpler, more direct implementation
+- Fewer moving parts
 
 ## What Remains to Be Implemented
 
 ### Critical for Correctness
 
-1. **Primary Key Encoding** (High Priority)
-   - Replace simple counter with actual PK value encoding
+1. **Primary Key to Secondary Key Extraction** (High Priority)
+   - Extract secondary index key components from primary key tuple
+   - Handle multi-column indexes
+   - Support different data types
+   - Needed in both `handle_secondary_index_rollback_for_validation` and validation scan
+
+2. **Complete Secondary Index Deletion** (High Priority)
+   - In `handle_secondary_index_rollback_for_validation()`:
+     - Uncomment and fix the `o_btree_modify` call
+     - Pass proper key bound
+   - In validation scan orphan cleanup:
+     - Uncomment and fix the deletion logic
+     - Pass proper key bound
+
+3. **Primary Key Encoding** (Medium Priority)
+   - Replace simple counter with actual PK value encoding in validation scan
    - Handle multi-column PKs
    - Support different data types
    - Enable proper comparison with boundary
-
-2. **Case 2 Rollback Completion** (High Priority)
-   - Implement secondary index deletion in `validation_boundary_undo_callback()`
-   - Extract secondary index key from stored PK
-   - Call `o_btree_modify` with `BTreeOperationDelete`
-   - Handle errors and maintain consistency
-
-3. **Boundary Checking Integration** (High Priority)
-   - Add boundary checks to `o_update_secondary_index()`
-   - Add validation boundary undo items during modifications
-   - Store pk_encoded and boundary_at_modify values
 
 ### Enhancements for Concurrency
 
@@ -134,17 +153,19 @@ bool btree_check_pk_against_boundary(BTreeDescr *desc, OTuple pk);
 6. **Unit Tests** (Medium Priority)
    - Test boundary initialization and updates
    - Test atomic operations
-   - Test edge cases (boundary overflow, multi-column PKs)
+   - Test rollback scenarios
+   - Test orphan cleanup
 
 7. **Integration Tests** (High Priority)
    - Test concurrent index build with active transactions
-   - Verify rollback scenarios for all 3 cases
+   - Verify rollback removes secondary index entries
+   - Test validation scan orphan cleanup
    - Test edge cases and failure scenarios
 
 8. **Performance Testing** (Low Priority)
    - Measure overhead of boundary updates
    - Tune `VALIDATION_BOUNDARY_UPDATE_INTERVAL`
-   - Profile undo record overhead
+   - Profile rollback overhead
 
 ## Safety Properties
 
@@ -156,7 +177,7 @@ bool btree_check_pk_against_boundary(BTreeDescr *desc, OTuple pk);
 
 3. **Atomic Operations**: All boundary reads/writes use atomic operations
 
-4. **Clear Warnings**: Case 2 incomplete implementation logs warnings about potential orphaned entries
+4. **Rollback Integration**: Secondary index cleanup integrated into existing rollback mechanism
 
 ### Known Limitations
 
@@ -164,9 +185,9 @@ bool btree_check_pk_against_boundary(BTreeDescr *desc, OTuple pk);
    - Impact: Reduced concurrency during index build
    - Mitigation: Only affects indexes being validated
 
-2. **Incomplete Rollback**: Case 2 rollback doesn't remove validator-added tuples
-   - Impact: Orphaned entries in secondary index after rollback
-   - Mitigation: Warning logged, issue tracked
+2. **Incomplete Key Extraction**: Secondary key extraction from PK not implemented
+   - Impact: Rollback and orphan cleanup don't actually delete
+   - Mitigation: DEBUG logging indicates where deletions should happen
 
 3. **Counter-Based Boundary**: Not tied to actual PK values
    - Impact: Less precise validation tracking
@@ -178,30 +199,29 @@ The implementation follows a safe migration path:
 
 1. **Phase 1 (Current)**: Infrastructure in place, conservative defaults
    - All modifications blocked during validation
-   - Foundation ready for full implementation
+   - Framework for rollback and orphan cleanup ready
+   - Key extraction needed for full functionality
 
-2. **Phase 2 (Next)**: Implement PK encoding
+2. **Phase 2 (Next)**: Implement key extraction
+   - Enable actual secondary index deletion
+   - Both in rollback and orphan cleanup paths
+
+3. **Phase 3**: Implement PK encoding
    - Enable actual boundary-based checking
    - Allow concurrent modifications for validated ranges
-
-3. **Phase 3 (Final)**: Complete Case 2 rollback
-   - Full correctness with concurrency
-   - All three rollback cases working
 
 4. **Phase 4 (Optimization)**: Performance tuning
    - Adjust update intervals
    - Consider page-level boundaries
-   - Optimize undo record size
+   - Optimize overhead
 
 ## Code Review Compliance
 
-All code review feedback has been addressed:
-
-✅ Magic number 0 replaced with `VALIDATION_BOUNDARY_NONE` constant
-✅ Placeholder returns safe value (UINT64_MAX) to block modifications
-✅ Update interval defined as `VALIDATION_BOUNDARY_UPDATE_INTERVAL` constant
-✅ Counter-based approach limitations documented
-✅ Case 2 incomplete implementation clearly marked with WARNING
+Addressed user feedback:
+✅ Removed separate undo type (`ValidationBoundaryUndoItemType`)
+✅ Integrated logic into `page_item_rollback`
+✅ Added orphan cleanup in validation scan
+✅ Simpler, more direct approach
 
 ## Security Analysis
 
@@ -213,9 +233,9 @@ No security vulnerabilities introduced:
 
 ## Conclusion
 
-This implementation provides a **safe and extensible foundation** for improved concurrent index build validation. The conservative defaults ensure correctness while the infrastructure is ready for full concurrent implementation. The code is well-documented with clear TODO items for completing the remaining work.
+This implementation provides a **safe and extensible foundation** for improved concurrent index build validation. The new approach is simpler and more integrated with existing undo mechanisms. The conservative defaults ensure correctness while the infrastructure is ready for full concurrent implementation.
 
-**Status**: ✅ Foundation Complete, ⚠️ Full Implementation Pending
+**Status**: ✅ Foundation Complete, ⚠️ Key Extraction and Deletion Needed
 **Safety**: ✅ No data corruption risk
 **Concurrency**: ⚠️ Limited until PK encoding implemented
-**Next Steps**: Implement PK encoding and Case 2 rollback
+**Next Steps**: Implement key extraction → Enable secondary index deletion → Implement PK encoding

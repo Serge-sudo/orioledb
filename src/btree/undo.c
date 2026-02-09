@@ -18,12 +18,15 @@
 #include "btree/find.h"
 #include "btree/io.h"
 #include "btree/merge.h"
+#include "btree/modify.h"
 #include "btree/page_chunks.h"
 #include "btree/undo.h"
+#include "catalog/o_indices.h"
 #include "catalog/o_sys_cache.h"
 #include "recovery/recovery.h"
 #include "rewind/rewind.h"
 #include "tableam/descr.h"
+#include "tableam/operations.h"
 #include "transam/oxid.h"
 #include "transam/undo.h"
 #include "utils/memutils.h"
@@ -89,6 +92,106 @@ page_add_image_to_undo(BTreeDescr *desc, Pointer p, CommitSeqNo imageCsn,
 }
 
 /*
+ * Handle secondary index rollback during concurrent index build validation.
+ * When rolling back a primary key tuple, check if validation boundary indicates
+ * the validator may have added corresponding secondary index entries.
+ * If so, also remove those entries from secondary indexes.
+ */
+static void
+handle_secondary_index_rollback_for_validation(BTreeDescr *desc, OTuple pk_tuple)
+{
+	OIndexDescr *index_descr;
+	OTableDescr *table_descr;
+	uint64		validation_boundary;
+	OIndexNumber i;
+	
+	/* Only handle for primary index */
+	if (desc->type != oIndexPrimary)
+		return;
+	
+	/* Get index descriptor from BTreeDescr */
+	index_descr = (OIndexDescr *) desc->arg;
+	if (index_descr == NULL)
+		return;
+	
+	/* Get validation boundary */
+	validation_boundary = btree_get_validation_boundary(desc);
+	
+	/* If no validation in progress or validation complete, nothing to do */
+	if (validation_boundary == VALIDATION_BOUNDARY_NONE || 
+		validation_boundary == VALIDATION_BOUNDARY_COMPLETE)
+		return;
+	
+	/* Get table descriptor to access secondary indexes */
+	table_descr = o_fetch_table_descr(index_descr->tableOids);
+	if (table_descr == NULL)
+		return;
+	
+	/*
+	 * TODO: Implement proper PK encoding and comparison.
+	 * For now, we check if the PK might be less than the boundary.
+	 * If validation is in progress and we're rolling back a PK tuple,
+	 * we need to check if the validator may have added secondary index entries.
+	 * 
+	 * The 3 cases:
+	 * 1. PK < boundary when added: Transaction added it, regular undo handles it
+	 * 2. PK >= boundary when added, but < now: Validator added it, need to remove
+	 * 3. PK >= current boundary: Neither added it, nothing to do
+	 * 
+	 * Since we don't have the boundary at modification time stored, we
+	 * conservatively assume case 2 if validation is in progress and
+	 * remove from all secondary indexes.
+	 */
+	
+	/* Iterate through secondary indexes and remove entries */
+	for (i = 0; i < table_descr->nIndices; i++)
+	{
+		OIndexDescr *secondary_idx = table_descr->indices[i];
+		OBTreeKeyBound key_bound;
+		OTuple		nullTup;
+		BTreeModifyCallbackInfo callbackInfo = {
+			.waitCallback = NULL,
+			.modifyDeletedCallback = NULL,
+			.modifyCallback = NULL,
+			.needsUndoForSelfCreated = false,
+			.arg = NULL
+		};
+		
+		/* Skip primary index */
+		if (i == PrimaryIndexNumber)
+			continue;
+		
+		/* Skip if not a secondary index being validated */
+		if (secondary_idx == NULL)
+			continue;
+		
+		/*
+		 * Build key bound from primary key tuple.
+		 * This requires extracting secondary index key components from the PK tuple.
+		 * 
+		 * TODO: Properly extract secondary key from PK tuple based on index definition.
+		 * For now, this is a placeholder that won't work correctly.
+		 */
+		memset(&key_bound, 0, sizeof(key_bound));
+		O_TUPLE_SET_NULL(nullTup);
+		
+		/* 
+		 * Attempt to delete from secondary index.
+		 * This may fail if the entry doesn't exist (case 3), which is fine.
+		 */
+		o_btree_load_shmem(&secondary_idx->desc);
+		
+		/* Note: This is incomplete - need proper key extraction */
+		/* o_btree_modify(&secondary_idx->desc, BTreeOperationDelete,
+		 *                nullTup, BTreeKeyNone,
+		 *                (Pointer) &key_bound, BTreeKeyBound,
+		 *                InvalidOXid, COMMITSEQNO_INPROGRESS, RowLockUpdate,
+		 *                NULL, &callbackInfo);
+		 */
+	}
+}
+
+/*
  * Given page item modified by in-progress transaction.  Rollback changes
  * using undo chain.  Specify 'wholeChain' flag to revert all in-progress
  * changes from the chain.  Otherise, only last change item is reverted.
@@ -143,6 +246,9 @@ retry:
 
 		if (!UndoLocationIsValid(nonLockUndoLocation))
 			*nonLockTuphdrPtr = *tuphdr;
+
+		/* Handle secondary index rollback for validation if needed */
+		handle_secondary_index_rollback_for_validation(desc, prev_tuple);
 
 		if (!XACT_INFO_IS_FINISHED(tuphdr->xactInfo) && wholeChain)
 			goto retry;
@@ -204,6 +310,9 @@ retry:
 
 		BTREE_PAGE_SET_ITEM_FLAGS(p, locator, tuple.formatFlags);
 
+		/* Handle secondary index rollback for validation if needed */
+		handle_secondary_index_rollback_for_validation(desc, tuple);
+
 		/* Follow the row-level undo chain if needed */
 		if ((UndoLocationIsValid(nonLockUndoLocation) ||
 			 !XACT_INFO_IS_FINISHED(prev_header.xactInfo)) && wholeChain)
@@ -241,6 +350,9 @@ retry:
 		BTREE_PAGE_READ_TUPLE(prev_tuple, p, locator);
 		PAGE_SUB_N_VACATED(p, BTREE_PAGE_GET_ITEM_SIZE(p, locator) -
 						   (BTreeLeafTuphdrSize + MAXALIGN(o_btree_len(desc, prev_tuple, OTupleLength))));
+
+		/* Handle secondary index rollback for validation if needed */
+		handle_secondary_index_rollback_for_validation(desc, prev_tuple);
 
 		page_locator_delete_item(p, locator);
 		return false;

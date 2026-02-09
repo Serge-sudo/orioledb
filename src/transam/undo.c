@@ -27,7 +27,6 @@
 #include "recovery/wal.h"
 #include "tableam/descr.h"
 #include "tableam/handler.h"
-#include "tableam/operations.h"
 #include "transam/oxid.h"
 #include "transam/undo.h"
 #include "utils/o_buffers.h"
@@ -150,11 +149,6 @@ UndoItemTypeDescr undoItemTypeDescrs[] = {
 		.type = InvalidateComparatorUndoItemType,
 		.callback = o_invalidate_comparator_callback,
 		.callOnCommit = true
-	},
-	{
-		.type = ValidationBoundaryUndoItemType,
-		.callback = validation_boundary_undo_callback,
-		.callOnCommit = false
 	},
 };
 

@@ -1581,6 +1581,47 @@ orioledb_index_validate_scan(Relation heapRelation,
 							  heapTuple.data, BTreeKeyNonLeafKey);
 			if (cmp < 0)
 			{
+				/*
+				 * Index tuple exists but corresponding primary key tuple doesn't exist.
+				 * This means we need to delete this tuple from the secondary index.
+				 * This can happen if the tuple was deleted from primary but the
+				 * secondary index entry remains.
+				 */
+				OTuple		nullTup;
+				OBTreeKeyBound key_bound;
+				BTreeModifyCallbackInfo callbackInfo = {
+					.waitCallback = NULL,
+					.modifyDeletedCallback = NULL,
+					.modifyCallback = NULL,
+					.needsUndoForSelfCreated = false,
+					.arg = NULL
+				};
+
+				O_TUPLE_SET_NULL(nullTup);
+				
+				/*
+				 * Build key bound from the index tuple.
+				 * The indexTuple is already a PK tuple, so we need to extract
+				 * the secondary index key from it.
+				 * 
+				 * TODO: Properly extract secondary key components based on index definition.
+				 * For now, this is a placeholder.
+				 */
+				memset(&key_bound, 0, sizeof(key_bound));
+				
+				/* Delete from secondary index */
+				o_btree_load_shmem(&index_descr->desc);
+				
+				/* Note: This requires proper key extraction implementation */
+				/* o_btree_modify(&index_descr->desc, BTreeOperationDelete,
+				 *                nullTup, BTreeKeyNone,
+				 *                (Pointer) &key_bound, BTreeKeyBound,
+				 *                InvalidOXid, COMMITSEQNO_INPROGRESS, RowLockUpdate,
+				 *                NULL, &callbackInfo);
+				 */
+				
+				elog(DEBUG1, "Validation: Found orphaned secondary index entry, should delete");
+				
 				indexTupleValid = false;
 				continue;
 			}
