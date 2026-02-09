@@ -321,7 +321,12 @@ btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
 	pg_atomic_init_u32(&metaPageBlkno.leafPagesNum, 0);
 	pg_atomic_init_u64(&metaPageBlkno.ctid, ctid);
 	pg_atomic_init_u64(&metaPageBlkno.bridge_ctid, bridge_ctid);
-	pg_atomic_init_u64(&metaPageBlkno.validation_boundary, 0);
+	
+	/* Initialize validation boundary */
+	memset(metaPageBlkno.validationBoundary, 0, sizeof(metaPageBlkno.validationBoundary));
+	metaPageBlkno.validationBoundaryLen = 0;
+	metaPageBlkno.validationBoundaryFlags = 0;
+	
 	for (i = 0; i < ORIOLEDB_MAX_DEPTH; i++)
 	{
 		/* init_page_first_chunk() needs leaf flag to be set */
@@ -405,7 +410,12 @@ btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
 	file_header->leafPagesNum = pg_atomic_read_u32(&metaPageBlkno.leafPagesNum);
 	file_header->ctid = pg_atomic_read_u64(&metaPageBlkno.ctid);
 	file_header->bridgeCtid = pg_atomic_read_u64(&metaPageBlkno.bridge_ctid);
-	file_header->validationBoundary = pg_atomic_read_u64(&metaPageBlkno.validation_boundary);
+	
+	/* Copy validation boundary (no lock needed during build) */
+	memcpy(file_header->validationBoundary, metaPageBlkno.validationBoundary,
+		   sizeof(file_header->validationBoundary));
+	file_header->validationBoundaryLen = metaPageBlkno.validationBoundaryLen;
+	file_header->validationBoundaryFlags = metaPageBlkno.validationBoundaryFlags;
 }
 
 S3TaskLocation

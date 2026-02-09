@@ -39,10 +39,12 @@ typedef uint64 OTupleXactInfo;
 #define InvalidIndexNumber (0xFFFF)
 
 /*
- * Validation boundary constants for concurrent index build.
+ * Validation boundary update interval for concurrent index build.
+ * We update the boundary after processing this many tuples.
+ * This balances between overhead of lock acquisitions and granularity of
+ * allowing concurrent modifications.
  */
-#define VALIDATION_BOUNDARY_NONE (0)		/* No validation in progress */
-#define VALIDATION_BOUNDARY_COMPLETE (UINT64_MAX)	/* Validation complete, all modifications allowed */
+#define VALIDATION_BOUNDARY_UPDATE_INTERVAL 1000
 
 typedef enum BTreeKeyType
 {
@@ -368,8 +370,8 @@ extern void o_btree_cleanup_pages(OInMemoryBlkno root, OInMemoryBlkno metaPageBl
 extern ItemPointerData btree_ctid_get_and_inc(BTreeDescr *desc);
 extern ItemPointerData btree_bridge_ctid_get_and_inc(BTreeDescr *desc, bool *overflow);
 extern void btree_ctid_update_if_needed(BTreeDescr *desc, ItemPointerData ctid);
-extern uint64 btree_get_validation_boundary(BTreeDescr *desc);
-extern void btree_set_validation_boundary(BTreeDescr *desc, uint64 boundary);
+extern bool btree_get_validation_boundary(BTreeDescr *desc, OTuple *boundary_out);
+extern void btree_set_validation_boundary(BTreeDescr *desc, OTuple boundary);
 extern bool btree_check_pk_against_boundary(BTreeDescr *desc, OTuple pk);
 extern void btree_desc_stopevent_params_internal(BTreeDescr *desc,
 												 JsonbParseState **state);

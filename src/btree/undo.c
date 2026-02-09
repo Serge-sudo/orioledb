@@ -102,7 +102,8 @@ handle_secondary_index_rollback_for_validation(BTreeDescr *desc, OTuple pk_tuple
 {
 	OIndexDescr *index_descr;
 	OTableDescr *table_descr;
-	uint64		validation_boundary;
+	OTuple		validation_boundary;
+	bool		has_boundary;
 	OIndexNumber i;
 	
 	/* Only handle for primary index */
@@ -115,80 +116,86 @@ handle_secondary_index_rollback_for_validation(BTreeDescr *desc, OTuple pk_tuple
 		return;
 	
 	/* Get validation boundary */
-	validation_boundary = btree_get_validation_boundary(desc);
+	has_boundary = btree_get_validation_boundary(desc, &validation_boundary);
 	
-	/* If no validation in progress or validation complete, nothing to do */
-	if (validation_boundary == VALIDATION_BOUNDARY_NONE || 
-		validation_boundary == VALIDATION_BOUNDARY_COMPLETE)
+	/* If no validation is in progress, nothing to do */
+	if (!has_boundary)
 		return;
 	
 	/* Get table descriptor to access secondary indexes */
 	table_descr = o_fetch_table_descr(index_descr->tableOids);
 	if (table_descr == NULL)
+	{
+		pfree(validation_boundary.data);
 		return;
+	}
 	
 	/*
-	 * TODO: Implement proper PK encoding and comparison.
-	 * For now, we check if the PK might be less than the boundary.
-	 * If validation is in progress and we're rolling back a PK tuple,
-	 * we need to check if the validator may have added secondary index entries.
-	 * 
-	 * The 3 cases:
-	 * 1. PK < boundary when added: Transaction added it, regular undo handles it
-	 * 2. PK >= boundary when added, but < now: Validator added it, need to remove
-	 * 3. PK >= current boundary: Neither added it, nothing to do
-	 * 
-	 * Since we don't have the boundary at modification time stored, we
-	 * conservatively assume case 2 if validation is in progress and
-	 * remove from all secondary indexes.
+	 * Check if this PK is less than the validation boundary.
+	 * If PK < boundary: the validator has already processed this range
+	 * and may have added secondary index entries that we need to remove.
 	 */
-	
-	/* Iterate through secondary indexes and remove entries */
-	for (i = 0; i < table_descr->nIndices; i++)
+	if (btree_check_pk_against_boundary(desc, pk_tuple))
 	{
-		OIndexDescr *secondary_idx = table_descr->indices[i];
-		OBTreeKeyBound key_bound;
-		OTuple		nullTup;
-		BTreeModifyCallbackInfo callbackInfo = {
-			.waitCallback = NULL,
-			.modifyDeletedCallback = NULL,
-			.modifyCallback = NULL,
-			.needsUndoForSelfCreated = false,
-			.arg = NULL
-		};
-		
-		/* Skip primary index */
-		if (i == PrimaryIndexNumber)
-			continue;
-		
-		/* Skip if not a secondary index being validated */
-		if (secondary_idx == NULL)
-			continue;
-		
 		/*
-		 * Build key bound from primary key tuple.
-		 * This requires extracting secondary index key components from the PK tuple.
+		 * The 3 cases logic is now simpler:
+		 * - If PK < boundary: Validator may have added it, need to check and remove
+		 * - If PK >= boundary: Validator hasn't processed it yet, nothing to do
 		 * 
-		 * TODO: Properly extract secondary key from PK tuple based on index definition.
-		 * For now, this is a placeholder that won't work correctly.
+		 * We're in the first case here, so iterate through secondary indexes
+		 * and remove entries.
 		 */
-		memset(&key_bound, 0, sizeof(key_bound));
-		O_TUPLE_SET_NULL(nullTup);
 		
-		/* 
-		 * Attempt to delete from secondary index.
-		 * This may fail if the entry doesn't exist (case 3), which is fine.
-		 */
-		o_btree_load_shmem(&secondary_idx->desc);
-		
-		/* Note: This is incomplete - need proper key extraction */
-		/* o_btree_modify(&secondary_idx->desc, BTreeOperationDelete,
-		 *                nullTup, BTreeKeyNone,
-		 *                (Pointer) &key_bound, BTreeKeyBound,
-		 *                InvalidOXid, COMMITSEQNO_INPROGRESS, RowLockUpdate,
-		 *                NULL, &callbackInfo);
-		 */
+		/* Iterate through secondary indexes and remove entries */
+		for (i = 0; i < table_descr->nIndices; i++)
+		{
+			OIndexDescr *secondary_idx = table_descr->indices[i];
+			OBTreeKeyBound key_bound;
+			OTuple		nullTup;
+			BTreeModifyCallbackInfo callbackInfo = {
+				.waitCallback = NULL,
+				.modifyDeletedCallback = NULL,
+				.modifyCallback = NULL,
+				.needsUndoForSelfCreated = false,
+				.arg = NULL
+			};
+			
+			/* Skip primary index */
+			if (i == PrimaryIndexNumber)
+				continue;
+			
+			/* Skip if not a secondary index being validated */
+			if (secondary_idx == NULL)
+				continue;
+			
+			/*
+			 * Build key bound from primary key tuple.
+			 * This requires extracting secondary index key components from the PK tuple.
+			 * 
+			 * TODO: Properly extract secondary key from PK tuple based on index definition.
+			 * For now, this is a placeholder that won't work correctly.
+			 */
+			memset(&key_bound, 0, sizeof(key_bound));
+			O_TUPLE_SET_NULL(nullTup);
+			
+			/* 
+			 * Attempt to delete from secondary index.
+			 * This may fail if the entry doesn't exist, which is fine.
+			 */
+			o_btree_load_shmem(&secondary_idx->desc);
+			
+			/* Note: This is incomplete - need proper key extraction */
+			/* o_btree_modify(&secondary_idx->desc, BTreeOperationDelete,
+			 *                nullTup, BTreeKeyNone,
+			 *                (Pointer) &key_bound, BTreeKeyBound,
+			 *                InvalidOXid, COMMITSEQNO_INPROGRESS, RowLockUpdate,
+			 *                NULL, &callbackInfo);
+			 */
+		}
 	}
+	
+	/* Free the boundary tuple */
+	pfree(validation_boundary.data);
 }
 
 /*

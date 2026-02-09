@@ -1472,8 +1472,12 @@ orioledb_index_validate_scan(Relation heapRelation,
 	if (index_descr == NULL)
 		elog(ERROR, "index descriptor not found for index %u", indexRelation->rd_id);
 
-	/* Initialize validation boundary to indicate validation is starting */
-	btree_set_validation_boundary(&index_descr->desc, VALIDATION_BOUNDARY_NONE);
+	/* Initialize validation boundary to NULL (no validation done yet) */
+	{
+		OTuple nullTup;
+		O_TUPLE_SET_NULL(nullTup);
+		btree_set_validation_boundary(&index_descr->desc, nullTup);
+	}
 
 	O_LOAD_SNAPSHOT(&oSnapshot, snapshot);
 	
@@ -1510,19 +1514,24 @@ orioledb_index_validate_scan(Relation heapRelation,
 		 * This allows concurrent transactions to modify secondary index entries
 		 * for PKs that have already been validated.
 		 * 
-		 * NOTE: Using a simple counter is a simplification. A proper implementation
-		 * should encode the actual PK value being processed to correctly track
-		 * validation progress. The current approach ensures forward progress but
-		 * is conservative in allowing concurrent modifications.
+		 * We now store the actual PK tuple value as the boundary, not a counter.
+		 * The boundary is compared using the btree comparator.
 		 */
 		pk_counter++;
 		if (pk_counter % VALIDATION_BOUNDARY_UPDATE_INTERVAL == 0)
 		{
-			/* 
-			 * TODO: Replace counter with actual PK encoding
-			 * Update boundary to allow concurrent modifications up to this PK 
-			 */
-			btree_set_validation_boundary(&index_descr->desc, pk_counter);
+			OTuple pk_key;
+			
+			/* Extract the primary key from the current tuple */
+			pk_key = o_btree_tuple_make_key(&GET_PRIMARY(descr)->desc, tup, 
+											NULL, false, NULL);
+			
+			/* Update boundary to allow concurrent modifications up to this PK */
+			btree_set_validation_boundary(&index_descr->desc, pk_key);
+			
+			/* Free the key if it was allocated */
+			if (pk_key.data != tup.data)
+				pfree(pk_key.data);
 		}
 
 		MemoryContextReset(econtext->ecxt_per_tuple_memory);
@@ -1648,10 +1657,14 @@ orioledb_index_validate_scan(Relation heapRelation,
 	btree_iterator_free(iterator);
 	
 	/*
-	 * Set final validation boundary to indicate validation is complete
-	 * and all concurrent modifications are now allowed.
+	 * Clear validation boundary to indicate validation is complete.
+	 * All concurrent modifications are now allowed.
 	 */
-	btree_set_validation_boundary(&index_descr->desc, VALIDATION_BOUNDARY_COMPLETE);
+	{
+		OTuple nullTup;
+		O_TUPLE_SET_NULL(nullTup);
+		btree_set_validation_boundary(&index_descr->desc, nullTup);
+	}
 }
 
 

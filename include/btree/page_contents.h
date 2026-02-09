@@ -45,12 +45,17 @@ typedef struct
 
 	/*
 	 * Validation boundary for concurrent index build.
-	 * Indicates the current position (as encoded pk) up to which the validator
-	 * has processed tuples in the validation phase. Concurrent transactions
-	 * can only modify secondary index entries if their target pk is less than
-	 * this boundary.
+	 * Stores the actual primary key value up to which the validator has
+	 * processed tuples in the validation phase. Concurrent transactions
+	 * can only modify secondary index entries if their target pk is less
+	 * than this boundary (compared using btree comparator).
+	 * 
+	 * Protected by validationBoundaryLock for thread-safe access.
 	 */
-	pg_atomic_uint64 validation_boundary;
+	LWLock		validationBoundaryLock;
+	char		validationBoundary[O_BTREE_MAX_KEY_SIZE];
+	int			validationBoundaryLen;
+	uint8		validationBoundaryFlags;
 
 	/* Number of running sequential scans depending on the checkpoint number */
 	pg_atomic_uint32 numSeqScans[NUM_SEQ_SCANS_ARRAY_SIZE];

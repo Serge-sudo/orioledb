@@ -378,7 +378,12 @@ init_meta_page(OInMemoryBlkno blkno, uint32 leafPagesNum)
 	pg_atomic_init_u64(&metaPage->datafileLength[1], 0);
 	pg_atomic_init_u64(&metaPage->ctid, 0);
 	pg_atomic_init_u64(&metaPage->bridge_ctid, 0);
-	pg_atomic_init_u64(&metaPage->validation_boundary, 0);
+	
+	/* Initialize validation boundary */
+	memset(metaPage->validationBoundary, 0, sizeof(metaPage->validationBoundary));
+	metaPage->validationBoundaryLen = 0;
+	metaPage->validationBoundaryFlags = 0;
+	
 	for (i = 0; i < NUM_SEQ_SCANS_ARRAY_SIZE; i++)
 		pg_atomic_init_u32(&metaPage->numSeqScans[i], 0);
 
@@ -388,6 +393,8 @@ init_meta_page(OInMemoryBlkno blkno, uint32 leafPagesNum)
 					 checkpoint_state->oMetaTrancheId);
 	LWLockInitialize(&metaPage->punchHolesLock,
 					 checkpoint_state->punchHolesTrancheId);
+	LWLockInitialize(&metaPage->validationBoundaryLock,
+					 checkpoint_state->oMetaTrancheId);
 
 	page_desc->type = oIndexInvalid;
 	page_desc->oids.datoid = InvalidOid;

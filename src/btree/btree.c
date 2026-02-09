@@ -311,28 +311,82 @@ btree_bridge_ctid_get_and_inc(BTreeDescr *desc, bool *overflow)
 
 /*
  * Get the current validation boundary for concurrent index build.
- * Returns the encoded pk value up to which validation has been completed.
+ * Returns a copy of the boundary key in the provided buffer.
+ * Returns true if a boundary is set, false if not (no validation in progress).
  */
-uint64
-btree_get_validation_boundary(BTreeDescr *desc)
+bool
+btree_get_validation_boundary(BTreeDescr *desc, OTuple *boundary_out)
 {
 	BTreeMetaPage *metaPageBlkno = BTREE_GET_META(desc);
+	bool		has_boundary;
 
 	Assert(ORootPageIsValid(desc) && OMetaPageIsValid(desc));
-	return pg_atomic_read_u64(&metaPageBlkno->validation_boundary);
+	Assert(boundary_out != NULL);
+
+	LWLockAcquire(&metaPageBlkno->validationBoundaryLock, LW_SHARED);
+	
+	has_boundary = (metaPageBlkno->validationBoundaryLen > 0);
+	
+	if (has_boundary)
+	{
+		/* Allocate memory for the boundary tuple */
+		boundary_out->data = palloc(metaPageBlkno->validationBoundaryLen);
+		memcpy(boundary_out->data, metaPageBlkno->validationBoundary,
+			   metaPageBlkno->validationBoundaryLen);
+		boundary_out->formatFlags = metaPageBlkno->validationBoundaryFlags;
+	}
+	else
+	{
+		O_TUPLE_SET_NULL(*boundary_out);
+	}
+	
+	LWLockRelease(&metaPageBlkno->validationBoundaryLock);
+	
+	return has_boundary;
 }
 
 /*
  * Set the validation boundary for concurrent index build.
  * This should be called by the validator as it progresses through the pk.
+ * The boundary tuple is copied into the meta page.
  */
 void
-btree_set_validation_boundary(BTreeDescr *desc, uint64 boundary)
+btree_set_validation_boundary(BTreeDescr *desc, OTuple boundary)
 {
 	BTreeMetaPage *metaPageBlkno = BTREE_GET_META(desc);
+	int			tuple_len;
 
 	Assert(ORootPageIsValid(desc) && OMetaPageIsValid(desc));
-	pg_atomic_write_u64(&metaPageBlkno->validation_boundary, boundary);
+
+	LWLockAcquire(&metaPageBlkno->validationBoundaryLock, LW_EXCLUSIVE);
+	
+	if (O_TUPLE_IS_NULL(boundary))
+	{
+		/* Clear the boundary (validation complete or not started) */
+		memset(metaPageBlkno->validationBoundary, 0, 
+			   sizeof(metaPageBlkno->validationBoundary));
+		metaPageBlkno->validationBoundaryLen = 0;
+		metaPageBlkno->validationBoundaryFlags = 0;
+	}
+	else
+	{
+		/* Set the boundary to the given tuple */
+		tuple_len = desc->ops->len(desc, boundary, OKeyLength);
+		
+		/* Ensure it fits in the fixed-size buffer */
+		if (tuple_len > O_BTREE_MAX_KEY_SIZE)
+		{
+			LWLockRelease(&metaPageBlkno->validationBoundaryLock);
+			elog(ERROR, "validation boundary tuple too large: %d bytes (max %d)",
+				 tuple_len, O_BTREE_MAX_KEY_SIZE);
+		}
+		
+		memcpy(metaPageBlkno->validationBoundary, boundary.data, tuple_len);
+		metaPageBlkno->validationBoundaryLen = tuple_len;
+		metaPageBlkno->validationBoundaryFlags = boundary.formatFlags;
+	}
+	
+	LWLockRelease(&metaPageBlkno->validationBoundaryLock);
 }
 
 /*
@@ -341,40 +395,45 @@ btree_set_validation_boundary(BTreeDescr *desc, uint64 boundary)
  * has already processed this range and concurrent modifications are allowed).
  * Returns false if pk is greater than or equal to the boundary.
  * 
- * For now, we use a simple numeric comparison. In a more complete implementation,
- * this would need to properly encode/compare complex pk tuples.
+ * Uses btree comparator for proper PK comparison.
  */
 bool
 btree_check_pk_against_boundary(BTreeDescr *desc, OTuple pk)
 {
-	uint64		boundary;
-	uint64		pk_encoded;
+	OTuple		boundary;
+	bool		has_boundary;
+	int			cmp;
+	bool		result;
 
+	/* Get the current boundary */
+	has_boundary = btree_get_validation_boundary(desc, &boundary);
+	
 	/* If no validation is in progress, allow all modifications */
-	boundary = btree_get_validation_boundary(desc);
-	if (boundary == VALIDATION_BOUNDARY_NONE || boundary == VALIDATION_BOUNDARY_COMPLETE)
+	if (!has_boundary)
 		return true;
+
+	/* If PK is null or empty, allow the modification */
+	if (pk.data == NULL || desc->ops->len(desc, pk, OKeyLength) == 0)
+	{
+		if (!O_TUPLE_IS_NULL(boundary))
+			pfree(boundary.data);
+		return true;
+	}
 
 	/*
-	 * Simplified encoding: For now, we assume pk can be encoded as uint64.
-	 * In a complete implementation, this needs proper tuple comparison logic.
-	 * This is a placeholder that would need to be replaced with proper
-	 * pk encoding based on the index key structure.
-	 * 
-	 * TODO: Implement proper pk encoding based on index structure.
-	 * Until proper encoding is implemented, conservatively block all modifications
-	 * during validation to maintain correctness.
+	 * Compare PK with boundary using btree comparator.
+	 * If PK < boundary, the validator has already processed this range,
+	 * so concurrent modifications are allowed.
 	 */
-	if (pk.data == NULL || desc->ops->len(desc, pk, OKeyLength) == 0)
-		return true;
-
-	/* 
-	 * Placeholder: Return false to block modifications during validation
-	 * until proper PK encoding is implemented. This is safe but overly restrictive.
-	 */
-	pk_encoded = UINT64_MAX;  /* Forces all modifications to be blocked */
-
-	return pk_encoded < boundary;
+	cmp = o_btree_cmp(desc, pk.data, BTreeKeyNonLeafKey,
+					  boundary.data, BTreeKeyNonLeafKey);
+	
+	result = (cmp < 0);
+	
+	/* Free the boundary tuple copy */
+	pfree(boundary.data);
+	
+	return result;
 }
 
 static inline OIndexDescr *

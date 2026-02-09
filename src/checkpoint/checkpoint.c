@@ -2545,7 +2545,14 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 	header.leafPagesNum = pg_atomic_read_u32(&meta_page->leafPagesNum);
 	header.ctid = pg_atomic_read_u64(&meta_page->ctid);
 	header.bridgeCtid = pg_atomic_read_u64(&meta_page->bridge_ctid);
-	header.validationBoundary = pg_atomic_read_u64(&meta_page->validation_boundary);
+	
+	/* Copy validation boundary with lock protection */
+	LWLockAcquire(&meta_page->validationBoundaryLock, LW_SHARED);
+	memcpy(header.validationBoundary, meta_page->validationBoundary, 
+		   sizeof(header.validationBoundary));
+	header.validationBoundaryLen = meta_page->validationBoundaryLen;
+	header.validationBoundaryFlags = meta_page->validationBoundaryFlags;
+	LWLockRelease(&meta_page->validationBoundaryLock);
 
 	if (!orioledb_s3_mode && !is_compressed)
 	{
@@ -5247,7 +5254,14 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 	pg_atomic_write_u32(&meta_page->leafPagesNum, file_header.leafPagesNum);
 	pg_atomic_write_u64(&meta_page->ctid, file_header.ctid);
 	pg_atomic_write_u64(&meta_page->bridge_ctid, file_header.bridgeCtid);
-	pg_atomic_write_u64(&meta_page->validation_boundary, file_header.validationBoundary);
+	
+	/* Restore validation boundary with lock protection */
+	LWLockAcquire(&meta_page->validationBoundaryLock, LW_EXCLUSIVE);
+	memcpy(meta_page->validationBoundary, file_header.validationBoundary,
+		   sizeof(meta_page->validationBoundary));
+	meta_page->validationBoundaryLen = file_header.validationBoundaryLen;
+	meta_page->validationBoundaryFlags = file_header.validationBoundaryFlags;
+	LWLockRelease(&meta_page->validationBoundaryLock);
 
 	if (*evicted_data)
 	{
