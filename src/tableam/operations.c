@@ -2078,3 +2078,85 @@ o_truncate_table(ORelOids oids)
 
 	pfree(treeOids);
 }
+
+/*
+ * Undo callback for validation boundary tracking during concurrent index build.
+ * This implements the 3-case rollback logic:
+ *
+ * Case 1: PK was less than boundary when added
+ *   - Transaction added the tuple to secondary index
+ *   - Normal rollback via regular undo
+ *
+ * Case 2: PK was greater than boundary when added, but less during rollback
+ *   - Validator added the tuple (not transaction)
+ *   - Need to remove from secondary index
+ *
+ * Case 3: PK is still greater than current boundary
+ *   - Neither transaction nor validator added anything
+ *   - Do nothing
+ *
+ * TODO: This is a stub implementation. Complete implementation requires:
+ * 1. Proper PK extraction and encoding
+ * 2. Secondary index lookup and deletion for Case 2
+ * 3. Integration with the modify path to add these undo items
+ */
+void
+validation_boundary_undo_callback(UndoLogType undoType,
+								  UndoLocation location,
+								  UndoStackItem *baseItem,
+								  OXid oxid,
+								  bool abort,
+								  bool changeCountsValid)
+{
+	ValidationBoundaryUndoItem *item = (ValidationBoundaryUndoItem *) baseItem;
+	OIndexDescr *index_descr;
+	uint64		current_boundary;
+
+	/* Only process on abort/rollback */
+	if (!abort)
+		return;
+
+	/* Fetch the index descriptor */
+	index_descr = o_fetch_index_descr(item->index_oids, oIndexInvalid, false, NULL);
+	if (index_descr == NULL)
+	{
+		/* Index may have been dropped, nothing to do */
+		return;
+	}
+
+	/* Get current validation boundary */
+	current_boundary = btree_get_validation_boundary(&index_descr->desc);
+
+	/* Implement the 3-case logic */
+	if (item->pk_encoded < item->boundary_at_modify)
+	{
+		/*
+		 * Case 1: PK was less than boundary when added
+		 * Transaction added the tuple, regular undo handles it
+		 * Nothing special needed here
+		 */
+	}
+	else if (item->pk_encoded < current_boundary)
+	{
+		/*
+		 * Case 2: PK was greater than boundary when added,
+		 * but is now less than current boundary
+		 * This means the validator added the tuple, we need to remove it
+		 *
+		 * TODO: Implement secondary index deletion
+		 * - Extract the full secondary index key
+		 * - Call o_btree_modify with BTreeOperationDelete
+		 * - Handle any errors appropriately
+		 */
+		elog(DEBUG1, "Case 2: Need to remove tuple from secondary index during rollback (pk_encoded=%lu, boundary_at_modify=%lu, current_boundary=%lu)",
+			 item->pk_encoded, item->boundary_at_modify, current_boundary);
+	}
+	else
+	{
+		/*
+		 * Case 3: PK is still greater than current boundary
+		 * Neither transaction nor validator added anything yet
+		 * Nothing to do
+		 */
+	}
+}

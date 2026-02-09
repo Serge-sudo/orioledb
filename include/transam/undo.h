@@ -240,6 +240,7 @@ typedef enum
 	RewindRelFileNodeUndoItemType,
 	SysCacheDeleteUndoItemType,
 	InvalidateComparatorUndoItemType,
+	ValidationBoundaryUndoItemType,
 } UndoItemType;
 
 struct UndoStackItem
@@ -294,6 +295,20 @@ typedef struct
 	UndoLocation prevSubLocation;
 	SubTransactionId parentSubid;
 } SubXactUndoStackItem;
+
+/*
+ * Validation boundary undo record: tracks the validation boundary at the time
+ * of secondary index modification during concurrent index build.
+ * Used to implement proper rollback logic based on whether the validator or
+ * the transaction added the tuple to the secondary index.
+ */
+typedef struct
+{
+	UndoStackItem header;
+	uint64		pk_encoded;			/* Encoded primary key value */
+	uint64		boundary_at_modify;	/* Validation boundary when modification occurred */
+	ORelOids	index_oids;			/* Index being modified */
+} ValidationBoundaryUndoItem;
 
 typedef enum
 {
