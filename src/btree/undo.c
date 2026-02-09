@@ -475,17 +475,20 @@ secondary_index_undo_callback(UndoLogType undoType, UndoLocation location,
 	SecondaryIndexUndoStackItem *item = (SecondaryIndexUndoStackItem *) baseItem;
 	OTableDescr *tableDescr;
 	OIndexDescr *indexDescr;
+	OIndexDescr *primaryIndexDescr;
 	BTreeDescr *primaryDesc;
 	BTreeDescr *secondaryDesc;
 	OTuple		tuple;
 	OTuple		pkTuple;
-	OBTreeKeyBound pkBound;
 	Page		p;
 	OInMemoryBlkno blkno;
 	BTreePageItemLocator *loc;
 	OBTreeFindPageContext context;
 	OFindPageResult findResult;
 	bool		pkSatisfiesBoundary;
+	BTreeLeafTuphdr *tupHdr;
+	OTuple		leafTup;
+	int			cmp;
 
 	Assert(abort);
 
@@ -498,7 +501,8 @@ secondary_index_undo_callback(UndoLogType undoType, UndoLocation location,
 	if (!indexDescr)
 		return;
 
-	primaryDesc = &GET_PRIMARY(tableDescr)->desc;
+	primaryIndexDescr = GET_PRIMARY(tableDescr);
+	primaryDesc = &primaryIndexDescr->desc;
 	secondaryDesc = &indexDescr->desc;
 
 	/* Extract tuple from undo record */
@@ -526,49 +530,111 @@ secondary_index_undo_callback(UndoLogType undoType, UndoLocation location,
 	 * for the secondary index location to avoid race conditions.
 	 */
 
-	/* TODO: Extract PK from secondary tuple to construct pkTuple */
-	/* For now, we cannot properly extract PK from secondary tuple */
-	/* This requires understanding the secondary index structure */
+	/* Load shared memory for secondary index */
+	o_btree_load_shmem(secondaryDesc);
 	
+	/* Initialize find context to locate the secondary index entry */
+	init_page_find_context(&context, secondaryDesc,
+						   COMMITSEQNO_INPROGRESS,
+						   BTREE_PAGE_FIND_MODIFY);
+	
+	/* Find the page containing this secondary index entry */
+	findResult = refind_page(&context, (Pointer) &tuple,
+							 BTreeKeyLeafTuple,
+							 0, InvalidInMemoryBlkno,
+							 InvalidOPageChangeCount);
+	
+	if (findResult != OFindPageResultSuccess)
+	{
+		/* Entry not found - validator hasn't added it yet, nothing to do */
+		return;
+	}
+
+	blkno = context.items[context.index].blkno;
+	p = O_GET_IN_MEMORY_PAGE(blkno);
+	loc = &context.items[context.index].locator;
+
+	/* Verify the entry exists and matches */
+	if (BTREE_PAGE_LOCATOR_IS_VALID(p, loc))
+	{
+		BTREE_PAGE_READ_LEAF_ITEM(tupHdr, leafTup, p, loc);
+		cmp = o_btree_cmp(secondaryDesc, &tuple, BTreeKeyLeafTuple,
+						  &leafTup, BTreeKeyLeafTuple);
+	}
+	else
+	{
+		cmp = 1;
+	}
+
+	if (cmp != 0)
+	{
+		/* Entry not found or doesn't match - nothing to rollback */
+		unlock_page(blkno);
+		return;
+	}
+
 	/*
-	 * Proper implementation would:
-	 * 1. Find the page containing this secondary index entry
-	 * 2. Lock the page
-	 * 3. While holding the lock, check if PK < validation boundary
-	 * 4. If true, the validator added it, so delete it
-	 * 5. Unlock the page
+	 * NOW we hold the page lock, so the boundary check is safe from race conditions.
 	 * 
-	 * Example code structure:
-	 *
-	 * o_btree_load_shmem(secondaryDesc);
-	 * init_page_find_context(&context, secondaryDesc,
-	 *                        COMMITSEQNO_INPROGRESS,
-	 *                        BTREE_PAGE_FIND_MODIFY);
-	 * 
-	 * findResult = refind_page(&context, (Pointer) &tuple,
-	 *                          BTreeKeyLeafTuple,
-	 *                          0, InvalidInMemoryBlkno,
-	 *                          InvalidOPageChangeCount);
-	 * 
-	 * if (findResult == OFindPageResultSuccess)
-	 * {
-	 *     blkno = context.items[context.index].blkno;
-	 *     p = O_GET_IN_MEMORY_PAGE(blkno);
-	 *     loc = &context.items[context.index].locator;
-	 *     
-	 *     // NOW we hold the page lock, so boundary check is safe
-	 *     pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(primaryDesc, pkTuple);
-	 *     
-	 *     if (pkSatisfiesBoundary)  // PK < boundary, validator added it
-	 *     {
-	 *         // Delete the entry from secondary index
-	 *         page_item_delete(secondaryDesc, p, loc);
-	 *         MARK_DIRTY(secondaryDesc, blkno);
-	 *     }
-	 *     
-	 *     unlock_page(blkno);
-	 * }
+	 * Extract PK from the secondary tuple. For secondary indexes, the PK columns
+	 * are embedded in the leaf tuple. We can use o_btree_tuple_make_key to extract
+	 * the key portion which includes the PK for secondary indexes.
 	 */
+	{
+		Pointer		pkData;
+		bool		pkPalloc = false;
+		
+		/* Extract the key (which includes PK for secondary indexes) */
+		pkTuple = o_btree_tuple_make_key(secondaryDesc, tuple,
+										 NULL, false, &pkPalloc);
+		
+		/* Check if PK satisfies (is less than) the validation boundary */
+		pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(primaryDesc, pkTuple);
+		
+		if (pkPalloc)
+			pfree(pkTuple.data);
+		
+		if (pkSatisfiesBoundary)
+		{
+			/*
+			 * PK < boundary, which means the validator has processed this PK
+			 * and added the entry to the secondary index. Since our transaction
+			 * is rolling back and we skipped this operation (didn't add it ourselves),
+			 * we need to remove the entry that the validator added.
+			 * 
+			 * We simply mark the item locator as invalid, which effectively deletes it.
+			 * The page will be cleaned up later by vacuuming or page compaction.
+			 */
+			
+			/* Mark page as dirty before modification */
+			page_block_reads(blkno);
+			
+			/* Mark the locator as invalid to delete the entry */
+			BTREE_PAGE_LOCATOR_SET_INVALID(loc);
+			
+			/* Update page statistics */
+			PAGE_ADD_N_VACATED(p, BTREE_PAGE_GET_ITEM_SIZE(p, loc));
+			
+			/* Mark the page as modified */
+			MARK_DIRTY(secondaryDesc, blkno);
+			
+			/* Check if page became too sparse and might need merging */
+			if (blkno != secondaryDesc->rootInfo.rootPageBlkno && is_page_too_sparse(secondaryDesc, p))
+			{
+				/* Try to merge this page with siblings */
+				btree_try_merge_and_unlock(secondaryDesc, blkno, true, true);
+			}
+			else
+			{
+				unlock_page(blkno);
+			}
+		}
+		else
+		{
+			/* PK >= boundary, validator hasn't processed this yet, nothing to delete */
+			unlock_page(blkno);
+		}
+	}
 }
 
 static BTreeDescr *
