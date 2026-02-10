@@ -1411,51 +1411,38 @@ orioledb_validate_next_index_tid(Tuplesortstate *tuplesort,
  * Extract PK tuple from a secondary index tuple.
  * 
  * Secondary index tuples contain both secondary key fields and PK fields (PK at the end).
- * This function creates a new tuple containing only the PK field values.
+ * We extract the full key and return it. The o_btree_cmp function with the PK descriptor
+ * will handle comparing only the PK portions.
  * 
- * Returns: A new OTuple with PK fields populated. Caller must pfree the returned tuple data.
+ * Returns: A new OTuple key. Caller must pfree the returned tuple data.
  */
 static OTuple
 extract_pk_tuple_from_secondary(OTuple secTuple, BTreeDescr *secDesc, BTreeDescr *pkDesc)
 {
-	OTuple		pkTuple;
 	OTuple		secKey;
 	bool		keyPalloc = false;
-	int			pkNKeyFields = pkDesc->nonLeafTupdesc->natts;
-	int			secNKeyFields = secDesc->nonLeafTupdesc->natts;
-	int			pkOffset;
-	int			i;
 	
-	/* First extract the full key from the secondary tuple */
+	/*
+	 * Extract the full key from the secondary tuple.
+	 * The key contains both secondary columns and PK columns (PK at the end).
+	 * We return this key, and the comparison function using the PK descriptor
+	 * will correctly compare only the PK portion.
+	 */
 	secKey = o_btree_tuple_make_key(secDesc, secTuple, NULL, false, &keyPalloc);
 	
-	/* PK fields are at the end of the secondary key */
-	pkOffset = secNKeyFields - pkNKeyFields;
-	
-	/* Allocate space for PK tuple - format flags + PK field data */
-	pkTuple.formatFlags = secKey.formatFlags;
-	pkTuple.data = (Pointer) palloc(BTreeKeyNonLeafTupleSize(pkNKeyFields));
-	
-	/* Copy PK field values from the end of secondary key to new PK tuple */
-	for (i = 0; i < pkNKeyFields; i++)
+	/*
+	 * If the key was allocated, return it. Otherwise, make a copy so caller
+	 * can safely free it.
+	 */
+	if (!keyPalloc && secKey.data != NULL)
 	{
-		TupleDesc	pkTupDesc = pkDesc->nonLeafTupdesc;
-		int			attlen = pkTupDesc->attrs[i].attlen;
-		Datum		val;
-		bool		isnull;
-		
-		/* Get value from secondary key at pkOffset + i */
-		val = o_fastgetattr(secKey.data, pkOffset + i + 1, secDesc->nonLeafTupdesc, &isnull);
-		
-		/* Set value in PK tuple at position i */
-		o_btree_nonleaf_tuple_set_datum(pkTuple.data, i, val, isnull, attlen);
+		Size keyLen = o_btree_len(secDesc, secKey, OKeyLength);
+		Pointer newData = (Pointer) palloc(keyLen);
+		memcpy(newData, secKey.data, keyLen);
+		secKey.data = newData;
 	}
 	
-	/* Free temporary secondary key if it was allocated */
-	if (keyPalloc && secKey.data != NULL)
-		pfree(secKey.data);
-	
-	return pkTuple;
+	return secKey;
 }
 
 static void
