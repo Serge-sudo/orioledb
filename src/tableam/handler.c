@@ -1407,6 +1407,57 @@ orioledb_validate_next_index_tid(Tuplesortstate *tuplesort,
 	return true;
 }
 
+/*
+ * Extract PK tuple from a secondary index tuple.
+ * 
+ * Secondary index tuples contain both secondary key fields and PK fields (PK at the end).
+ * This function creates a new tuple containing only the PK field values.
+ * 
+ * Returns: A new OTuple with PK fields populated. Caller must pfree the returned tuple data.
+ */
+static OTuple
+extract_pk_tuple_from_secondary(OTuple secTuple, BTreeDescr *secDesc, BTreeDescr *pkDesc)
+{
+	OTuple		pkTuple;
+	OTuple		secKey;
+	bool		keyPalloc = false;
+	int			pkNKeyFields = pkDesc->nonLeafTupdesc->natts;
+	int			secNKeyFields = secDesc->nonLeafTupdesc->natts;
+	int			pkOffset;
+	int			i;
+	
+	/* First extract the full key from the secondary tuple */
+	secKey = o_btree_tuple_make_key(secDesc, secTuple, NULL, false, &keyPalloc);
+	
+	/* PK fields are at the end of the secondary key */
+	pkOffset = secNKeyFields - pkNKeyFields;
+	
+	/* Allocate space for PK tuple - format flags + PK field data */
+	pkTuple.formatFlags = secKey.formatFlags;
+	pkTuple.data = (Pointer) palloc(BTreeKeyNonLeafTupleSize(pkNKeyFields));
+	
+	/* Copy PK field values from the end of secondary key to new PK tuple */
+	for (i = 0; i < pkNKeyFields; i++)
+	{
+		TupleDesc	pkTupDesc = pkDesc->nonLeafTupdesc;
+		int			attlen = pkTupDesc->attrs[i].attlen;
+		Datum		val;
+		bool		isnull;
+		
+		/* Get value from secondary key at pkOffset + i */
+		val = o_fastgetattr(secKey.data, pkOffset + i + 1, secDesc->nonLeafTupdesc, &isnull);
+		
+		/* Set value in PK tuple at position i */
+		o_btree_nonleaf_tuple_set_datum(pkTuple.data, i, val, isnull, attlen);
+	}
+	
+	/* Free temporary secondary key if it was allocated */
+	if (keyPalloc && secKey.data != NULL)
+		pfree(secKey.data);
+	
+	return pkTuple;
+}
+
 static void
 orioledb_index_validate_scan(Relation heapRelation,
 							 Relation indexRelation,
@@ -1537,29 +1588,23 @@ orioledb_index_validate_scan(Relation heapRelation,
 			}
 
 			/* 
-			 * Extract PK from the full secondary index tuple for comparison.
-			 * We extract the composite key from the secondary tuple, which includes
-			 * both secondary key columns and PK columns. The PK columns are at the end.
+			 * Extract PK tuple from the full secondary index tuple for comparison.
+			 * This creates a new tuple containing only the PK field values.
 			 */
 			secIndex = state->index_descr;
-			bool pkPalloc = false;
-			OTuple secKey = o_btree_tuple_make_key(&secIndex->desc, indexTuple, NULL, false, &pkPalloc);
+			OTuple pkFromSecondary = extract_pk_tuple_from_secondary(indexTuple, &secIndex->desc, &GET_PRIMARY(descr)->desc);
 			
 			/* 
-			 * Compare only the PK portion. Since the secondary key ends with PK fields,
-			 * and both descriptors understand their respective structures, we can compare
-			 * the secondary key (which contains PK) with the primary tuple.
-			 * 
-			 * The o_btree_cmp with the primary descriptor will compare only the PK fields
-			 * that are common between the two tuples.
+			 * Now compare PK-to-PK: the extracted PK from secondary vs the primary index tuple.
+			 * Both are now proper PK tuples that can be directly compared.
 			 */
 			cmp = o_btree_cmp(&GET_PRIMARY(descr)->desc,
-							  secKey.data, BTreeKeyNonLeafKey,
+							  pkFromSecondary.data, BTreeKeyNonLeafKey,
 							  heapTuple.data, BTreeKeyLeafTuple);
 			
-			/* Free the extracted key if it was allocated */
-			if (pkPalloc && secKey.data != NULL)
-				pfree(secKey.data);
+			/* Free the extracted PK tuple */
+			if (pkFromSecondary.data != NULL)
+				pfree(pkFromSecondary.data);
 			
 			if (cmp < 0)
 			{
