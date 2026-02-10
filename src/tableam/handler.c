@@ -1473,7 +1473,6 @@ orioledb_index_validate_scan(Relation heapRelation,
 	Datum		heapRowIdDatum;
 	bool		rowIdIsNull;
 	OInMemoryBlkno lastBlkno = OInvalidInMemoryBlkno;
-	OTuple		pageBoundary = {0};
 
 	Assert(state != NULL);
 	Assert(state->tuplesort != NULL);
@@ -1670,49 +1669,25 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 		/*
 		 * Update the validation boundary when we move to a new page.
-		 * When the iterator moves to a new page, it releases the lock on the old page.
-		 * Therefore, we must set the boundary to the highkey (last tuple) of the old page
-		 * immediately when we detect the page change, while the iterator is on the new page.
-		 * This ensures the boundary is updated BEFORE other transactions can modify the old page.
+		 * When the iterator moves to a new page, we have a lock on the new page.
+		 * Set the boundary to the current tuple (which is on the new page) immediately.
+		 * This ensures proper synchronization - all PKs on the new page will be validated.
 		 */
-		if (hint.blkno != lastBlkno && lastBlkno != OInvalidInMemoryBlkno)
+		if (hint.blkno != lastBlkno)
 		{
-			if (!O_TUPLE_IS_NULL(pageBoundary))
+			if (lastBlkno != OInvalidInMemoryBlkno)
 			{
 				/*
-				 * Set boundary to the last tuple from the previous page.
-				 * This is effectively the highkey of that page.
+				 * We've moved to a new page. Set the boundary to the current tuple
+				 * which is on the new page. The iterator holds a lock on this page.
 				 */
-				btree_set_validation_boundary(&GET_PRIMARY(descr)->desc, pageBoundary);
-				pfree(pageBoundary.data);
-				O_TUPLE_SET_NULL(pageBoundary);
+				btree_set_validation_boundary(&GET_PRIMARY(descr)->desc, heapTuple);
 			}
 			lastBlkno = hint.blkno;
 		}
-		else if (lastBlkno == OInvalidInMemoryBlkno)
-		{
-			/* First page - initialize lastBlkno */
-			lastBlkno = hint.blkno;
-		}
-		
-		/* Keep a copy of the current heap tuple to use as boundary when leaving this page */
-		if (!O_TUPLE_IS_NULL(pageBoundary))
-			pfree(pageBoundary.data);
-		pageBoundary.data = (Pointer) palloc(o_btree_len(&GET_PRIMARY(descr)->desc, heapTuple, OTupleLength));
-		memcpy(pageBoundary.data, heapTuple.data, o_btree_len(&GET_PRIMARY(descr)->desc, heapTuple, OTupleLength));
-		pageBoundary.formatFlags = heapTuple.formatFlags;
 
 		ExecClearTuple(primarySlot);
 		pfree(tup.data);
-	}
-
-	/*
-	 * Set the final boundary if we have one from the last page.
-	 */
-	if (!O_TUPLE_IS_NULL(pageBoundary))
-	{
-		btree_set_validation_boundary(&GET_PRIMARY(descr)->desc, pageBoundary);
-		pfree(pageBoundary.data);
 	}
 
 	/*
