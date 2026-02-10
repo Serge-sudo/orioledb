@@ -1542,14 +1542,15 @@ orioledb_index_validate_scan(Relation heapRelation,
 			 * so we need to extract just the PK portion for comparison.
 			 */
 			secIndex = state->index_descr;
-			indexTuplePK = o_btree_tuple_make_key(&secIndex->desc, indexTuple, NULL, false);
-			
 			/* 
-			 * Compare PK from secondary index tuple with PK from heap tuple.
-			 * indexTuplePK is an extracted key (BTreeKeyNonLeafKey format).
-			 * heapTuple is a full primary index tuple (BTreeKeyLeafTuple format).
-			 * This ensures we compare only the PK parts properly.
+			 * Extract PK from the secondary index tuple by using the PRIMARY index descriptor.
+			 * The secondary index tuple contains the full row data, so we extract just the PK part.
+			 * indexTuplePK will be in BTreeKeyNonLeafKey format (extracted key).
+			 * heapTuple is a full primary index tuple in BTreeKeyLeafTuple format.
 			 */
+			indexTuplePK = o_btree_tuple_make_key(&GET_PRIMARY(descr)->desc, indexTuple, NULL, false);
+			
+			/* Compare PK to PK */
 			cmp = o_btree_cmp(&GET_PRIMARY(descr)->desc,
 							  indexTuplePK.data, BTreeKeyNonLeafKey,
 							  heapTuple.data, BTreeKeyLeafTuple);
