@@ -1301,8 +1301,10 @@ o_tbl_index_delete(OIndexDescr *id, OIndexNumber ix_num, TupleTableSlot *slot,
 	 * For secondary indexes during concurrent index build validation,
 	 * we create an undo record tracking the operation. The boundary check
 	 * will happen later when the page lock is held.
+	 *
+	 * Skip undo record creation if oxid is invalid (e.g., during validation scan).
 	 */
-	if (id->desc.type != oIndexPrimary && ix_num != BridgeIndexNumber)
+	if (OXidIsValid(oxid) && id->desc.type != oIndexPrimary && ix_num != BridgeIndexNumber)
 	{
 		OTableDescr *descr = (OTableDescr *) id->desc.arg;
 
@@ -1441,8 +1443,10 @@ o_tbl_index_insert(OTableDescr *descr,
 		 * Create undo record for this secondary index operation.
 		 * The undo record will track what actually happened during the operation.
 		 * The boundary check will occur later when the page lock is held.
+		 *
+		 * Skip undo record creation if oxid is invalid (e.g., during validation scan).
 		 */
-		if (indexNum != InvalidIndexNumber && indexNum > 0)  /* Skip primary at index 0 */
+		if (OXidIsValid(oxid) && indexNum != InvalidIndexNumber && indexNum > 0)  /* Skip primary at index 0 */
 		{
 			make_secondary_index_undo_record(descr, indexNum,
 											 BTreeOperationInsert,
