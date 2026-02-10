@@ -1538,31 +1538,28 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 			/* 
 			 * Extract PK from the full secondary index tuple for comparison.
-			 * The indexTuple now contains the FULL secondary index tuple,
-			 * so we need to extract just the PK portion for comparison.
+			 * We extract the composite key from the secondary tuple, which includes
+			 * both secondary key columns and PK columns. The PK columns are at the end.
 			 */
 			secIndex = state->index_descr;
-			/* 
-			 * Extract key from the secondary index tuple using the secondary descriptor.
-			 * For secondary indexes, the key portion includes the secondary key columns
-			 * followed by PK columns. We extract this composite key first.
-			 */
 			bool pkPalloc = false;
-			indexTuplePK = o_btree_tuple_make_key(&secIndex->desc, indexTuple, NULL, false, &pkPalloc);
+			OTuple secKey = o_btree_tuple_make_key(&secIndex->desc, indexTuple, NULL, false, &pkPalloc);
 			
 			/* 
-			 * Now compare using the PRIMARY descriptor. The secondary key's PK portion
-			 * can be compared against the primary index tuple using the primary descriptor.
-			 * indexTuplePK is in BTreeKeyNonLeafKey format (extracted key).
-			 * heapTuple is a full primary index tuple in BTreeKeyLeafTuple format.
+			 * Compare only the PK portion. Since the secondary key ends with PK fields,
+			 * and both descriptors understand their respective structures, we can compare
+			 * the secondary key (which contains PK) with the primary tuple.
+			 * 
+			 * The o_btree_cmp with the primary descriptor will compare only the PK fields
+			 * that are common between the two tuples.
 			 */
 			cmp = o_btree_cmp(&GET_PRIMARY(descr)->desc,
-							  indexTuplePK.data, BTreeKeyNonLeafKey,
+							  secKey.data, BTreeKeyNonLeafKey,
 							  heapTuple.data, BTreeKeyLeafTuple);
 			
 			/* Free the extracted key if it was allocated */
-			if (pkPalloc && indexTuplePK.data != NULL)
-				pfree(indexTuplePK.data);
+			if (pkPalloc && secKey.data != NULL)
+				pfree(secKey.data);
 			
 			if (cmp < 0)
 			{
