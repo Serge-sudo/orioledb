@@ -990,8 +990,12 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	if (descr == NULL)
 		elog(ERROR, "table descriptor not found for index %u", info->index->rd_id);
 
-	/* Initialize snapshot for iteration */
-	oSnapshot = o_in_progress_snapshot;
+	/*
+	 * Use SnapshotAny to see ALL tuples including in-progress ones.
+	 * This matches the snapshot used in orioledb_index_validate_scan to
+	 * ensure consistent visibility of tuples during index validation.
+	 */
+	O_LOAD_SNAPSHOT(&oSnapshot, SnapshotAny);
 
 	/* Create iterator to scan all tuples in the index */
 	it = o_btree_iterator_create(&index_descr->desc, NULL, BTreeKeyNone,
