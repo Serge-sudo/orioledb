@@ -1670,25 +1670,32 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 		/*
 		 * Update the validation boundary when we move to a new page.
-		 * This reduces lock contention compared to updating on every tuple.
+		 * When the iterator moves to a new page, it releases the lock on the old page.
+		 * Therefore, we must set the boundary to the highkey (last tuple) of the old page
+		 * immediately when we detect the page change, while the iterator is on the new page.
+		 * This ensures the boundary is updated BEFORE other transactions can modify the old page.
 		 */
 		if (hint.blkno != lastBlkno && lastBlkno != OInvalidInMemoryBlkno)
 		{
 			if (!O_TUPLE_IS_NULL(pageBoundary))
 			{
+				/*
+				 * Set boundary to the last tuple from the previous page.
+				 * This is effectively the highkey of that page.
+				 */
 				btree_set_validation_boundary(&GET_PRIMARY(descr)->desc, pageBoundary);
 				pfree(pageBoundary.data);
 				O_TUPLE_SET_NULL(pageBoundary);
 			}
+			lastBlkno = hint.blkno;
 		}
-		
-		/* Remember the last tuple on this page as the potential boundary */
-		if (hint.blkno != lastBlkno)
+		else if (lastBlkno == OInvalidInMemoryBlkno)
 		{
+			/* First page - initialize lastBlkno */
 			lastBlkno = hint.blkno;
 		}
 		
-		/* Keep a copy of the current heap tuple to use as boundary at page end */
+		/* Keep a copy of the current heap tuple to use as boundary when leaving this page */
 		if (!O_TUPLE_IS_NULL(pageBoundary))
 			pfree(pageBoundary.data);
 		pageBoundary.data = (Pointer) palloc(o_btree_len(&GET_PRIMARY(descr)->desc, heapTuple, OTupleLength));
