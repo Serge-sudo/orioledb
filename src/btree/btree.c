@@ -548,43 +548,36 @@ btree_print_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
 
 	initStringInfo(&buf);
 
-	appendStringInfo(&buf, "Validation boundary set for index %u: nkeys=%d, flags=0x%x, keys=[",
+	appendStringInfo(&buf, "Validation boundary set for index %u: nkeys=%d, flags=0x%x, keys=(", 
 					 desc->oids.datoid, boundary->nkeys, boundary->flags);
 
-	/* Print the tuple key values in hexadecimal for debugging */
+	/* Print the tuple key values using type-specific output functions */
 	for (i = 0; i < boundary->nkeys; i++)
 	{
-		int j;
-		Pointer data;
-		
 		if (i > 0)
-			appendStringInfo(&buf, "; ");
+			appendStringInfo(&buf, ", ");
 		
-		appendStringInfo(&buf, "key[%d]:{len=%d", i, boundary->keys[i].len);
-		
-		if (boundary->keys[i].len > 0)
+		/* Check if the value is NULL */
+		if (boundary->keys[i].flags & O_VALUE_BOUND_NULL)
 		{
-			data = boundary->keys[i].value;
-			appendStringInfo(&buf, ", data=0x");
-			
-			/* Print up to 32 bytes in hex for readability */
-			for (j = 0; j < Min(boundary->keys[i].len, 32); j++)
-			{
-				appendStringInfo(&buf, "%02x", ((unsigned char *)data)[j]);
-			}
-			
-			if (boundary->keys[i].len > 32)
-				appendStringInfo(&buf, "... (total %d bytes)", boundary->keys[i].len);
+			appendStringInfo(&buf, "null");
 		}
 		else
 		{
-			appendStringInfo(&buf, ", data=NULL");
+			Oid			typoutput;
+			bool		typisvarlena;
+			char	   *res;
+
+			/* Get the output function for this type */
+			getTypeOutputInfo(boundary->keys[i].type, &typoutput, &typisvarlena);
+			
+			/* Convert the Datum to string using the type's output function */
+			res = OidOutputFunctionCall(typoutput, boundary->keys[i].value);
+			appendStringInfo(&buf, "'%s'", res);
 		}
-		
-		appendStringInfo(&buf, "}");
 	}
 
-	appendStringInfo(&buf, "]");
+	appendStringInfo(&buf, ")");
 	
 	elog(DEBUG1, "%s", buf.data);
 	pfree(buf.data);
