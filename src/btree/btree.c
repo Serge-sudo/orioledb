@@ -32,6 +32,7 @@
 #include "utils/stopevent.h"
 
 #include "fmgr.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "utils/fmgrprotos.h"
 #include "utils/numeric.h"
@@ -437,6 +438,11 @@ btree_set_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
 	metaPage->validationBoundaryValid = true;
 
 	LWLockRelease(&metaPage->validationBoundaryLock);
+
+#ifdef USE_ASSERT_CHECKING
+	/* Debug: log when boundary is set */
+	btree_print_validation_boundary(desc, boundary);
+#endif
 }
 
 /*
@@ -525,4 +531,33 @@ btree_pk_satisfies_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *pk)
 
 	/* Return true if PK <= boundary */
 	return (cmp <= 0);
+}
+
+/*
+ * Debug function to print the validation boundary when it is set.
+ * This helps with debugging concurrent index validation.
+ */
+void
+btree_print_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
+{
+	StringInfoData buf;
+	int			i;
+
+	Assert(desc != NULL);
+	Assert(boundary != NULL);
+
+	initStringInfo(&buf);
+
+	appendStringInfo(&buf, "Validation boundary set for index %u: nkeys=%d, flags=0x%x",
+					 desc->oids.datoid, boundary->nkeys, boundary->flags);
+
+	/* Print basic information about each key field */
+	for (i = 0; i < boundary->nkeys; i++)
+	{
+		appendStringInfo(&buf, ", key[%d]: len=%d",
+						 i, boundary->keys[i].len);
+	}
+
+	elog(DEBUG1, "%s", buf.data);
+	pfree(buf.data);
 }

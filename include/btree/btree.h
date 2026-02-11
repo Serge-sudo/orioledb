@@ -375,5 +375,6 @@ extern void btree_set_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boun
 extern bool btree_get_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary);
 extern void btree_clear_validation_boundary(BTreeDescr *desc);
 extern bool btree_pk_satisfies_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *pk);
+extern void btree_print_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary);
 
 #endif							/* __BTREE_H__ */
