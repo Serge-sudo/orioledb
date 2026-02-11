@@ -417,24 +417,24 @@ btree_downlink_stopevent_params(BTreeDescr *desc, Page p, BTreePageItemLocator *
  * validation has been completed.
  */
 void
-btree_set_validation_boundary(BTreeDescr *desc, OTuple boundary)
+/*
+ * Set the validation boundary for concurrent index builds.
+ * The boundary is stored as an OBTreeKeyBound in the meta page.
+ */
+void
+btree_set_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
 {
 	BTreeMetaPage *metaPage;
-	int			boundaryLen;
 
 	Assert(desc != NULL);
-	Assert(!O_TUPLE_IS_NULL(boundary));
-
-	boundaryLen = o_btree_len(desc, boundary, OTupleLength);
-	if (boundaryLen > MAX_VALIDATION_BOUNDARY_SIZE)
-		elog(ERROR, "validation boundary tuple too large: %d bytes (maximum: %d bytes)",
-			 boundaryLen, MAX_VALIDATION_BOUNDARY_SIZE);
+	Assert(boundary != NULL);
 
 	metaPage = BTREE_GET_META(desc);
 	LWLockAcquire(&metaPage->validationBoundaryLock, LW_EXCLUSIVE);
 
-	memcpy(metaPage->validationBoundaryData, boundary.data, boundaryLen);
-	metaPage->validationBoundaryLen = boundaryLen;
+	/* Copy the boundary into the meta page */
+	memcpy(&metaPage->validationBoundary, boundary, sizeof(OBTreeKeyBound));
+	metaPage->validationBoundaryValid = true;
 
 	LWLockRelease(&metaPage->validationBoundaryLock);
 }
@@ -442,14 +442,13 @@ btree_set_validation_boundary(BTreeDescr *desc, OTuple boundary)
 /*
  * Get the current validation boundary.
  * Returns true if a boundary is set, false otherwise.
- * The boundary OTuple will be allocated in the current memory context.
+ * The boundary is copied to the caller-provided OBTreeKeyBound structure.
  */
 bool
-btree_get_validation_boundary(BTreeDescr *desc, OTuple *boundary)
+btree_get_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
 {
 	BTreeMetaPage *metaPage;
-	uint16		len;
-	char	   *data;
+	bool		valid;
 
 	Assert(desc != NULL);
 	Assert(boundary != NULL);
@@ -457,23 +456,16 @@ btree_get_validation_boundary(BTreeDescr *desc, OTuple *boundary)
 	metaPage = BTREE_GET_META(desc);
 	LWLockAcquire(&metaPage->validationBoundaryLock, LW_SHARED);
 
-	len = metaPage->validationBoundaryLen;
-	if (len == 0)
+	valid = metaPage->validationBoundaryValid;
+	if (valid)
 	{
-		LWLockRelease(&metaPage->validationBoundaryLock);
-		O_TUPLE_SET_NULL(*boundary);
-		return false;
+		/* Copy the boundary to the caller */
+		memcpy(boundary, &metaPage->validationBoundary, sizeof(OBTreeKeyBound));
 	}
-
-	/* Allocate and copy the boundary tuple */
-	data = (char *) palloc(len);
-	memcpy(data, metaPage->validationBoundaryData, len);
 
 	LWLockRelease(&metaPage->validationBoundaryLock);
 
-	boundary->data = data;
-	boundary->formatFlags = 0;	/* Will be set by caller if needed */
-	return true;
+	return valid;
 }
 
 /*
@@ -489,7 +481,7 @@ btree_clear_validation_boundary(BTreeDescr *desc)
 	metaPage = BTREE_GET_META(desc);
 	LWLockAcquire(&metaPage->validationBoundaryLock, LW_EXCLUSIVE);
 
-	metaPage->validationBoundaryLen = 0;
+	metaPage->validationBoundaryValid = false;
 
 	LWLockRelease(&metaPage->validationBoundaryLock);
 }
@@ -502,38 +494,34 @@ btree_clear_validation_boundary(BTreeDescr *desc)
  * Returns false if PK is greater than the boundary.
  */
 bool
-btree_pk_satisfies_validation_boundary(BTreeDescr *desc, OTuple pk)
+btree_pk_satisfies_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *pk)
 {
 	BTreeMetaPage *metaPage;
-	OTuple		boundary;
-	uint16		len;
-	char		boundaryData[MAX_VALIDATION_BOUNDARY_SIZE];
+	OBTreeKeyBound boundary;
+	bool		valid;
 	int			cmp;
 
 	Assert(desc != NULL);
-	Assert(!O_TUPLE_IS_NULL(pk));
+	Assert(pk != NULL);
 
 	metaPage = BTREE_GET_META(desc);
 	LWLockAcquire(&metaPage->validationBoundaryLock, LW_SHARED);
 
-	len = metaPage->validationBoundaryLen;
-	if (len == 0)
+	valid = metaPage->validationBoundaryValid;
+	if (!valid)
 	{
 		/* No validation in progress */
 		LWLockRelease(&metaPage->validationBoundaryLock);
 		return true;
 	}
 
-	/* Copy boundary to local buffer to minimize lock hold time */
-	memcpy(boundaryData, metaPage->validationBoundaryData, len);
+	/* Copy boundary to local variable to minimize lock hold time */
+	memcpy(&boundary, &metaPage->validationBoundary, sizeof(OBTreeKeyBound));
 	LWLockRelease(&metaPage->validationBoundaryLock);
 
-	boundary.data = boundaryData;
-	boundary.formatFlags = 0;
-
 	/* Compare PK with boundary */
-	cmp = o_btree_cmp(desc, pk.data, BTreeKeyNonLeafKey,
-					  boundary.data, BTreeKeyNonLeafKey);
+	cmp = o_btree_cmp(desc, pk, BTreeKeyBound,
+					  &boundary, BTreeKeyBound);
 
 	/* Return true if PK <= boundary */
 	return (cmp <= 0);

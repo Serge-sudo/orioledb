@@ -479,7 +479,6 @@ secondary_index_undo_callback(UndoLogType undoType, UndoLocation location,
 	BTreeDescr *primaryDesc;
 	BTreeDescr *secondaryDesc;
 	OTuple		tuple;
-	OTuple		pkTuple;
 	Page		p;
 	OInMemoryBlkno blkno;
 	BTreePageItemLocator *loc;
@@ -577,22 +576,17 @@ secondary_index_undo_callback(UndoLogType undoType, UndoLocation location,
 	 * NOW we hold the page lock, so the boundary check is safe from race conditions.
 	 * 
 	 * Extract PK from the secondary tuple. For secondary indexes, the PK columns
-	 * are embedded in the leaf tuple. We can use o_btree_tuple_make_key to extract
-	 * the key portion which includes the PK for secondary indexes.
+	 * are embedded in the leaf tuple. We use o_fill_pindex_tuple_key_bound to extract
+	 * the PK portion into an OBTreeKeyBound structure.
 	 */
 	{
-		Pointer		pkData;
-		bool		pkPalloc = false;
+		OBTreeKeyBound pkBound;
 		
-		/* Extract the key (which includes PK for secondary indexes) */
-		pkTuple = o_btree_tuple_make_key(secondaryDesc, tuple,
-										 NULL, false, &pkPalloc);
+		/* Extract PK from the secondary tuple into a key bound */
+		o_fill_pindex_tuple_key_bound(secondaryDesc, tuple, &pkBound);
 		
 		/* Check if PK satisfies (is less than) the validation boundary */
-		pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(primaryDesc, pkTuple);
-		
-		if (pkPalloc)
-			pfree(pkTuple.data);
+		pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(primaryDesc, &pkBound);
 		
 		if (pkSatisfiesBoundary)
 		{

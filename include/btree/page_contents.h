@@ -16,9 +16,9 @@
 
 #include "btree/page_state.h"
 #include "s3/queue.h"
+#include "tableam/key_range.h"
 
 #define NUM_SEQ_SCANS_ARRAY_SIZE	32
-#define MAX_VALIDATION_BOUNDARY_SIZE 256	/* Maximum size of serialized PK tuple for validation boundary */
 
 /* The structure of BTree meta page.  Referenced by metaPageBlkno. */
 typedef struct
@@ -61,11 +61,11 @@ typedef struct
 	 * current primary key value up to which validation has been completed.
 	 * Concurrent transactions can only modify secondary index entries for PKs
 	 * less than or equal to this boundary.
-	 * validationBoundaryLen of 0 means no validation in progress.
+	 * validationBoundaryValid of false means no validation in progress.
 	 */
 	LWLock		validationBoundaryLock;
-	uint16		validationBoundaryLen;
-	char		validationBoundaryData[MAX_VALIDATION_BOUNDARY_SIZE];
+	bool		validationBoundaryValid;
+	OBTreeKeyBound validationBoundary;
 } BTreeMetaPage;
 
 StaticAssertDecl(sizeof(BTreeMetaPage) <= ORIOLEDB_BLCKSZ,

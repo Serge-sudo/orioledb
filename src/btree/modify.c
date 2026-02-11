@@ -706,10 +706,15 @@ o_btree_modify_insert_update(BTreeModifyInternalContext *context)
 	{
 		OTableDescr *tableDescr = (OTableDescr *) desc->arg;
 		InsertOnConflictCallbackArg *ioc_arg = (InsertOnConflictCallbackArg *) callbackInfo->arg;
+		OIndexDescr *primaryIndexDescr = &tableDescr->indices[PrimaryIndexNumber];
+		OBTreeKeyBound pkBound;
 		bool		pkSatisfiesBoundary;
 		
+		/* Convert the primary key tuple to OBTreeKeyBound */
+		o_fill_key_bound(primaryIndexDescr, context->tuple, context->tupleType, &pkBound);
+		
 		/* Check validation boundary while holding the page lock on primary */
-		pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(desc, context->tuple);
+		pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(desc, &pkBound);
 		
 		/* Store result for use by secondary index operations */
 		ioc_arg->pkSatisfiesBoundary = pkSatisfiesBoundary;
@@ -844,10 +849,15 @@ o_btree_modify_delete(BTreeModifyInternalContext *context)
 	{
 		OTableDescr *tableDescr = (OTableDescr *) desc->arg;
 		OModifyCallbackArg *mod_arg = (OModifyCallbackArg *) callbackInfo->arg;
+		OIndexDescr *primaryIndexDescr = &tableDescr->indices[PrimaryIndexNumber];
+		OBTreeKeyBound pkBound;
 		bool		pkSatisfiesBoundary;
 		
+		/* Convert the current tuple to OBTreeKeyBound */
+		o_fill_key_bound(primaryIndexDescr, curTuple, BTreeKeyLeafTuple, &pkBound);
+		
 		/* Check validation boundary while holding the page lock on primary */
-		pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(desc, curTuple);
+		pkSatisfiesBoundary = btree_pk_satisfies_validation_boundary(desc, &pkBound);
 		
 		/* Store result for use by secondary index operations */
 		mod_arg->pkSatisfiesBoundary = pkSatisfiesBoundary;

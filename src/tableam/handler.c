@@ -1677,11 +1677,16 @@ orioledb_index_validate_scan(Relation heapRelation,
 		{
 			if (lastBlkno != OInvalidInMemoryBlkno)
 			{
+				OBTreeKeyBound bound;
+				OIndexDescr *primaryIndexDescr = &GET_PRIMARY(descr)->indices[PrimaryIndexNumber];
+				
 				/*
 				 * We've moved to a new page. Set the boundary to the current tuple
 				 * which is on the new page. The iterator holds a lock on this page.
+				 * Convert the primary key tuple to an OBTreeKeyBound.
 				 */
-				btree_set_validation_boundary(&GET_PRIMARY(descr)->desc, heapTuple);
+				o_fill_key_bound(primaryIndexDescr, heapTuple, BTreeKeyLeafTuple, &bound);
+				btree_set_validation_boundary(&GET_PRIMARY(descr)->desc, &bound);
 			}
 			lastBlkno = hint.blkno;
 		}
