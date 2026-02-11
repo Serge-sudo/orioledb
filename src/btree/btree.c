@@ -423,38 +423,34 @@ void
  * The boundary is stored as an OBTreeKeyBound in the meta page.
  */
 void
-btree_set_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
+/*
+ * Serialize an OBTreeKeyBound into a byte buffer.
+ * Returns the number of bytes written.
+ */
+static int
+serialize_key_bound(OBTreeKeyBound *boundary, char *buffer, int bufsize)
 {
-	BTreeMetaPage *metaPage;
-	char	   *ptr;
+	char	   *ptr = buffer;
 	int			i;
 	int16		typlen;
 	bool		typbyval;
 
-	Assert(desc != NULL);
 	Assert(boundary != NULL);
-
-	metaPage = BTREE_GET_META(desc);
-	LWLockAcquire(&metaPage->validationBoundaryLock, LW_EXCLUSIVE);
-
-	/*
-	 * Serialize the boundary data into the meta page buffer.
-	 * For pass-by-reference types, we need to serialize the data
-	 * because Datum pointers won't be valid in shared memory.
-	 */
-	ptr = metaPage->validationBoundaryData;
-	metaPage->validationBoundaryNKeys = boundary->nkeys;
+	Assert(buffer != NULL);
 
 	for (i = 0; i < boundary->nkeys; i++)
 	{
 		OBTreeValueBound *key = &boundary->keys[i];
-		OIndexField *field = &desc->fields[i];
 
 		/* Store type info */
+		if (ptr + sizeof(Oid) > buffer + bufsize)
+			elog(ERROR, "validation boundary data too large");
 		memcpy(ptr, &key->type, sizeof(Oid));
 		ptr += sizeof(Oid);
 
 		/* Store flags */
+		if (ptr + sizeof(uint8) > buffer + bufsize)
+			elog(ERROR, "validation boundary data too large");
 		memcpy(ptr, &key->flags, sizeof(uint8));
 		ptr += sizeof(uint8);
 
@@ -469,6 +465,8 @@ btree_set_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
 		else if (typbyval)
 		{
 			/* Pass-by-value: store the Datum directly */
+			if (ptr + sizeof(Datum) > buffer + bufsize)
+				elog(ERROR, "validation boundary data too large");
 			memcpy(ptr, &key->value, sizeof(Datum));
 			ptr += sizeof(Datum);
 		}
@@ -477,7 +475,7 @@ btree_set_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
 			/* Variable length type */
 			int			len = VARSIZE_ANY(DatumGetPointer(key->value));
 
-			if (ptr + sizeof(int) + len > metaPage->validationBoundaryData + sizeof(metaPage->validationBoundaryData))
+			if (ptr + sizeof(int) + len > buffer + bufsize)
 				elog(ERROR, "validation boundary data too large");
 
 			memcpy(ptr, &len, sizeof(int));
@@ -488,7 +486,7 @@ btree_set_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
 		else if (typlen > 0)
 		{
 			/* Fixed length pass-by-reference type */
-			if (ptr + typlen > metaPage->validationBoundaryData + sizeof(metaPage->validationBoundaryData))
+			if (ptr + typlen > buffer + bufsize)
 				elog(ERROR, "validation boundary data too large");
 
 			memcpy(ptr, DatumGetPointer(key->value), typlen);
@@ -500,53 +498,27 @@ btree_set_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
 		}
 	}
 
-	metaPage->validationBoundaryLen = ptr - metaPage->validationBoundaryData;
-	metaPage->validationBoundaryValid = true;
-
-	LWLockRelease(&metaPage->validationBoundaryLock);
-
-#ifdef USE_ASSERT_CHECKING
-	/* Debug: log when boundary is set */
-	btree_print_validation_boundary(desc, boundary);
-#endif
+	return ptr - buffer;
 }
 
 /*
- * Get the current validation boundary.
- * Returns true if a boundary is set, false otherwise.
- * The boundary is deserialized from shared memory into the caller-provided structure.
+ * Deserialize an OBTreeKeyBound from a byte buffer.
+ * Allocates memory for pass-by-reference types using palloc.
  */
-bool
-btree_get_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
+static void
+deserialize_key_bound(OBTreeKeyBound *boundary, int nkeys, char *buffer)
 {
-	BTreeMetaPage *metaPage;
-	bool		valid;
-	char	   *ptr;
+	char	   *ptr = buffer;
 	int			i;
 	int16		typlen;
 	bool		typbyval;
 
-	Assert(desc != NULL);
 	Assert(boundary != NULL);
+	Assert(buffer != NULL);
 
-	metaPage = BTREE_GET_META(desc);
-	LWLockAcquire(&metaPage->validationBoundaryLock, LW_SHARED);
+	boundary->nkeys = nkeys;
 
-	valid = metaPage->validationBoundaryValid;
-	if (!valid)
-	{
-		LWLockRelease(&metaPage->validationBoundaryLock);
-		return false;
-	}
-
-	/*
-	 * Deserialize the boundary data from the meta page buffer.
-	 * We need to reconstruct Datum pointers for pass-by-reference types.
-	 */
-	ptr = metaPage->validationBoundaryData;
-	boundary->nkeys = metaPage->validationBoundaryNKeys;
-
-	for (i = 0; i < boundary->nkeys; i++)
+	for (i = 0; i < nkeys; i++)
 	{
 		OBTreeValueBound *key = &boundary->keys[i];
 
@@ -606,6 +578,64 @@ btree_get_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
 		/* Set comparator to NULL - will be initialized if needed */
 		key->comparator = NULL;
 	}
+}
+
+btree_set_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
+{
+	BTreeMetaPage *metaPage;
+	int			serialized_len;
+
+	Assert(desc != NULL);
+	Assert(boundary != NULL);
+
+	metaPage = BTREE_GET_META(desc);
+	LWLockAcquire(&metaPage->validationBoundaryLock, LW_EXCLUSIVE);
+
+	/* Serialize the boundary data into the meta page buffer */
+	serialized_len = serialize_key_bound(boundary,
+										  metaPage->validationBoundaryData,
+										  sizeof(metaPage->validationBoundaryData));
+
+	metaPage->validationBoundaryNKeys = boundary->nkeys;
+	metaPage->validationBoundaryLen = serialized_len;
+	metaPage->validationBoundaryValid = true;
+
+	LWLockRelease(&metaPage->validationBoundaryLock);
+
+#ifdef USE_ASSERT_CHECKING
+	/* Debug: log when boundary is set */
+	btree_print_validation_boundary(desc, boundary);
+#endif
+}
+
+/*
+ * Get the current validation boundary.
+ * Returns true if a boundary is set, false otherwise.
+ * The boundary is deserialized from shared memory into the caller-provided structure.
+ */
+bool
+btree_get_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
+{
+	BTreeMetaPage *metaPage;
+	bool		valid;
+	int			nkeys;
+
+	Assert(desc != NULL);
+	Assert(boundary != NULL);
+
+	metaPage = BTREE_GET_META(desc);
+	LWLockAcquire(&metaPage->validationBoundaryLock, LW_SHARED);
+
+	valid = metaPage->validationBoundaryValid;
+	if (!valid)
+	{
+		LWLockRelease(&metaPage->validationBoundaryLock);
+		return false;
+	}
+
+	/* Deserialize the boundary data from the meta page buffer */
+	nkeys = metaPage->validationBoundaryNKeys;
+	deserialize_key_bound(boundary, nkeys, metaPage->validationBoundaryData);
 
 	LWLockRelease(&metaPage->validationBoundaryLock);
 
