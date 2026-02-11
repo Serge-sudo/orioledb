@@ -62,10 +62,16 @@ typedef struct
 	 * Concurrent transactions can only modify secondary index entries for PKs
 	 * less than or equal to this boundary.
 	 * validationBoundaryValid of false means no validation in progress.
+	 * 
+	 * The boundary data is serialized into validationBoundaryData because
+	 * Datum values for pass-by-reference types are pointers that cannot be
+	 * stored directly in shared memory.
 	 */
 	LWLock		validationBoundaryLock;
 	bool		validationBoundaryValid;
-	OBTreeKeyBound validationBoundary;
+	int16		validationBoundaryNKeys;
+	uint16		validationBoundaryLen;
+	char		validationBoundaryData[256];
 } BTreeMetaPage;
 
 StaticAssertDecl(sizeof(BTreeMetaPage) <= ORIOLEDB_BLCKSZ,
