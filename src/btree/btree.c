@@ -35,9 +35,13 @@
 #include "miscadmin.h"
 #include "utils/fmgrprotos.h"
 #include "utils/numeric.h"
+#include "utils/hsearch.h"
 
 LWLockPadded *unique_locks;
 int			num_unique_locks;
+
+/* Shared memory hash table for validation boundaries */
+static HTAB *validation_boundary_htab = NULL;
 
 void
 o_btree_init_unique_lwlocks(void)
@@ -412,6 +416,47 @@ btree_downlink_stopevent_params(BTreeDescr *desc, Page p, BTreePageItemLocator *
 }
 
 /*
+ * Calculate shared memory needed for validation boundary hash table.
+ */
+Size
+btree_validation_shmem_needs(void)
+{
+	Size		size;
+
+	/* Size for hash table: 128 concurrent index builds should be enough */
+	size = hash_estimate_size(128, sizeof(ValidationBoundaryEntry));
+	
+	return size;
+}
+
+/*
+ * Initialize shared memory for validation boundary hash table.
+ */
+void
+btree_validation_shmem_init(Pointer ptr, bool found)
+{
+	HASHCTL		info;
+
+	if (!found)
+	{
+		/* Initialize hash table */
+		memset(&info, 0, sizeof(info));
+		info.keysize = sizeof(ORelOids);
+		info.entrysize = sizeof(ValidationBoundaryEntry);
+		
+		validation_boundary_htab = ShmemInitHash("Validation Boundary Hash",
+												 128, 128,
+												 &info,
+												 HASH_ELEM | HASH_BLOBS);
+	}
+	else
+	{
+		/* Attach to existing hash table */
+		validation_boundary_htab = (HTAB *) ptr;
+	}
+}
+
+/*
  * Set the validation boundary for concurrent index build.
  * The boundary represents the current primary key value up to which
  * validation has been completed.
@@ -419,24 +464,27 @@ btree_downlink_stopevent_params(BTreeDescr *desc, Page p, BTreePageItemLocator *
 void
 btree_set_validation_boundary(BTreeDescr *desc, OTuple boundary)
 {
-	BTreeMetaPage *metaPage;
+	ValidationBoundaryEntry *entry;
 	int			boundaryLen;
+	bool		found;
 
 	Assert(desc != NULL);
 	Assert(!O_TUPLE_IS_NULL(boundary));
+	Assert(validation_boundary_htab != NULL);
 
 	boundaryLen = o_btree_len(desc, boundary, OTupleLength);
-	if (boundaryLen > MAX_VALIDATION_BOUNDARY_SIZE)
+	if (boundaryLen > O_BTREE_MAX_KEY_SIZE)
 		elog(ERROR, "validation boundary tuple too large: %d bytes (maximum: %d bytes)",
-			 boundaryLen, MAX_VALIDATION_BOUNDARY_SIZE);
+			 boundaryLen, O_BTREE_MAX_KEY_SIZE);
 
-	metaPage = BTREE_GET_META(desc);
-	LWLockAcquire(&metaPage->validationBoundaryLock, LW_EXCLUSIVE);
+	/* Insert or update entry in hash table */
+	entry = (ValidationBoundaryEntry *) hash_search(validation_boundary_htab,
+													&desc->oids,
+													HASH_ENTER,
+													&found);
 
-	memcpy(metaPage->validationBoundaryData, boundary.data, boundaryLen);
-	metaPage->validationBoundaryLen = boundaryLen;
-
-	LWLockRelease(&metaPage->validationBoundaryLock);
+	memcpy(entry->tupleData, boundary.data, boundaryLen);
+	entry->tupleLen = boundaryLen;
 }
 
 /*
@@ -447,29 +495,28 @@ btree_set_validation_boundary(BTreeDescr *desc, OTuple boundary)
 bool
 btree_get_validation_boundary(BTreeDescr *desc, OTuple *boundary)
 {
-	BTreeMetaPage *metaPage;
-	uint16		len;
+	ValidationBoundaryEntry *entry;
 	char	   *data;
 
 	Assert(desc != NULL);
 	Assert(boundary != NULL);
+	Assert(validation_boundary_htab != NULL);
 
-	metaPage = BTREE_GET_META(desc);
-	LWLockAcquire(&metaPage->validationBoundaryLock, LW_SHARED);
+	/* Look up entry in hash table */
+	entry = (ValidationBoundaryEntry *) hash_search(validation_boundary_htab,
+													&desc->oids,
+													HASH_FIND,
+													NULL);
 
-	len = metaPage->validationBoundaryLen;
-	if (len == 0)
+	if (entry == NULL)
 	{
-		LWLockRelease(&metaPage->validationBoundaryLock);
 		O_TUPLE_SET_NULL(*boundary);
 		return false;
 	}
 
 	/* Allocate and copy the boundary tuple */
-	data = (char *) palloc(len);
-	memcpy(data, metaPage->validationBoundaryData, len);
-
-	LWLockRelease(&metaPage->validationBoundaryLock);
+	data = (char *) palloc(entry->tupleLen);
+	memcpy(data, entry->tupleData, entry->tupleLen);
 
 	boundary->data = data;
 	boundary->formatFlags = 0;	/* Will be set by caller if needed */
@@ -482,16 +529,14 @@ btree_get_validation_boundary(BTreeDescr *desc, OTuple *boundary)
 void
 btree_clear_validation_boundary(BTreeDescr *desc)
 {
-	BTreeMetaPage *metaPage;
-
 	Assert(desc != NULL);
+	Assert(validation_boundary_htab != NULL);
 
-	metaPage = BTREE_GET_META(desc);
-	LWLockAcquire(&metaPage->validationBoundaryLock, LW_EXCLUSIVE);
-
-	metaPage->validationBoundaryLen = 0;
-
-	LWLockRelease(&metaPage->validationBoundaryLock);
+	/* Remove entry from hash table */
+	hash_search(validation_boundary_htab,
+				&desc->oids,
+				HASH_REMOVE,
+				NULL);
 }
 
 /*
@@ -504,29 +549,29 @@ btree_clear_validation_boundary(BTreeDescr *desc)
 bool
 btree_pk_satisfies_validation_boundary(BTreeDescr *desc, OTuple pk)
 {
-	BTreeMetaPage *metaPage;
+	ValidationBoundaryEntry *entry;
 	OTuple		boundary;
-	uint16		len;
-	char		boundaryData[MAX_VALIDATION_BOUNDARY_SIZE];
+	char		boundaryData[O_BTREE_MAX_KEY_SIZE];
 	int			cmp;
 
 	Assert(desc != NULL);
 	Assert(!O_TUPLE_IS_NULL(pk));
+	Assert(validation_boundary_htab != NULL);
 
-	metaPage = BTREE_GET_META(desc);
-	LWLockAcquire(&metaPage->validationBoundaryLock, LW_SHARED);
+	/* Look up entry in hash table */
+	entry = (ValidationBoundaryEntry *) hash_search(validation_boundary_htab,
+													&desc->oids,
+													HASH_FIND,
+													NULL);
 
-	len = metaPage->validationBoundaryLen;
-	if (len == 0)
+	if (entry == NULL)
 	{
 		/* No validation in progress */
-		LWLockRelease(&metaPage->validationBoundaryLock);
 		return true;
 	}
 
 	/* Copy boundary to local buffer to minimize lock hold time */
-	memcpy(boundaryData, metaPage->validationBoundaryData, len);
-	LWLockRelease(&metaPage->validationBoundaryLock);
+	memcpy(boundaryData, entry->tupleData, entry->tupleLen);
 
 	boundary.data = boundaryData;
 	boundary.formatFlags = 0;

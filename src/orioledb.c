@@ -204,6 +204,7 @@ static ShmemItem shmemItems[] = {
 	{o_proc_shmem_needs, o_proc_shmem_init},
 	{ppools_shmem_needs, ppools_shmem_init},
 	{btree_scan_shmem_needs, btree_scan_init_shmem},
+	{btree_validation_shmem_needs, btree_validation_shmem_init},
 	{s3_queue_shmem_needs, s3_queue_init_shmem},
 	{s3_workers_shmem_needs, s3_workers_init_shmem},
 	{s3_headers_shmem_needs, s3_headers_shmem_init},
