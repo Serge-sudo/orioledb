@@ -32,7 +32,6 @@
 #include "utils/stopevent.h"
 
 #include "fmgr.h"
-#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "utils/fmgrprotos.h"
 #include "utils/numeric.h"
@@ -418,207 +417,39 @@ btree_downlink_stopevent_params(BTreeDescr *desc, Page p, BTreePageItemLocator *
  * validation has been completed.
  */
 void
-/*
- * Set the validation boundary for concurrent index builds.
- * The boundary is stored as an OBTreeKeyBound in the meta page.
- */
-void
-/*
- * Serialize an OBTreeKeyBound into a byte buffer.
- * Returns the number of bytes written.
- */
-static int
-serialize_key_bound(OBTreeKeyBound *boundary, char *buffer, int bufsize)
-{
-	char	   *ptr = buffer;
-	int			i;
-	int16		typlen;
-	bool		typbyval;
-
-	Assert(boundary != NULL);
-	Assert(buffer != NULL);
-
-	for (i = 0; i < boundary->nkeys; i++)
-	{
-		OBTreeValueBound *key = &boundary->keys[i];
-
-		/* Store type info */
-		if (ptr + sizeof(Oid) > buffer + bufsize)
-			elog(ERROR, "validation boundary data too large");
-		memcpy(ptr, &key->type, sizeof(Oid));
-		ptr += sizeof(Oid);
-
-		/* Store flags */
-		if (ptr + sizeof(uint8) > buffer + bufsize)
-			elog(ERROR, "validation boundary data too large");
-		memcpy(ptr, &key->flags, sizeof(uint8));
-		ptr += sizeof(uint8);
-
-		/* Get type info for serialization */
-		get_typlenbyval(key->type, &typlen, &typbyval);
-
-		/* Serialize the value */
-		if (key->flags & O_VALUE_BOUND_NULL)
-		{
-			/* NULL value - nothing to store */
-		}
-		else if (typbyval)
-		{
-			/* Pass-by-value: store the Datum directly */
-			if (ptr + sizeof(Datum) > buffer + bufsize)
-				elog(ERROR, "validation boundary data too large");
-			memcpy(ptr, &key->value, sizeof(Datum));
-			ptr += sizeof(Datum);
-		}
-		else if (typlen == -1)
-		{
-			/* Variable length type */
-			int			len = VARSIZE_ANY(DatumGetPointer(key->value));
-
-			if (ptr + sizeof(int) + len > buffer + bufsize)
-				elog(ERROR, "validation boundary data too large");
-
-			memcpy(ptr, &len, sizeof(int));
-			ptr += sizeof(int);
-			memcpy(ptr, DatumGetPointer(key->value), len);
-			ptr += len;
-		}
-		else if (typlen > 0)
-		{
-			/* Fixed length pass-by-reference type */
-			if (ptr + typlen > buffer + bufsize)
-				elog(ERROR, "validation boundary data too large");
-
-			memcpy(ptr, DatumGetPointer(key->value), typlen);
-			ptr += typlen;
-		}
-		else
-		{
-			elog(ERROR, "unsupported type length: %d", typlen);
-		}
-	}
-
-	return ptr - buffer;
-}
-
-/*
- * Deserialize an OBTreeKeyBound from a byte buffer.
- * Allocates memory for pass-by-reference types using palloc.
- */
-static void
-deserialize_key_bound(OBTreeKeyBound *boundary, int nkeys, char *buffer)
-{
-	char	   *ptr = buffer;
-	int			i;
-	int16		typlen;
-	bool		typbyval;
-
-	Assert(boundary != NULL);
-	Assert(buffer != NULL);
-
-	boundary->nkeys = nkeys;
-
-	for (i = 0; i < nkeys; i++)
-	{
-		OBTreeValueBound *key = &boundary->keys[i];
-
-		/* Read type info */
-		memcpy(&key->type, ptr, sizeof(Oid));
-		ptr += sizeof(Oid);
-
-		/* Read flags */
-		memcpy(&key->flags, ptr, sizeof(uint8));
-		ptr += sizeof(uint8);
-
-		/* Get type info for deserialization */
-		get_typlenbyval(key->type, &typlen, &typbyval);
-
-		/* Deserialize the value */
-		if (key->flags & O_VALUE_BOUND_NULL)
-		{
-			/* NULL value */
-			key->value = (Datum) 0;
-		}
-		else if (typbyval)
-		{
-			/* Pass-by-value: read the Datum directly */
-			memcpy(&key->value, ptr, sizeof(Datum));
-			ptr += sizeof(Datum);
-		}
-		else if (typlen == -1)
-		{
-			/* Variable length type - allocate and copy */
-			int			len;
-			void	   *data;
-
-			memcpy(&len, ptr, sizeof(int));
-			ptr += sizeof(int);
-
-			data = palloc(len);
-			memcpy(data, ptr, len);
-			ptr += len;
-
-			key->value = PointerGetDatum(data);
-		}
-		else if (typlen > 0)
-		{
-			/* Fixed length pass-by-reference type - allocate and copy */
-			void	   *data = palloc(typlen);
-
-			memcpy(data, ptr, typlen);
-			ptr += typlen;
-
-			key->value = PointerGetDatum(data);
-		}
-		else
-		{
-			elog(ERROR, "unsupported type length: %d", typlen);
-		}
-
-		/* Set comparator to NULL - will be initialized if needed */
-		key->comparator = NULL;
-	}
-}
-
-btree_set_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
+btree_set_validation_boundary(BTreeDescr *desc, OTuple boundary)
 {
 	BTreeMetaPage *metaPage;
-	int			serialized_len;
+	int			boundaryLen;
 
 	Assert(desc != NULL);
-	Assert(boundary != NULL);
+	Assert(!O_TUPLE_IS_NULL(boundary));
+
+	boundaryLen = o_btree_len(desc, boundary, OTupleLength);
+	if (boundaryLen > MAX_VALIDATION_BOUNDARY_SIZE)
+		elog(ERROR, "validation boundary tuple too large: %d bytes (maximum: %d bytes)",
+			 boundaryLen, MAX_VALIDATION_BOUNDARY_SIZE);
 
 	metaPage = BTREE_GET_META(desc);
 	LWLockAcquire(&metaPage->validationBoundaryLock, LW_EXCLUSIVE);
 
-	/* Serialize the boundary data into the meta page buffer */
-	serialized_len = serialize_key_bound(boundary,
-										  metaPage->validationBoundaryData,
-										  sizeof(metaPage->validationBoundaryData));
-
-	metaPage->validationBoundaryNKeys = boundary->nkeys;
-	metaPage->validationBoundaryLen = serialized_len;
-	metaPage->validationBoundaryValid = true;
+	memcpy(metaPage->validationBoundaryData, boundary.data, boundaryLen);
+	metaPage->validationBoundaryLen = boundaryLen;
 
 	LWLockRelease(&metaPage->validationBoundaryLock);
-
-#ifdef USE_ASSERT_CHECKING
-	/* Debug: log when boundary is set */
-	btree_print_validation_boundary(desc, boundary);
-#endif
 }
 
 /*
  * Get the current validation boundary.
  * Returns true if a boundary is set, false otherwise.
- * The boundary is deserialized from shared memory into the caller-provided structure.
+ * The boundary OTuple will be allocated in the current memory context.
  */
 bool
-btree_get_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
+btree_get_validation_boundary(BTreeDescr *desc, OTuple *boundary)
 {
 	BTreeMetaPage *metaPage;
-	bool		valid;
-	int			nkeys;
+	uint16		len;
+	char	   *data;
 
 	Assert(desc != NULL);
 	Assert(boundary != NULL);
@@ -626,19 +457,22 @@ btree_get_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
 	metaPage = BTREE_GET_META(desc);
 	LWLockAcquire(&metaPage->validationBoundaryLock, LW_SHARED);
 
-	valid = metaPage->validationBoundaryValid;
-	if (!valid)
+	len = metaPage->validationBoundaryLen;
+	if (len == 0)
 	{
 		LWLockRelease(&metaPage->validationBoundaryLock);
+		O_TUPLE_SET_NULL(*boundary);
 		return false;
 	}
 
-	/* Deserialize the boundary data from the meta page buffer */
-	nkeys = metaPage->validationBoundaryNKeys;
-	deserialize_key_bound(boundary, nkeys, metaPage->validationBoundaryData);
+	/* Allocate and copy the boundary tuple */
+	data = (char *) palloc(len);
+	memcpy(data, metaPage->validationBoundaryData, len);
 
 	LWLockRelease(&metaPage->validationBoundaryLock);
 
+	boundary->data = data;
+	boundary->formatFlags = 0;	/* Will be set by caller if needed */
 	return true;
 }
 
@@ -655,7 +489,7 @@ btree_clear_validation_boundary(BTreeDescr *desc)
 	metaPage = BTREE_GET_META(desc);
 	LWLockAcquire(&metaPage->validationBoundaryLock, LW_EXCLUSIVE);
 
-	metaPage->validationBoundaryValid = false;
+	metaPage->validationBoundaryLen = 0;
 
 	LWLockRelease(&metaPage->validationBoundaryLock);
 }
@@ -668,75 +502,39 @@ btree_clear_validation_boundary(BTreeDescr *desc)
  * Returns false if PK is greater than the boundary.
  */
 bool
-btree_pk_satisfies_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *pk)
+btree_pk_satisfies_validation_boundary(BTreeDescr *desc, OTuple pk)
 {
-	OBTreeKeyBound boundary;
+	BTreeMetaPage *metaPage;
+	OTuple		boundary;
+	uint16		len;
+	char		boundaryData[MAX_VALIDATION_BOUNDARY_SIZE];
 	int			cmp;
 
 	Assert(desc != NULL);
-	Assert(pk != NULL);
+	Assert(!O_TUPLE_IS_NULL(pk));
 
-	/* Get the deserialized boundary */
-	if (!btree_get_validation_boundary(desc, &boundary))
+	metaPage = BTREE_GET_META(desc);
+	LWLockAcquire(&metaPage->validationBoundaryLock, LW_SHARED);
+
+	len = metaPage->validationBoundaryLen;
+	if (len == 0)
 	{
 		/* No validation in progress */
+		LWLockRelease(&metaPage->validationBoundaryLock);
 		return true;
 	}
 
+	/* Copy boundary to local buffer to minimize lock hold time */
+	memcpy(boundaryData, metaPage->validationBoundaryData, len);
+	LWLockRelease(&metaPage->validationBoundaryLock);
+
+	boundary.data = boundaryData;
+	boundary.formatFlags = 0;
+
 	/* Compare PK with boundary */
-	cmp = o_btree_cmp(desc, pk, BTreeKeyBound,
-					  &boundary, BTreeKeyBound);
+	cmp = o_btree_cmp(desc, pk.data, BTreeKeyNonLeafKey,
+					  boundary.data, BTreeKeyNonLeafKey);
 
 	/* Return true if PK <= boundary */
 	return (cmp <= 0);
-}
-
-/*
- * Debug function to print the validation boundary when it is set.
- * This helps with debugging concurrent index validation.
- */
-void
-btree_print_validation_boundary(BTreeDescr *desc, OBTreeKeyBound *boundary)
-{
-	StringInfoData buf;
-	int			i;
-
-	Assert(desc != NULL);
-	Assert(boundary != NULL);
-
-	initStringInfo(&buf);
-
-	appendStringInfo(&buf, "Validation boundary set for index %u: nkeys=%d, keys=(", 
-					 desc->oids.datoid, boundary->nkeys);
-
-	/* Print the tuple key values using type-specific output functions */
-	for (i = 0; i < boundary->nkeys; i++)
-	{
-		if (i > 0)
-			appendStringInfo(&buf, ", ");
-		
-		/* Check if the value is NULL */
-		if (boundary->keys[i].flags & O_VALUE_BOUND_NULL)
-		{
-			appendStringInfo(&buf, "null");
-		}
-		else
-		{
-			Oid			typoutput;
-			bool		typisvarlena;
-			char	   *res;
-
-			/* Get the output function for this type */
-			getTypeOutputInfo(boundary->keys[i].type, &typoutput, &typisvarlena);
-			
-			/* Convert the Datum to string using the type's output function */
-			res = OidOutputFunctionCall(typoutput, boundary->keys[i].value);
-			appendStringInfo(&buf, "'%s'", res);
-		}
-	}
-
-	appendStringInfo(&buf, ")");
-	
-	elog(DEBUG1, "%s", buf.data);
-	pfree(buf.data);
 }
