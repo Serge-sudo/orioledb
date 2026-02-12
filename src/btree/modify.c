@@ -35,6 +35,14 @@
 #define IsRelationTree(desc) (ORelOidsIsValid(desc->oids) && !IS_SYS_TREE_OIDS(desc->oids))
 
 /*
+ * Global variable to pass boundary check result from PK modification to
+ * secondary index undo record creation. Since secondary index operations
+ * always follow PK operations and only one PK can be modified at a time,
+ * this simple approach works correctly.
+ */
+static bool g_last_pk_satisfies_boundary = true;
+
+/*
  * Context for o_btree_modify_internal()
  */
 typedef struct
@@ -700,7 +708,8 @@ o_btree_modify_insert_update(BTreeModifyInternalContext *context)
 	/*
 	 * For primary index modification during concurrent secondary index build,
 	 * check if the PK satisfies the validation boundary WHILE HOLDING PAGE LOCK.
-	 * Store the result in the callback arg for use by secondary index operations.
+	 * Store the result in both the callback arg and global variable for use by
+	 * secondary index operations and undo record creation.
 	 */
 	if (desc->type == oIndexPrimary && desc->arg != NULL && callbackInfo != NULL && callbackInfo->arg != NULL)
 	{
@@ -713,6 +722,9 @@ o_btree_modify_insert_update(BTreeModifyInternalContext *context)
 		
 		/* Store result for use by secondary index operations */
 		ioc_arg->pkSatisfiesBoundary = pkSatisfiesBoundary;
+		
+		/* Store in global variable for undo record creation */
+		g_last_pk_satisfies_boundary = pkSatisfiesBoundary;
 	}
 
 	/*
@@ -838,7 +850,8 @@ o_btree_modify_delete(BTreeModifyInternalContext *context)
 	/*
 	 * For primary index modification during concurrent secondary index build,
 	 * check if the PK satisfies the validation boundary WHILE HOLDING PAGE LOCK.
-	 * Store the result in the callback arg for use by secondary index operations.
+	 * Store the result in both the callback arg and global variable for use by
+	 * secondary index operations and undo record creation.
 	 */
 	if (desc->type == oIndexPrimary && desc->arg != NULL && callbackInfo != NULL && callbackInfo->arg != NULL)
 	{
@@ -851,6 +864,9 @@ o_btree_modify_delete(BTreeModifyInternalContext *context)
 		
 		/* Store result for use by secondary index operations */
 		mod_arg->pkSatisfiesBoundary = pkSatisfiesBoundary;
+		
+		/* Store in global variable for undo record creation */
+		g_last_pk_satisfies_boundary = pkSatisfiesBoundary;
 	}
 
 	/*
@@ -1602,4 +1618,15 @@ o_btree_autonomous_delete(BTreeDescr *desc, OTuple key, BTreeKeyType keyType,
 	}
 
 	return (result == OBTreeModifyResultDeleted);
+}
+
+/*
+ * Get the last boundary check result from primary index modification.
+ * This is used when creating undo records for secondary index operations
+ * to determine if the operation should be marked as actuallyPerformed.
+ */
+bool
+o_get_last_pk_satisfies_boundary(void)
+{
+	return g_last_pk_satisfies_boundary;
 }

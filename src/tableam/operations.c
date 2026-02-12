@@ -1442,7 +1442,7 @@ o_tbl_index_insert(OTableDescr *descr,
 		/*
 		 * Create undo record for this secondary index operation.
 		 * The undo record will track what actually happened during the operation.
-		 * The boundary check will occur later when the page lock is held.
+		 * Use the boundary check result from the primary index modification.
 		 *
 		 * Skip undo record creation if oxid is invalid (e.g., during validation scan).
 		 */
@@ -1451,7 +1451,7 @@ o_tbl_index_insert(OTableDescr *descr,
 			make_secondary_index_undo_record(descr, indexNum,
 											 BTreeOperationInsert,
 											 slot,
-											 true);  /* Will be set by btree_modify based on actual result */
+											 o_get_last_pk_satisfies_boundary());
 		}
 
 		if (own_tup)

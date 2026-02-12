@@ -31,11 +31,13 @@
 #include "utils/page_pool.h"
 #include "utils/stopevent.h"
 
+#include "catalog/pg_index.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "utils/fmgrprotos.h"
-#include "utils/numeric.h"
 #include "utils/hsearch.h"
+#include "utils/numeric.h"
+#include "utils/syscache.h"
 
 LWLockPadded *unique_locks;
 int			num_unique_locks;
@@ -582,4 +584,36 @@ btree_pk_satisfies_validation_boundary(BTreeDescr *desc, OTuple pk)
 
 	/* Return true if PK <= boundary */
 	return (cmp <= 0);
+}
+
+/*
+ * Check if an index is "ready but not valid" by querying pg_index.
+ * This indicates the index is being built concurrently.
+ *
+ * Returns true if indisready=true and indisvalid=false, false otherwise.
+ */
+bool
+btree_index_is_ready_not_valid(Relation indexRel)
+{
+	HeapTuple	indexTuple;
+	Form_pg_index indexForm;
+	bool		result;
+
+	/* Get the index tuple from pg_index */
+	indexTuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(RelationGetRelid(indexRel)));
+	
+	if (!HeapTupleIsValid(indexTuple))
+	{
+		/* Index not found in pg_index */
+		return false;
+	}
+
+	indexForm = (Form_pg_index) GETSTRUCT(indexTuple);
+
+	/* Check if index is ready but not valid */
+	result = (indexForm->indisready && !indexForm->indisvalid);
+
+	ReleaseSysCache(indexTuple);
+
+	return result;
 }

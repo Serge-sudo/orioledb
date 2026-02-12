@@ -86,5 +86,6 @@ extern OBTreeModifyResult o_btree_insert_unique(BTreeDescr *desc,
 												RowLockMode lock_mode,
 												BTreeLocationHint *hint,
 												BTreeModifyCallbackInfo *callbackInfo);
+extern bool o_get_last_pk_satisfies_boundary(void);
 
 #endif							/* __BTREE_MODIFY_H__ */
