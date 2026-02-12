@@ -1210,6 +1210,7 @@ orioledb_shmem_request(void)
 	RequestAddinShmemSpace(orioledb_memsize());
 	request_btree_io_lwlocks();
 	RequestNamedLWLockTranche("orioledb_unique_locks", max_procs * 4);
+	RequestNamedLWLockTranche("orioledb_validation_boundary", 1);
 }
 
 /*
