@@ -34,6 +34,7 @@
 #include "catalog/pg_index.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "storage/lwlock.h"
 #include "utils/fmgrprotos.h"
 #include "utils/hsearch.h"
 #include "utils/numeric.h"
@@ -449,7 +450,7 @@ btree_validation_shmem_init(Pointer ptr, bool found)
 		validation_boundary_htab = ShmemInitHash("Validation Boundary Hash",
 												 128, 128,
 												 &info,
-												 HASH_ELEM | HASH_BLOBS);
+												 HASH_ELEM | HASH_BLOBS | HASH_PARTITION);
 	}
 	else
 	{
@@ -469,6 +470,8 @@ btree_set_validation_boundary(BTreeDescr *desc, OTuple boundary)
 	ValidationBoundaryEntry *entry;
 	int			boundaryLen;
 	bool		found;
+	uint32		hashcode;
+	LWLock	   *partitionLock;
 
 	Assert(desc != NULL);
 	Assert(!O_TUPLE_IS_NULL(boundary));
@@ -479,6 +482,11 @@ btree_set_validation_boundary(BTreeDescr *desc, OTuple boundary)
 		elog(ERROR, "validation boundary tuple too large: %d bytes (maximum: %d bytes)",
 			 boundaryLen, O_BTREE_MAX_KEY_SIZE);
 
+	/* Get hash code and acquire partition lock */
+	hashcode = get_hash_value(validation_boundary_htab, &desc->oids);
+	partitionLock = LockHashPartitionLock(hashcode);
+	LWLockAcquire(partitionLock, LW_EXCLUSIVE);
+
 	/* Insert or update entry in hash table */
 	entry = (ValidationBoundaryEntry *) hash_search(validation_boundary_htab,
 													&desc->oids,
@@ -487,6 +495,8 @@ btree_set_validation_boundary(BTreeDescr *desc, OTuple boundary)
 
 	memcpy(entry->tupleData, boundary.data, boundaryLen);
 	entry->tupleLen = boundaryLen;
+
+	LWLockRelease(partitionLock);
 }
 
 /*
@@ -499,10 +509,18 @@ btree_get_validation_boundary(BTreeDescr *desc, OTuple *boundary)
 {
 	ValidationBoundaryEntry *entry;
 	char	   *data;
+	uint32		hashcode;
+	LWLock	   *partitionLock;
+	bool		result = false;
 
 	Assert(desc != NULL);
 	Assert(boundary != NULL);
 	Assert(validation_boundary_htab != NULL);
+
+	/* Get hash code and acquire partition lock */
+	hashcode = get_hash_value(validation_boundary_htab, &desc->oids);
+	partitionLock = LockHashPartitionLock(hashcode);
+	LWLockAcquire(partitionLock, LW_SHARED);
 
 	/* Look up entry in hash table */
 	entry = (ValidationBoundaryEntry *) hash_search(validation_boundary_htab,
@@ -513,6 +531,7 @@ btree_get_validation_boundary(BTreeDescr *desc, OTuple *boundary)
 	if (entry == NULL)
 	{
 		O_TUPLE_SET_NULL(*boundary);
+		LWLockRelease(partitionLock);
 		return false;
 	}
 
@@ -522,7 +541,10 @@ btree_get_validation_boundary(BTreeDescr *desc, OTuple *boundary)
 
 	boundary->data = data;
 	boundary->formatFlags = 0;	/* Will be set by caller if needed */
-	return true;
+	result = true;
+
+	LWLockRelease(partitionLock);
+	return result;
 }
 
 /*
@@ -531,14 +553,24 @@ btree_get_validation_boundary(BTreeDescr *desc, OTuple *boundary)
 void
 btree_clear_validation_boundary(BTreeDescr *desc)
 {
+	uint32		hashcode;
+	LWLock	   *partitionLock;
+
 	Assert(desc != NULL);
 	Assert(validation_boundary_htab != NULL);
+
+	/* Get hash code and acquire partition lock */
+	hashcode = get_hash_value(validation_boundary_htab, &desc->oids);
+	partitionLock = LockHashPartitionLock(hashcode);
+	LWLockAcquire(partitionLock, LW_EXCLUSIVE);
 
 	/* Remove entry from hash table */
 	hash_search(validation_boundary_htab,
 				&desc->oids,
 				HASH_REMOVE,
 				NULL);
+
+	LWLockRelease(partitionLock);
 }
 
 /*
@@ -554,11 +586,19 @@ btree_pk_satisfies_validation_boundary(BTreeDescr *desc, OTuple pk)
 	ValidationBoundaryEntry *entry;
 	OTuple		boundary;
 	char		boundaryData[O_BTREE_MAX_KEY_SIZE];
+	uint16		boundaryLen;
 	int			cmp;
+	uint32		hashcode;
+	LWLock	   *partitionLock;
 
 	Assert(desc != NULL);
 	Assert(!O_TUPLE_IS_NULL(pk));
 	Assert(validation_boundary_htab != NULL);
+
+	/* Get hash code and acquire partition lock */
+	hashcode = get_hash_value(validation_boundary_htab, &desc->oids);
+	partitionLock = LockHashPartitionLock(hashcode);
+	LWLockAcquire(partitionLock, LW_SHARED);
 
 	/* Look up entry in hash table */
 	entry = (ValidationBoundaryEntry *) hash_search(validation_boundary_htab,
@@ -569,11 +609,15 @@ btree_pk_satisfies_validation_boundary(BTreeDescr *desc, OTuple pk)
 	if (entry == NULL)
 	{
 		/* No validation in progress */
+		LWLockRelease(partitionLock);
 		return true;
 	}
 
 	/* Copy boundary to local buffer to minimize lock hold time */
-	memcpy(boundaryData, entry->tupleData, entry->tupleLen);
+	boundaryLen = entry->tupleLen;
+	memcpy(boundaryData, entry->tupleData, boundaryLen);
+
+	LWLockRelease(partitionLock);
 
 	boundary.data = boundaryData;
 	boundary.formatFlags = 0;
