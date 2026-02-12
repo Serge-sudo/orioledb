@@ -14,6 +14,7 @@
 #ifndef __BTREE_H__
 #define __BTREE_H__
 
+#include "btree/page_contents.h"
 #include "transam/oxid.h"
 #include "transam/undo.h"
 #include "utils/seq_buf.h"
