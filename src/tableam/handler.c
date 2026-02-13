@@ -1347,6 +1347,68 @@ debug_print_validate_tuple(OTuple tuple, OTableDescr *table_descr, OIndexDescr *
 }
 
 /*
+ * debug_print_validate_tuple - Debug helper to print tuples added to validation tuplesort
+ *
+ * Prints the secondary index tuple being added to tuplesort during validation.
+ * Shows both the secondary key fields and primary key fields.
+ */
+static void
+debug_print_validate_tuple(OTuple tuple, OTableDescr *table_descr, OIndexDescr *index_descr)
+{
+#ifdef USE_ASSERT_CHECKING
+	StringInfoData buf;
+	BTreeDescr *desc = &index_descr->desc;
+	int			nKeyFields = desc->nKeyFields;
+	int			i;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "VALIDATE_TUPLE_ADD: index=%u.%u.%u, tuple_len=%zu",
+					 desc->oids.datoid, desc->oids.reloid, desc->oids.relnode,
+					 o_btree_len(desc, tuple, OTupleLength));
+
+	/* Print each field in the tuple */
+	for (i = 1; i <= desc->nFields; i++)
+	{
+		Datum		value;
+		bool		isnull;
+		Oid			typid;
+		int16		typlen;
+		bool		typbyval;
+		Oid			typoutput;
+		bool		typisvarlena;
+		char	   *value_str;
+
+		/* Determine if this is a secondary key field or PK field */
+		if (i <= nKeyFields)
+			appendStringInfo(&buf, ", SK_field_%d: ", i);
+		else
+			appendStringInfo(&buf, ", PK_field_%d: ", i - nKeyFields);
+
+		/* Get field info */
+		o_tuple_get_column_by_num(&desc->leafSpec, tuple, i, &value, &isnull);
+		typid = desc->leafSpec.types[i - 1];
+		get_typlenbyvalalign(typid, &typlen, &typbyval, NULL);
+
+		if (isnull)
+		{
+			appendStringInfo(&buf, "NULL");
+		}
+		else
+		{
+			/* Get the output function for this type */
+			getTypeOutputInfo(typid, &typoutput, &typisvarlena);
+			value_str = OidOutputFunctionCall(typoutput, value);
+			appendStringInfo(&buf, "%s (type=%u)", value_str, typid);
+			pfree(value_str);
+		}
+	}
+
+	elog(DEBUG1, "%s", buf.data);
+	pfree(buf.data);
+#endif							/* USE_ASSERT_CHECKING */
+}
+
+/*
  * validate_index_callback - Callback for index validation
  *
  * This callback is invoked by orioledb_ambulkdelete for each tuple in the index.
