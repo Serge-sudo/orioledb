@@ -18,8 +18,10 @@
 #include "orioledb.h"
 
 #include "btree/btree.h"
+#include "btree/find.h"
 #include "btree/io.h"
 #include "btree/iterator.h"
+#include "btree/page_state.h"
 #include "btree/scan.h"
 #include "btree/undo.h"
 #include "catalog/indices.h"
@@ -36,6 +38,7 @@
 #include "tuple/slot.h"
 #include "tuple/sort.h"
 #include "utils/compress.h"
+#include "utils/page_pool.h"
 #include "utils/rel.h"
 #include "utils/stopevent.h"
 
@@ -1597,39 +1600,76 @@ orioledb_index_validate_scan(Relation heapRelation,
 				/*
 				 * Secondary index has a tuple that primary index doesn't have.
 				 * This means we need to DELETE this spurious entry from the secondary index.
-				 * We have the full secondary index tuple, so we can delete it directly.
+				 * Delete it immediately by marking the locator as invalid, same approach
+				 * as in secondary_index_undo_callback.
 				 */
-				TupleTableSlot *deleteSlot;
-				OTableModifyResult deleteResult;
-				OIndexNumber ix_num;
+				Page		p;
+				OInMemoryBlkno blkno;
+				BTreePageItemLocator *loc;
+				OBTreeFindPageContext context;
+				OFindPageResult findResult;
+				BTreeLeafTuphdr *tupHdr;
+				OTuple		leafTup;
+				int			cmpResult;
+				BTreeDescr *secondaryDesc = &secIndex->desc;
 				
-				/* Find the index number for this secondary index */
-				ix_num = find_tree_in_descr(descr, state->index_oids);
-				if (ix_num != InvalidIndexNumber)
+				/* Load shared memory for secondary index */
+				o_btree_load_shmem(secondaryDesc);
+				
+				/* Initialize find context to locate the secondary index entry */
+				init_page_find_context(&context, secondaryDesc,
+									   COMMITSEQNO_INPROGRESS,
+									   BTREE_PAGE_FIND_MODIFY);
+				
+				/* Find the page containing this secondary index entry */
+				findResult = refind_page(&context, (Pointer) &indexTuple,
+										 BTreeKeyLeafTuple,
+										 0, InvalidInMemoryBlkno,
+										 InvalidOPageChangeCount);
+				
+				if (findResult == OFindPageResultSuccess)
 				{
-					/* Create a slot to hold the secondary index tuple for deletion */
-					deleteSlot = MakeSingleTupleTableSlot(secIndex->leafTupdesc, &TTSOpsOrioleDB);
-					
-					/* Store the full secondary index tuple in the slot */
-					tts_orioledb_store_tuple(deleteSlot, indexTuple, descr,
-											COMMITSEQNO_INPROGRESS, ix_num, true, NULL);
-					
-					/* Delete the tuple from the secondary index using o_tbl_index_delete */
-					deleteResult = o_tbl_index_delete(secIndex, ix_num, deleteSlot,
-													 get_current_oxid_if_any(), 
-													 COMMITSEQNO_INPROGRESS);
-					
-					if (deleteResult.success)
+					blkno = context.items[context.index].blkno;
+					p = O_GET_IN_MEMORY_PAGE(blkno);
+					loc = &context.items[context.index].locator;
+
+					/* Verify the entry exists and matches */
+					if (BTREE_PAGE_LOCATOR_IS_VALID(p, loc))
 					{
-						state->tups_deleted++;
-						elog(DEBUG2, "validate_index: deleted spurious tuple from secondary index");
+						BTREE_PAGE_READ_LEAF_ITEM(tupHdr, leafTup, p, loc);
+						cmpResult = o_btree_cmp(secondaryDesc, &indexTuple, BTreeKeyLeafTuple,
+											   &leafTup, BTreeKeyLeafTuple);
 					}
 					else
 					{
-						elog(WARNING, "validate_index: failed to delete spurious tuple from secondary index");
+						cmpResult = 1;
+					}
+
+					if (cmpResult == 0)
+					{
+						/*
+						 * Entry found and matches. Delete it immediately by marking
+						 * the locator as invalid (non-transactional deletion).
+						 */
+						
+						/* Mark page as dirty before modification */
+						page_block_reads(blkno);
+						
+						/* Mark the locator as invalid to delete the entry */
+						BTREE_PAGE_LOCATOR_SET_INVALID(loc);
+						
+						/* Update page statistics */
+						PAGE_ADD_N_VACATED(p, BTREE_PAGE_GET_ITEM_SIZE(p, loc));
+						
+						/* Mark the page as modified */
+						MARK_DIRTY(secondaryDesc, blkno);
+						
+						state->tups_deleted++;
+						elog(DEBUG2, "validate_index: deleted spurious tuple from secondary index");
 					}
 					
-					ExecDropSingleTupleTableSlot(deleteSlot);
+					/* Unlock the page */
+					unlock_page(blkno);
 				}
 				
 				/* Move to next index tuple */
