@@ -1426,31 +1426,29 @@ validate_index_callback(ItemPointer itemptr, void *callback_state)
 	/*
 	 * For orioledb, the actual tuple is stored in state->current_tuple
 	 * by orioledb_ambulkdelete. For validation with deletion support, we need
-	 * to store the FULL secondary index tuple (not just PK) so we can later
-	 * delete entries that don't correspond to any primary tuple.
+	 * to convert the secondary index tuple into (secondary_key_fields, pk_fields)
+	 * format, excluding any INCLUDE fields that are not needed for validation.
 	 *
 	 * The tuplesort will sort these tuples by PK (using a custom comparator),
 	 * enabling efficient merge-join with the primary index scan.
 	 */
 	if (!O_TUPLE_IS_NULL(state->current_tuple))
 	{
-		size_t tuple_len = o_btree_len(&id->desc, state->current_tuple, OTupleLength);
+		OIndexDescr *pkIndex = GET_PRIMARY(table_descr);
 		
-		/* Make a copy of the full secondary index tuple */
-		fullIndexTuple.data = (Pointer) palloc(tuple_len);
-		memcpy(fullIndexTuple.data, state->current_tuple.data, tuple_len);
-		fullIndexTuple.formatFlags = state->current_tuple.formatFlags;
+		/* Convert secondary tuple to (secondary_key_fields, pk_fields) format */
+		fullIndexTuple = convert_secondary_tuple_for_validation(state->current_tuple, id, pkIndex);
 		
 		/* Debug: Print tuple before adding to tuplesort */
 		debug_print_validate_tuple(fullIndexTuple, table_descr, id);
 		
 		/* 
-		 * Put the FULL secondary index tuple into tuplesort.
-		 * The tuplesort comparator will extract and compare PK fields for sorting.
+		 * Put the converted tuple into tuplesort.
+		 * The tuplesort comparator will sort by PK fields for merge-join.
 		 */
 		tuplesort_putotuple(state->tuplesort, fullIndexTuple);
 		
-		/* Free the allocated copy */
+		/* Free the allocated tuple */
 		pfree(fullIndexTuple.data);
 	}
 
@@ -1473,41 +1471,123 @@ orioledb_validate_next_index_tid(Tuplesortstate *tuplesort,
 }
 
 /*
- * Extract PK tuple from a secondary index tuple.
+ * Convert a secondary index tuple into (secondary_key_fields, pk_fields) format
+ * for validation tuplesort.
  * 
- * Secondary index tuples contain both secondary key fields and PK fields (PK at the end).
- * We extract the full key and return it. The o_btree_cmp function with the PK descriptor
- * will handle comparing only the PK portions.
+ * Secondary index tuples may have:
+ * - Key fields (secondary key attributes)
+ * - Primary key fields (at the end of the key)
+ * - INCLUDE fields (non-key attributes that we don't need for validation)
  * 
- * Returns: A new OTuple key. Caller must pfree the returned tuple data.
+ * This function extracts only the key fields (secondary + PK) and converts them
+ * into a tuple formatted for the specialized tuplesort that has:
+ *   [secondary_key_field_1, ..., secondary_key_field_N, pk_field_1, ..., pk_field_M]
+ * 
+ * Most of the time we can pass the secondary index tuple directly (if it has no
+ * INCLUDE fields), but when INCLUDE fields exist, we need to extract only the
+ * key portion.
+ * 
+ * Returns: A new OTuple in the format (secondary_key_fields, pk_fields).
+ *          Caller must pfree the returned tuple data.
  */
 static OTuple
-extract_pk_tuple_from_secondary(OTuple secTuple, BTreeDescr *secDesc, BTreeDescr *pkDesc)
+convert_secondary_tuple_for_validation(OTuple secTuple, OIndexDescr *secIndex, OIndexDescr *pkIndex)
 {
-	OTuple		secKey;
-	bool		keyPalloc = false;
+	BTreeDescr *secDesc = &secIndex->desc;
+	BTreeDescr *pkDesc = &pkIndex->desc;
+	int			nKeyFields = secIndex->nKeyFields;
+	int			nFields = secIndex->nFields;
+	OTuple		result;
 	
 	/*
-	 * Extract the full key from the secondary tuple.
-	 * The key contains both secondary columns and PK columns (PK at the end).
-	 * We return this key, and the comparison function using the PK descriptor
-	 * will correctly compare only the PK portion.
+	 * If secondary index has no INCLUDE fields (nFields == nKeyFields),
+	 * we can use the tuple directly since it already has the correct format:
+	 * (secondary_key_fields, pk_fields).
 	 */
-	secKey = o_btree_tuple_make_key(secDesc, secTuple, NULL, false, &keyPalloc);
-	
-	/*
-	 * If the key was allocated, return it. Otherwise, make a copy so caller
-	 * can safely free it.
-	 */
-	if (!keyPalloc && secKey.data != NULL)
+	if (nKeyFields == nFields)
 	{
-		Size keyLen = o_btree_len(secDesc, secKey, OKeyLength);
-		Pointer newData = (Pointer) palloc(keyLen);
-		memcpy(newData, secKey.data, keyLen);
-		secKey.data = newData;
+		/* Make a copy of the tuple */
+		Size tupleLen = o_btree_len(secDesc, secTuple, OTupleLength);
+		result.data = (Pointer) palloc(tupleLen);
+		memcpy(result.data, secTuple.data, tupleLen);
+		result.formatFlags = secTuple.formatFlags;
+		return result;
 	}
 	
-	return secKey;
+	/*
+	 * Secondary index has INCLUDE fields that we need to exclude.
+	 * Extract only the key fields (secondary key + PK) and create a new tuple.
+	 */
+	{
+		Datum		values[INDEX_MAX_KEYS];
+		bool		isnull[INDEX_MAX_KEYS];
+		uint32		version = o_tuple_get_version(secTuple);
+		int			i;
+		Size		len;
+		TupleDesc	secLeafTupdesc = secDesc->leafTupdesc;
+		OTupleFixedFormatSpec *secLeafSpec = &secDesc->leafSpec;
+		
+		/* Extract all key fields (secondary key fields + PK fields) */
+		for (i = 0; i < nKeyFields; i++)
+		{
+			values[i] = o_fastgetattr(secTuple, i + 1, secLeafTupdesc, secLeafSpec, &isnull[i]);
+		}
+		
+		/*
+		 * Create a new tuple with only the key fields.
+		 * We use the secondary index's leafTupdesc/leafSpec for extraction,
+		 * but create the tuple in a format suitable for validation tuplesort.
+		 */
+		len = o_new_tuple_size(secLeafTupdesc, secLeafSpec, NULL, NULL, version, values, isnull, NULL);
+		result.data = (Pointer) palloc0(len);
+		o_tuple_fill(secLeafTupdesc, secLeafSpec, &result, len, NULL, NULL, version, values, isnull, NULL);
+		
+		return result;
+	}
+}
+
+/*
+ * Extract PK tuple from a validation tuplesort tuple.
+ * 
+ * Validation tuples from tuplesort are in format: (secondary_key_fields, pk_fields).
+ * This function extracts just the PK portion for comparison with primary index tuples.
+ * 
+ * Returns: A new OTuple containing only PK fields. Caller must pfree the returned tuple data.
+ */
+static OTuple
+extract_pk_from_validation_tuple(OTuple validationTuple, OIndexDescr *secIndex, OIndexDescr *pkIndex)
+{
+	Datum		pkValues[INDEX_MAX_KEYS];
+	bool		pkIsnull[INDEX_MAX_KEYS];
+	uint32		version = o_tuple_get_version(validationTuple);
+	int			i;
+	Size		len;
+	OTuple		result;
+	BTreeDescr *secDesc = &secIndex->desc;
+	BTreeDescr *pkDesc = &pkIndex->desc;
+	int			nSecKeyFields = secIndex->nKeyFields - secIndex->nPrimaryFields;
+	
+	/*
+	 * Extract PK fields from the validation tuple.
+	 * PK fields start at position (nSecKeyFields + 1) in the tuple.
+	 */
+	for (i = 0; i < secIndex->nPrimaryFields; i++)
+	{
+		pkValues[i] = o_fastgetattr(validationTuple, nSecKeyFields + i + 1,
+									secDesc->leafTupdesc, &secDesc->leafSpec,
+									&pkIsnull[i]);
+	}
+	
+	/*
+	 * Create a new tuple with PK fields using the PK descriptor.
+	 */
+	len = o_new_tuple_size(pkDesc->nonLeafTupdesc, &pkDesc->nonLeafSpec, NULL, NULL,
+						   version, pkValues, pkIsnull, NULL);
+	result.data = (Pointer) palloc0(len);
+	o_tuple_fill(pkDesc->nonLeafTupdesc, &pkDesc->nonLeafSpec, &result, len, NULL, NULL,
+				 version, pkValues, pkIsnull, NULL);
+	
+	return result;
 }
 
 static void
@@ -1639,23 +1719,23 @@ orioledb_index_validate_scan(Relation heapRelation,
 			}
 
 			/* 
-			 * Extract PK tuple from the full secondary index tuple for comparison.
-			 * This creates a new tuple containing only the PK field values.
+			 * Extract PK tuple from the validation tuplesort tuple for comparison.
+			 * The validation tuple has format (secondary_key_fields, pk_fields).
 			 */
 			secIndex = state->index_descr;
-			OTuple pkFromSecondary = extract_pk_tuple_from_secondary(indexTuple, &secIndex->desc, &GET_PRIMARY(descr)->desc);
+			OTuple pkFromValidationTuple = extract_pk_from_validation_tuple(indexTuple, secIndex, GET_PRIMARY(descr));
 			
 			/* 
-			 * Now compare PK-to-PK: the extracted PK from secondary vs the primary index tuple.
+			 * Now compare PK-to-PK: the extracted PK from validation tuple vs the primary index tuple.
 			 * Both are now proper PK tuples that can be directly compared.
 			 */
 			cmp = o_btree_cmp(&GET_PRIMARY(descr)->desc,
-							  pkFromSecondary.data, BTreeKeyNonLeafKey,
+							  pkFromValidationTuple.data, BTreeKeyNonLeafKey,
 							  heapTuple.data, BTreeKeyLeafTuple);
 			
 			/* Free the extracted PK tuple */
-			if (pkFromSecondary.data != NULL)
-				pfree(pkFromSecondary.data);
+			if (pkFromValidationTuple.data != NULL)
+				pfree(pkFromValidationTuple.data);
 			
 			if (cmp < 0)
 			{
