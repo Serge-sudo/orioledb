@@ -275,6 +275,126 @@ tuplesort_begin_orioledb_index(OIndexDescr *idx,
 	return state;
 }
 
+/*
+ * tuplesort_begin_orioledb_index_secondary_pk - create tuplesort for secondary index validation
+ *
+ * This function creates a tuplesort for validating secondary indexes during concurrent
+ * index builds. Unlike tuplesort_begin_orioledb_index which takes a single index descriptor,
+ * this function takes both secondary and primary index descriptors.
+ *
+ * The tuples stored have a special layout:
+ * - First: Secondary index key fields
+ * - Then: Primary key fields
+ *
+ * However, the sorting is done ONLY by the primary key fields, which enables merge-join
+ * validation with the primary index scan. The tupDesc describes all fields (secondary + PK),
+ * but the sortKeys only reference the PK portion for sorting.
+ *
+ * This is essential for functional secondary indexes where secondary key values cannot
+ * be computed from PK tuples alone - we must store the actual secondary key values
+ * from the index being validated.
+ *
+ * Parameters:
+ *   secondary - The secondary index descriptor (provides field information)
+ *   primary - The primary index descriptor (provides PK fields and sorting rules)
+ *   workMem - Memory limit for in-memory sorting
+ *   randomAccess - Whether random access to sorted data is required
+ *   coordinate - Coordination info for parallel sort (can be NULL)
+ *
+ * Returns: Tuplesortstate configured for secondary index validation
+ */
+Tuplesortstate *
+tuplesort_begin_orioledb_index_secondary_pk(OIndexDescr *secondary,
+											 OIndexDescr *primary,
+											 int workMem,
+											 bool randomAccess,
+											 SortCoordinate coordinate)
+{
+	Tuplesortstate *state = tuplesort_begin_common(workMem, coordinate,
+												   randomAccess);
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+	MemoryContext oldcontext;
+	OIndexBuildSortArg *arg;
+	int			secondary_fields;
+	int			pk_fields;
+	int			total_fields;
+	int			i;
+	TupleDesc	combinedTupDesc;
+
+	/*
+	 * Calculate field counts:
+	 * - secondary_fields: all fields in secondary index (includes PK at end)
+	 * - pk_fields: number of PK key fields
+	 * - total_fields: secondary fields + redundant PK fields (we store PK twice)
+	 */
+	secondary_fields = secondary->nFields;
+	pk_fields = primary->nKeyFields;
+	total_fields = secondary_fields + pk_fields;
+
+	oldcontext = MemoryContextSwitchTo(base->maincontext);
+	
+	/*
+	 * Create combined tuple descriptor with secondary fields first, then PK fields.
+	 * We use the primary index for comparison (stored in arg->id), but the tupDesc
+	 * includes all fields.
+	 */
+	combinedTupDesc = CreateTupleDescCopy(secondary->leafTupdesc);
+	
+	/* Extend the tuple descriptor with PK fields */
+	for (i = 0; i < pk_fields; i++)
+	{
+		TupleDescInitEntry(combinedTupDesc,
+						   secondary_fields + i + 1,
+						   NameStr(primary->leafTupdesc->attrs[i].attname),
+						   primary->leafTupdesc->attrs[i].atttypid,
+						   primary->leafTupdesc->attrs[i].atttypmod,
+						   0);
+		combinedTupDesc->attrs[secondary_fields + i].attcollation =
+			primary->leafTupdesc->attrs[i].attcollation;
+	}
+	
+	arg = (OIndexBuildSortArg *) palloc0(sizeof(OIndexBuildSortArg));
+	arg->id = primary;  /* Use primary for comparison logic */
+	arg->tupDesc = combinedTupDesc;
+	arg->enforceUnique = false;  /* Secondary index validation doesn't enforce uniqueness on PK */
+
+	/*
+	 * Set up sort keys - we only sort by PK fields, which are at the end
+	 * of our combined tuple descriptor
+	 */
+	base->sortKeys = (SortSupport) palloc0(pk_fields * sizeof(SortSupportData));
+	base->nKeys = pk_fields;
+
+	base->removeabbrev = removeabbrev_orioledb_index;
+	base->comparetup = comparetup_orioledb_index;
+	base->writetup = writetup_orioledb_index;
+	base->readtup = readtup_orioledb_index;
+	base->arg = arg;
+
+	/*
+	 * Configure sort keys to reference PK fields in the combined tuple descriptor.
+	 * PK fields start at position (secondary_fields + 1) in our tuple descriptor.
+	 */
+	for (i = 0; i < pk_fields; i++)
+	{
+		SortSupport sortKey = &base->sortKeys[i];
+
+		sortKey->ssup_cxt = CurrentMemoryContext;
+		sortKey->ssup_collation = primary->fields[i].collation;
+		sortKey->ssup_nulls_first = primary->fields[i].nullfirst;
+		/* Attribute number in the combined tuple descriptor */
+		sortKey->ssup_attno = secondary_fields + i + 1;
+		sortKey->abbreviate = (i == 0);
+		sortKey->ssup_reverse = !primary->fields[i].ascending;
+		/* FIXME: no abbrev converter yet */
+		o_finish_sort_support_function(primary->fields[i].comparator, sortKey);
+	}
+
+	MemoryContextSwitchTo(oldcontext);
+
+	return state;
+}
+
 Tuplesortstate *
 tuplesort_begin_orioledb_toast(OIndexDescr *toast,
 							   OIndexDescr *primary,
