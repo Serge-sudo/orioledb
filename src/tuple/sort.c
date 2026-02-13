@@ -283,11 +283,11 @@ tuplesort_begin_orioledb_index(OIndexDescr *idx,
  * this function takes both secondary and primary index descriptors.
  *
  * The tuples stored have a special layout:
- * - First: Secondary index key fields
+ * - First: Secondary index key fields (only the actual key fields, not including PK)
  * - Then: Primary key fields
  *
- * However, the sorting is done ONLY by the primary key fields, which enables merge-join
- * validation with the primary index scan. The tupDesc describes all fields (secondary + PK),
+ * The sorting is done ONLY by the primary key fields, which enables merge-join
+ * validation with the primary index scan. The tupDesc describes all fields (secondary key + PK),
  * but the sortKeys only reference the PK portion for sorting.
  *
  * This is essential for functional secondary indexes where secondary key values cannot
@@ -295,7 +295,7 @@ tuplesort_begin_orioledb_index(OIndexDescr *idx,
  * from the index being validated.
  *
  * Parameters:
- *   secondary - The secondary index descriptor (provides field information)
+ *   secondary - The secondary index descriptor (provides secondary key field information)
  *   primary - The primary index descriptor (provides PK fields and sorting rules)
  *   workMem - Memory limit for in-memory sorting
  *   randomAccess - Whether random access to sorted data is required
@@ -315,7 +315,7 @@ tuplesort_begin_orioledb_index_secondary_pk(OIndexDescr *secondary,
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	MemoryContext oldcontext;
 	OIndexBuildSortArg *arg;
-	int			secondary_fields;
+	int			secondary_key_fields;
 	int			pk_fields;
 	int			total_fields;
 	int			i;
@@ -323,33 +323,46 @@ tuplesort_begin_orioledb_index_secondary_pk(OIndexDescr *secondary,
 
 	/*
 	 * Calculate field counts:
-	 * - secondary_fields: all fields in secondary index (includes PK at end)
+	 * - secondary_key_fields: only the key fields of secondary index (NOT including PK)
 	 * - pk_fields: number of PK key fields
-	 * - total_fields: secondary fields + redundant PK fields (we store PK twice)
+	 * - total_fields: secondary key fields + PK fields (no duplication)
 	 */
-	secondary_fields = secondary->nFields;
+	secondary_key_fields = secondary->nKeyFields;
 	pk_fields = primary->nKeyFields;
-	total_fields = secondary_fields + pk_fields;
+	total_fields = secondary_key_fields + pk_fields;
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
 	
 	/*
-	 * Create combined tuple descriptor with secondary fields first, then PK fields.
+	 * Create combined tuple descriptor with secondary key fields first, then PK fields.
 	 * We use the primary index for comparison (stored in arg->id), but the tupDesc
 	 * includes all fields.
 	 */
-	combinedTupDesc = CreateTupleDescCopy(secondary->leafTupdesc);
+	combinedTupDesc = CreateTemplateTupleDesc(total_fields);
 	
-	/* Extend the tuple descriptor with PK fields */
+	/* Add secondary key fields */
+	for (i = 0; i < secondary_key_fields; i++)
+	{
+		TupleDescInitEntry(combinedTupDesc,
+						   i + 1,
+						   NameStr(secondary->leafTupdesc->attrs[i].attname),
+						   secondary->leafTupdesc->attrs[i].atttypid,
+						   secondary->leafTupdesc->attrs[i].atttypmod,
+						   0);
+		combinedTupDesc->attrs[i].attcollation =
+			secondary->leafTupdesc->attrs[i].attcollation;
+	}
+	
+	/* Add PK fields after secondary key fields */
 	for (i = 0; i < pk_fields; i++)
 	{
 		TupleDescInitEntry(combinedTupDesc,
-						   secondary_fields + i + 1,
+						   secondary_key_fields + i + 1,
 						   NameStr(primary->leafTupdesc->attrs[i].attname),
 						   primary->leafTupdesc->attrs[i].atttypid,
 						   primary->leafTupdesc->attrs[i].atttypmod,
 						   0);
-		combinedTupDesc->attrs[secondary_fields + i].attcollation =
+		combinedTupDesc->attrs[secondary_key_fields + i].attcollation =
 			primary->leafTupdesc->attrs[i].attcollation;
 	}
 	
@@ -373,7 +386,7 @@ tuplesort_begin_orioledb_index_secondary_pk(OIndexDescr *secondary,
 
 	/*
 	 * Configure sort keys to reference PK fields in the combined tuple descriptor.
-	 * PK fields start at position (secondary_fields + 1) in our tuple descriptor.
+	 * PK fields start at position (secondary_key_fields + 1) in our tuple descriptor.
 	 */
 	for (i = 0; i < pk_fields; i++)
 	{
@@ -383,7 +396,7 @@ tuplesort_begin_orioledb_index_secondary_pk(OIndexDescr *secondary,
 		sortKey->ssup_collation = primary->fields[i].collation;
 		sortKey->ssup_nulls_first = primary->fields[i].nullfirst;
 		/* Attribute number in the combined tuple descriptor */
-		sortKey->ssup_attno = secondary_fields + i + 1;
+		sortKey->ssup_attno = secondary_key_fields + i + 1;
 		sortKey->abbreviate = (i == 0);
 		sortKey->ssup_reverse = !primary->fields[i].ascending;
 		/* FIXME: no abbrev converter yet */
