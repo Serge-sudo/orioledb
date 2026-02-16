@@ -4,11 +4,16 @@
 
 The undo chain iterator provides a way to traverse not only items visible by snapshot but also all items in undo chains. This allows for complete visibility into all versions of tuples stored in OrioleDB B-trees.
 
-## Key Functions
+The iterator is **stateful** and returns one version at a time through repeated calls. It automatically handles:
+- Current versions from leaf pages
+- All historical versions from undo chains
+- Deleted and lock-only records
+
+## Key Function
 
 ### `btree_iterate_undo_chain()`
 
-Iterates over leaf page tuples including all versions in their undo chains.
+Iterates over leaf page tuples including all versions in their undo chains, returning one version per call.
 
 ```c
 OTuple btree_iterate_undo_chain(
@@ -18,8 +23,7 @@ OTuple btree_iterate_undo_chain(
     bool endInclude,
     bool *scanEnd,
     BTreeLocationHint *hint,
-    BTreeLeafTuphdr **tupHdr,
-    UndoLocation *undoLocation
+    BTreeLeafTuphdr **tupHdr
 );
 ```
 
@@ -29,50 +33,23 @@ OTuple btree_iterate_undo_chain(
 - `scanEnd`: Set to true when scan is complete
 - `hint`: Optional location hint for optimization
 - `tupHdr`: Returns tuple header for current version
-- `undoLocation`: Returns undo location, or InvalidUndoLocation if no more versions
 
-**Returns:** Current tuple from leaf page
+**Returns:** OTuple for the current version (may be NULL for deleted/lock-only versions)
 
-### `o_walk_undo_chain()`
-
-Walks through all versions of a tuple in its undo chain, calling a callback for each version.
-
-```c
-void o_walk_undo_chain(
-    BTreeDescr *desc,
-    BTreeLeafTuphdr *tupHdr,
-    MemoryContext mcxt,
-    UndoChainCallback callback,
-    void *arg
-);
-```
-
-**Parameters:**
-- `desc`: B-tree descriptor
-- `tupHdr`: Initial tuple header (will be modified to contain each version)
-- `mcxt`: Memory context for tuple allocations
-- `callback`: Function to call for each version (can be NULL)
-- `arg`: Argument to pass to callback
-
-**Callback signature:**
-```c
-typedef bool (*UndoChainCallback)(
-    OTuple tuple,
-    BTreeLeafTuphdr *tupHdr,
-    void *arg
-);
-```
-
-Returns `false` to stop iteration early, `true` to continue.
+**Behavior:**
+1. First call returns the current version from the leaf page
+2. Subsequent calls return versions from the undo chain (oldest to newest)
+3. Automatically moves to next tuple when undo chain is exhausted
+4. Returns NULL with `*scanEnd = true` when iteration is complete
 
 ## Comparison with Other Iterators
 
-| Iterator | Undo Chain Access | Snapshot Check | Deleted Tuples |
-|----------|-------------------|----------------|----------------|
-| `btree_iterate_raw` | No | No | Returned as NULL |
-| `btree_iterate_all` | No | No | Returned with header |
-| `o_btree_iterator_fetch` | Yes | Yes | Filtered by snapshot |
-| **`btree_iterate_undo_chain`** | **Yes** | **No** | **All versions returned** |
+| Iterator | Undo Chain Access | Snapshot Check | Deleted Tuples | Returns All Versions |
+|----------|-------------------|----------------|----------------|----------------------|
+| `btree_iterate_raw` | No | No | Returned as NULL | No |
+| `btree_iterate_all` | No | No | Returned with header | No |
+| `o_btree_iterator_fetch` | Yes | Yes | Filtered by snapshot | No |
+| **`btree_iterate_undo_chain`** | **Yes** | **No** | **All versions returned** | **Yes** |
 
 ## Use Cases
 
@@ -101,23 +78,15 @@ bool scanEnd = false;
 while (!scanEnd)
 {
     BTreeLeafTuphdr *tupHdr;
-    UndoLocation undoLoc;
     
     OTuple tup = btree_iterate_undo_chain(it, NULL, BTreeKeyNone, false,
-                                          &scanEnd, NULL, &tupHdr, &undoLoc);
+                                          &scanEnd, NULL, &tupHdr);
     
-    if (!O_TUPLE_IS_NULL(tup))
+    if (!O_TUPLE_IS_NULL(tup) || tupHdr != NULL)
     {
-        // Process current version
-        process_current_version(tup, tupHdr);
-        
-        // Walk undo chain if available
-        if (UndoLocationIsValid(undoLoc))
-        {
-            BTreeLeafTuphdr undoHdr = *tupHdr;
-            o_walk_undo_chain(desc, &undoHdr, CurrentMemoryContext,
-                              my_callback, my_arg);
-        }
+        // Process each version (current + all undo versions)
+        // Check tupHdr->deleted to identify deleted tuples
+        process_version(tup, tupHdr);
     }
 }
 
@@ -126,30 +95,32 @@ btree_iterator_free(it);
 
 ## Important Notes
 
-1. **No Snapshot Filtering**: Unlike `o_btree_iterator_fetch`, this iterator does NOT apply snapshot visibility checks. ALL versions are returned regardless of transaction state.
+1. **Stateful Iterator**: The iterator maintains state to track position in undo chains. Each call returns the next version automatically.
 
-2. **Memory Management**: Tuple data returned by the iterator is allocated in the specified memory context. The caller is responsible for freeing it or ensuring the context is reset appropriately.
+2. **No Snapshot Filtering**: Unlike `o_btree_iterator_fetch`, this iterator does NOT apply snapshot visibility checks. ALL versions are returned regardless of transaction state.
 
-3. **Lock-Only Records**: The iterator automatically skips lock-only undo records via `find_non_lock_only_undo_record()`.
+3. **Memory Management**: The iterator manages memory internally. Tuple data is freed automatically when moving to the next tuple or when the iterator is freed.
 
-4. **Deleted Tuples**: Deleted tuples are included in the iteration. Check `tupHdr->deleted` to identify them.
+4. **Lock-Only Records**: The iterator automatically skips lock-only undo records via `find_non_lock_only_undo_record()`.
 
-5. **Performance**: Walking undo chains can be expensive for tuples with many versions. Consider limiting iteration depth if needed.
+5. **Deleted Tuples**: Deleted tuples are included in the iteration. Check `tupHdr->deleted` to identify them.
 
-## Example Code
-
-See `doc/undo_chain_iterator_example.c` for comprehensive examples including:
-- Simple iteration over all tuples and versions
-- Using callbacks to process versions
-- Bounded iteration with start/end keys
-- Collecting all versions of a specific tuple
+6. **Performance**: Walking undo chains can be expensive for tuples with many versions. Consider limiting iteration depth if needed.
 
 ## Implementation Details
 
-The implementation consists of two main components:
+The implementation uses a stateful iterator approach:
 
-1. **`btree_iterate_undo_chain`**: Builds on top of `btree_iterate_all` to return current page tuples along with their undo locations.
+1. **State Management**: The `BTreeIterator` structure contains fields to track:
+   - `processingUndoChain`: Whether currently iterating through an undo chain
+   - `undoChainTupHdr`: Current version's tuple header
+   - `undoChainTuple`: Current version's tuple data
+   - `undoChainTupleAllocated`: Memory allocation tracking
 
-2. **`o_walk_undo_chain`**: Traverses the undo chain starting from a given tuple header, using the existing undo infrastructure (`get_prev_leaf_header_from_undo` and `get_prev_leaf_header_and_tuple_from_undo`).
+2. **Iteration Flow**:
+   - First call returns current version from leaf page
+   - Subsequent calls return versions from undo chain
+   - Automatically moves to next tuple when chain is exhausted
+   - Uses existing undo infrastructure (`get_prev_leaf_header_from_undo` and `get_prev_leaf_header_and_tuple_from_undo`)
 
 The design follows OrioleDB's existing patterns for undo chain traversal (similar to `o_find_tuple_version`) but removes snapshot visibility filtering to provide complete access to all versions.

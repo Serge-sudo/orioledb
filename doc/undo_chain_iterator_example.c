@@ -1,11 +1,10 @@
 /*-------------------------------------------------------------------------
  *
  * undo_chain_iterator_example.c
- *		Example usage of the undo chain iterator functions
+ *		Example usage of the undo chain iterator
  *
- * This file demonstrates how to use btree_iterate_undo_chain() and
- * o_walk_undo_chain() to traverse all versions of tuples in a B-tree,
- * including all items in their undo chains.
+ * This file demonstrates how to use btree_iterate_undo_chain() to traverse
+ * all versions of tuples in a B-tree, including all items in their undo chains.
  *
  * Copyright (c) 2021-2025, Oriole DB Inc.
  * Copyright (c) 2025, Supabase Inc.
@@ -20,15 +19,16 @@
  * Example 1: Simple iteration over all tuples and their versions
  *
  * This example shows how to iterate through all tuples in a B-tree
- * and process each version in their undo chains.
+ * and all their versions from undo chains.
  */
 void
 example1_iterate_all_versions(BTreeDescr *desc)
 {
 	BTreeIterator *it;
 	bool		scanEnd = false;
-	int			total_tuples = 0;
 	int			total_versions = 0;
+	int			current_tuple_num = 0;
+	BTreeLeafTuphdr *prev_tupHdr = NULL;
 
 	/* Create an iterator starting from the beginning */
 	it = o_btree_iterator_create(desc, NULL, BTreeKeyNone,
@@ -37,120 +37,53 @@ example1_iterate_all_versions(BTreeDescr *desc)
 	while (!scanEnd)
 	{
 		BTreeLeafTuphdr *tupHdr;
-		UndoLocation undoLoc;
 		OTuple		tup;
 
-		/* Get next tuple from leaf pages */
+		/* Get next version (current or undo) */
 		tup = btree_iterate_undo_chain(it, NULL, BTreeKeyNone, false,
-									   &scanEnd, NULL, &tupHdr, &undoLoc);
+									   &scanEnd, NULL, &tupHdr);
 
-		if (!O_TUPLE_IS_NULL(tup))
+		if (!O_TUPLE_IS_NULL(tup) || tupHdr != NULL)
 		{
-			total_tuples++;
-			total_versions++;	/* Count current version */
+			/* Check if this is a new tuple (not an undo version) */
+			if (prev_tupHdr == NULL ||
+				prev_tupHdr->undoLocation != tupHdr->undoLocation)
+			{
+				if (prev_tupHdr != NULL)
+					current_tuple_num++;
+				elog(DEBUG1, "Tuple %d:", current_tuple_num);
+			}
 
-			/* Process current version */
-			elog(DEBUG1, "Tuple %d: xactInfo=%lu, deleted=%d",
-				 total_tuples,
+			total_versions++;
+
+			/* Process version */
+			elog(DEBUG2, "  Version %d: xactInfo=%lu, deleted=%d",
+				 total_versions,
 				 (unsigned long) tupHdr->xactInfo,
 				 (int) tupHdr->deleted);
 
-			/* Walk undo chain if available */
-			if (UndoLocationIsValid(undoLoc))
-			{
-				BTreeLeafTuphdr undoHdr = *tupHdr;
-				int			version_num = 1;
-
-				/* Simple inline processing without callback */
-				while (UndoLocationIsValid(undoHdr.undoLocation))
-				{
-					UndoLocation prevUndoLoc = undoHdr.undoLocation;
-					OTuple		undoTup;
-
-					if (undoHdr.deleted != BTreeLeafTupleNonDeleted ||
-						XACT_INFO_IS_LOCK_ONLY(undoHdr.xactInfo))
-					{
-						get_prev_leaf_header_from_undo(desc->undoType,
-													   &undoHdr, true);
-					}
-					else
-					{
-						get_prev_leaf_header_and_tuple_from_undo(desc->undoType,
-																 &undoHdr,
-																 &undoTup, 0);
-						pfree(undoTup.data);
-					}
-
-					total_versions++;
-					version_num++;
-
-					elog(DEBUG2, "  Version %d: xactInfo=%lu, deleted=%d",
-						 version_num,
-						 (unsigned long) undoHdr.xactInfo,
-						 (int) undoHdr.deleted);
-				}
-			}
+			prev_tupHdr = tupHdr;
 		}
 	}
 
 	btree_iterator_free(it);
 
-	elog(LOG, "Scanned %d tuples with %d total versions",
-		 total_tuples, total_versions);
+	elog(LOG, "Scanned %d total versions", total_versions);
 }
 
 /*
- * Example 2: Using callback to process undo chain versions
+ * Example 2: Counting versions per tuple
  *
- * This example shows how to use o_walk_undo_chain with a callback
- * function to process each version.
+ * This example shows how to count versions for each tuple.
  */
-
-/* Context structure for callback */
-typedef struct
-{
-	int			version_count;
-	int			deleted_count;
-	int			update_count;
-	BTreeDescr *desc;
-} VersionStats;
-
-/* Callback function for processing each version */
-static bool
-count_versions_callback(OTuple tuple, BTreeLeafTuphdr *tupHdr, void *arg)
-{
-	VersionStats *stats = (VersionStats *) arg;
-
-	stats->version_count++;
-
-	if (tupHdr->deleted != BTreeLeafTupleNonDeleted)
-	{
-		stats->deleted_count++;
-		elog(DEBUG2, "  Version %d: DELETED (deleted=%d)",
-			 stats->version_count, (int) tupHdr->deleted);
-	}
-	else if (XACT_INFO_IS_LOCK_ONLY(tupHdr->xactInfo))
-	{
-		elog(DEBUG2, "  Version %d: LOCK-ONLY", stats->version_count);
-	}
-	else if (!O_TUPLE_IS_NULL(tuple))
-	{
-		stats->update_count++;
-		elog(DEBUG2, "  Version %d: UPDATE", stats->version_count);
-	}
-
-	/* Continue iteration */
-	return true;
-}
-
 void
-example2_count_versions_with_callback(BTreeDescr *desc)
+example2_count_versions_per_tuple(BTreeDescr *desc)
 {
 	BTreeIterator *it;
 	bool		scanEnd = false;
-	VersionStats total_stats = {0};
-
-	total_stats.desc = desc;
+	int			total_tuples = 0;
+	int			versions_for_current = 0;
+	bool		in_undo_chain = false;
 
 	it = o_btree_iterator_create(desc, NULL, BTreeKeyNone,
 								  NULL, ForwardScanDirection);
@@ -158,46 +91,54 @@ example2_count_versions_with_callback(BTreeDescr *desc)
 	while (!scanEnd)
 	{
 		BTreeLeafTuphdr *tupHdr;
-		UndoLocation undoLoc;
 		OTuple		tup;
-		VersionStats tuple_stats = {0};
 
 		tup = btree_iterate_undo_chain(it, NULL, BTreeKeyNone, false,
-									   &scanEnd, NULL, &tupHdr, &undoLoc);
+									   &scanEnd, NULL, &tupHdr);
 
-		if (!O_TUPLE_IS_NULL(tup))
+		if (!O_TUPLE_IS_NULL(tup) || tupHdr != NULL)
 		{
-			tuple_stats.desc = desc;
-
-			elog(DEBUG1, "Processing tuple with %d deleted status",
-				 (int) tupHdr->deleted);
-
-			/* Walk undo chain with callback */
-			if (UndoLocationIsValid(undoLoc))
+			/*
+			 * Track if we're in an undo chain by checking if we were
+			 * processing one and still are
+			 */
+			if (!in_undo_chain)
 			{
-				BTreeLeafTuphdr undoHdr = *tupHdr;
-				o_walk_undo_chain(desc, &undoHdr, CurrentMemoryContext,
-								  count_versions_callback, &tuple_stats);
+				/* Starting a new tuple */
+				if (versions_for_current > 0)
+				{
+					elog(LOG, "Tuple %d has %d versions",
+						 total_tuples, versions_for_current);
+				}
+				total_tuples++;
+				versions_for_current = 1;
 
-				elog(DEBUG1, "Tuple has %d versions (%d updates, %d deletes)",
-					 tuple_stats.version_count,
-					 tuple_stats.update_count,
-					 tuple_stats.deleted_count);
+				/* Check if this tuple has undo chain */
+				if (UndoLocationIsValid(tupHdr->undoLocation))
+					in_undo_chain = true;
+			}
+			else
+			{
+				/* Still in undo chain */
+				versions_for_current++;
 
-				/* Accumulate stats */
-				total_stats.version_count += tuple_stats.version_count;
-				total_stats.deleted_count += tuple_stats.deleted_count;
-				total_stats.update_count += tuple_stats.update_count;
+				/* Check if we're done with this chain */
+				if (!UndoLocationIsValid(tupHdr->undoLocation))
+					in_undo_chain = false;
 			}
 		}
 	}
 
+	/* Report last tuple */
+	if (versions_for_current > 0)
+	{
+		elog(LOG, "Tuple %d has %d versions",
+			 total_tuples, versions_for_current);
+	}
+
 	btree_iterator_free(it);
 
-	elog(LOG, "Total: %d versions (%d updates, %d deletes)",
-		 total_stats.version_count,
-		 total_stats.update_count,
-		 total_stats.deleted_count);
+	elog(LOG, "Total tuples: %d", total_tuples);
 }
 
 /*
@@ -211,7 +152,7 @@ example3_bounded_iteration(BTreeDescr *desc, void *startKey, void *endKey)
 {
 	BTreeIterator *it;
 	bool		scanEnd = false;
-	int			tuple_count = 0;
+	int			version_count = 0;
 
 	/* Create iterator starting from startKey */
 	it = o_btree_iterator_create(desc, startKey,
@@ -221,161 +162,175 @@ example3_bounded_iteration(BTreeDescr *desc, void *startKey, void *endKey)
 	while (!scanEnd)
 	{
 		BTreeLeafTuphdr *tupHdr;
-		UndoLocation undoLoc;
 		OTuple		tup;
 
 		/* Iterate with end boundary */
 		tup = btree_iterate_undo_chain(it, endKey,
 									   endKey ? BTreeKeyBound : BTreeKeyNone,
-									   false, &scanEnd, NULL, &tupHdr, &undoLoc);
+									   false, &scanEnd, NULL, &tupHdr);
 
-		if (!O_TUPLE_IS_NULL(tup))
+		if (!O_TUPLE_IS_NULL(tup) || tupHdr != NULL)
 		{
-			tuple_count++;
+			version_count++;
 
-			/* Process tuple and its undo chain */
-			if (UndoLocationIsValid(undoLoc))
+			/* Process tuple version */
+			if (tupHdr->deleted != BTreeLeafTupleNonDeleted)
 			{
-				BTreeLeafTuphdr undoHdr = *tupHdr;
-				int			version_count = 0;
-
-				while (UndoLocationIsValid(undoHdr.undoLocation))
-				{
-					version_count++;
-
-					if (undoHdr.deleted != BTreeLeafTupleNonDeleted ||
-						XACT_INFO_IS_LOCK_ONLY(undoHdr.xactInfo))
-					{
-						get_prev_leaf_header_from_undo(desc->undoType,
-													   &undoHdr, true);
-					}
-					else
-					{
-						OTuple		undoTup;
-
-						get_prev_leaf_header_and_tuple_from_undo(desc->undoType,
-																 &undoHdr,
-																 &undoTup, 0);
-						pfree(undoTup.data);
-					}
-				}
-
-				elog(DEBUG1, "Tuple %d has %d versions in undo chain",
-					 tuple_count, version_count);
+				elog(DEBUG1, "Version %d: DELETED (status=%d)",
+					 version_count, (int) tupHdr->deleted);
+			}
+			else if (!O_TUPLE_IS_NULL(tup))
+			{
+				elog(DEBUG1, "Version %d: UPDATE", version_count);
 			}
 		}
 	}
 
 	btree_iterator_free(it);
 
-	elog(LOG, "Processed %d tuples in range", tuple_count);
+	elog(LOG, "Processed %d versions in range", version_count);
 }
 
 /*
- * Example 4: Collecting all versions of a specific tuple
+ * Example 4: Collecting statistics about tuple versions
  *
- * This example shows how to collect all versions of a tuple
- * for analysis or debugging purposes.
+ * This example shows how to collect detailed statistics during iteration.
  */
-
 typedef struct
 {
-	List	   *versions;	/* List of collected tuple versions */
-	int			max_versions;	/* Maximum versions to collect */
-	MemoryContext mcxt;		/* Memory context for allocations */
-	BTreeDescr *desc;		/* B-tree descriptor for tuple operations */
-} CollectVersionsContext;
+	int			total_tuples;
+	int			total_versions;
+	int			deleted_versions;
+	int			update_versions;
+	int			max_chain_length;
+	int			current_chain_length;
+} VersionStats;
 
-typedef struct
-{
-	OTuple		tuple;
-	BTreeLeafTuphdr tupHdr;
-} TupleVersion;
-
-static bool
-collect_versions_callback(OTuple tuple, BTreeLeafTuphdr *tupHdr, void *arg)
-{
-	CollectVersionsContext *ctx = (CollectVersionsContext *) arg;
-	TupleVersion *version;
-
-	/* Check if we've hit the limit */
-	if (ctx->max_versions > 0 &&
-		list_length(ctx->versions) >= ctx->max_versions)
-	{
-		return false;			/* Stop iteration */
-	}
-
-	/* Allocate and store this version */
-	version = (TupleVersion *) MemoryContextAlloc(ctx->mcxt,
-												  sizeof(TupleVersion));
-	version->tupHdr = *tupHdr;
-
-	if (!O_TUPLE_IS_NULL(tuple))
-	{
-		BTreeDescr *desc = ctx->desc;
-		int			tuple_len;
-
-		/* Get the actual tuple length using the descriptor */
-		tuple_len = o_btree_len(desc, tuple, OTupleLength);
-
-		version->tuple.data = (Pointer) MemoryContextAlloc(ctx->mcxt, tuple_len);
-		memcpy(version->tuple.data, tuple.data, tuple_len);
-		version->tuple.formatFlags = tuple.formatFlags;
-	}
-	else
-	{
-		O_TUPLE_SET_NULL(version->tuple);
-	}
-
-	ctx->versions = lappend(ctx->versions, version);
-
-	return true;				/* Continue iteration */
-}
-
-List *
-example4_collect_tuple_versions(BTreeDescr *desc, void *key, int max_versions,
-								MemoryContext mcxt)
+void
+example4_collect_statistics(BTreeDescr *desc)
 {
 	BTreeIterator *it;
 	bool		scanEnd = false;
-	CollectVersionsContext ctx;
+	VersionStats stats = {0};
+	bool		in_undo_chain = false;
 
-	ctx.versions = NIL;
-	ctx.max_versions = max_versions;
-	ctx.mcxt = mcxt;
-	ctx.desc = desc;
-
-	/* Create iterator for specific key */
-	it = o_btree_iterator_create(desc, key, BTreeKeyBound,
+	it = o_btree_iterator_create(desc, NULL, BTreeKeyNone,
 								  NULL, ForwardScanDirection);
 
 	while (!scanEnd)
 	{
 		BTreeLeafTuphdr *tupHdr;
-		UndoLocation undoLoc;
 		OTuple		tup;
 
-		tup = btree_iterate_undo_chain(it, key, BTreeKeyBound,
-									   true, &scanEnd, NULL, &tupHdr, &undoLoc);
+		tup = btree_iterate_undo_chain(it, NULL, BTreeKeyNone, false,
+									   &scanEnd, NULL, &tupHdr);
 
-		if (!O_TUPLE_IS_NULL(tup))
+		if (!O_TUPLE_IS_NULL(tup) || tupHdr != NULL)
 		{
-			/* Found our tuple, collect all its versions */
-			if (UndoLocationIsValid(undoLoc))
+			stats.total_versions++;
+
+			if (!in_undo_chain)
 			{
-				BTreeLeafTuphdr undoHdr = *tupHdr;
-				o_walk_undo_chain(desc, &undoHdr, mcxt,
-								  collect_versions_callback, &ctx);
+				/* New tuple */
+				stats.total_tuples++;
+				stats.current_chain_length = 1;
+
+				if (UndoLocationIsValid(tupHdr->undoLocation))
+					in_undo_chain = true;
+			}
+			else
+			{
+				/* Undo version */
+				stats.current_chain_length++;
+
+				if (!UndoLocationIsValid(tupHdr->undoLocation))
+				{
+					/* End of chain */
+					if (stats.current_chain_length > stats.max_chain_length)
+						stats.max_chain_length = stats.current_chain_length;
+					in_undo_chain = false;
+				}
 			}
 
-			/* We only want versions of this specific tuple */
-			break;
+			/* Count version types */
+			if (tupHdr->deleted != BTreeLeafTupleNonDeleted)
+				stats.deleted_versions++;
+			else if (!O_TUPLE_IS_NULL(tup))
+				stats.update_versions++;
 		}
 	}
 
 	btree_iterator_free(it);
 
-	elog(LOG, "Collected %d versions of tuple", list_length(ctx.versions));
+	elog(LOG, "Statistics:");
+	elog(LOG, "  Total tuples: %d", stats.total_tuples);
+	elog(LOG, "  Total versions: %d", stats.total_versions);
+	elog(LOG, "  Deleted versions: %d", stats.deleted_versions);
+	elog(LOG, "  Update versions: %d", stats.update_versions);
+	elog(LOG, "  Max chain length: %d", stats.max_chain_length);
+	elog(LOG, "  Avg versions per tuple: %.2f",
+		 (float) stats.total_versions / stats.total_tuples);
+}
 
-	return ctx.versions;
+/*
+ * Example 5: Finding tuples with long undo chains
+ *
+ * This example shows how to identify tuples with many versions.
+ */
+void
+example5_find_long_chains(BTreeDescr *desc, int min_chain_length)
+{
+	BTreeIterator *it;
+	bool		scanEnd = false;
+	int			current_chain_length = 0;
+	int			tuple_num = 0;
+	bool		in_undo_chain = false;
+
+	it = o_btree_iterator_create(desc, NULL, BTreeKeyNone,
+								  NULL, ForwardScanDirection);
+
+	while (!scanEnd)
+	{
+		BTreeLeafTuphdr *tupHdr;
+		OTuple		tup;
+
+		tup = btree_iterate_undo_chain(it, NULL, BTreeKeyNone, false,
+									   &scanEnd, NULL, &tupHdr);
+
+		if (!O_TUPLE_IS_NULL(tup) || tupHdr != NULL)
+		{
+			if (!in_undo_chain)
+			{
+				/* Report previous tuple if it had a long chain */
+				if (current_chain_length >= min_chain_length)
+				{
+					elog(LOG, "Tuple %d has long chain: %d versions",
+						 tuple_num, current_chain_length);
+				}
+
+				/* Start new tuple */
+				tuple_num++;
+				current_chain_length = 1;
+
+				if (UndoLocationIsValid(tupHdr->undoLocation))
+					in_undo_chain = true;
+			}
+			else
+			{
+				current_chain_length++;
+
+				if (!UndoLocationIsValid(tupHdr->undoLocation))
+					in_undo_chain = false;
+			}
+		}
+	}
+
+	/* Check last tuple */
+	if (current_chain_length >= min_chain_length)
+	{
+		elog(LOG, "Tuple %d has long chain: %d versions",
+			 tuple_num, current_chain_length);
+	}
+
+	btree_iterator_free(it);
 }
