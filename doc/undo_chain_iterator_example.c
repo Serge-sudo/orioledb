@@ -27,8 +27,6 @@ example1_iterate_all_versions(BTreeDescr *desc)
 	BTreeIterator *it;
 	bool		scanEnd = false;
 	int			total_versions = 0;
-	int			current_tuple_num = 0;
-	bool		in_undo_chain = false;
 
 	/* Create an iterator starting from the beginning */
 	it = o_btree_iterator_create(desc, NULL, BTreeKeyNone,
@@ -38,7 +36,6 @@ example1_iterate_all_versions(BTreeDescr *desc)
 	{
 		BTreeLeafTuphdr *tupHdr;
 		OTuple		tup;
-		bool		was_in_chain = in_undo_chain;
 
 		/* Get next version (current or undo) */
 		tup = btree_iterate_undo_chain(it, NULL, BTreeKeyNone, false,
@@ -46,30 +43,22 @@ example1_iterate_all_versions(BTreeDescr *desc)
 
 		if (!O_TUPLE_IS_NULL(tup) || tupHdr != NULL)
 		{
-			/* Check if this is a new tuple (not an undo version) */
-			if (was_in_chain && !UndoLocationIsValid(tupHdr->undoLocation))
-			{
-				/* Just finished an undo chain */
-				in_undo_chain = false;
-			}
-			else if (!was_in_chain)
-			{
-				/* Starting a new tuple */
-				current_tuple_num++;
-				elog(DEBUG1, "Tuple %d:", current_tuple_num);
-
-				/* Check if it has an undo chain */
-				if (UndoLocationIsValid(tupHdr->undoLocation))
-					in_undo_chain = true;
-			}
-
 			total_versions++;
 
 			/* Process version */
-			elog(DEBUG2, "  Version %d: xactInfo=%lu, deleted=%d",
-				 total_versions,
-				 (unsigned long) tupHdr->xactInfo,
-				 (int) tupHdr->deleted);
+			if (tupHdr->deleted != BTreeLeafTupleNonDeleted)
+			{
+				elog(DEBUG2, "Version %d: DELETED (status=%d, xactInfo=%lu)",
+					 total_versions,
+					 (int) tupHdr->deleted,
+					 (unsigned long) tupHdr->xactInfo);
+			}
+			else if (!O_TUPLE_IS_NULL(tup))
+			{
+				elog(DEBUG2, "Version %d: DATA (xactInfo=%lu)",
+					 total_versions,
+					 (unsigned long) tupHdr->xactInfo);
+			}
 		}
 	}
 
@@ -159,7 +148,7 @@ example3_bounded_iteration(BTreeDescr *desc, void *startKey, void *endKey)
 {
 	BTreeIterator *it;
 	bool		scanEnd = false;
-	int			version_count = 0;
+	int			total_versions = 0;
 
 	/* Create iterator starting from startKey */
 	it = o_btree_iterator_create(desc, startKey,
@@ -178,24 +167,24 @@ example3_bounded_iteration(BTreeDescr *desc, void *startKey, void *endKey)
 
 		if (!O_TUPLE_IS_NULL(tup) || tupHdr != NULL)
 		{
-			version_count++;
+			total_versions++;
 
 			/* Process tuple version */
 			if (tupHdr->deleted != BTreeLeafTupleNonDeleted)
 			{
 				elog(DEBUG1, "Version %d: DELETED (status=%d)",
-					 version_count, (int) tupHdr->deleted);
+					 total_versions, (int) tupHdr->deleted);
 			}
 			else if (!O_TUPLE_IS_NULL(tup))
 			{
-				elog(DEBUG1, "Version %d: UPDATE", version_count);
+				elog(DEBUG1, "Version %d: UPDATE", total_versions);
 			}
 		}
 	}
 
 	btree_iterator_free(it);
 
-	elog(LOG, "Processed %d versions in range", version_count);
+	elog(LOG, "Processed %d versions in range", total_versions);
 }
 
 /*
