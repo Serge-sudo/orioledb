@@ -1210,11 +1210,20 @@ btree_iterate_undo_chain(BTreeIterator *it, void *end, BTreeKeyType endKind,
 {
 	OTuple		result;
 
+	/* tupHdr must be provided by caller since we need to return it */
+	if (tupHdr == NULL)
+	{
+		if (undoLocation)
+			*undoLocation = InvalidUndoLocation;
+		O_TUPLE_SET_NULL(result);
+		return result;
+	}
+
 	/* Get next tuple from leaf pages (includes deleted tuples) */
 	result = btree_iterate_all(it, end, endKind, endInclude, scanEnd,
 							   hint, tupHdr);
 
-	if (*scanEnd || O_TUPLE_IS_NULL(result) || tupHdr == NULL)
+	if (*scanEnd || O_TUPLE_IS_NULL(result))
 	{
 		if (undoLocation)
 			*undoLocation = InvalidUndoLocation;

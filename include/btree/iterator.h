@@ -70,8 +70,8 @@ typedef bool (*UndoChainCallback) (OTuple tuple, BTreeLeafTuphdr *tupHdr,
 								   void *arg);
 
 extern void o_walk_undo_chain(BTreeDescr *desc, BTreeLeafTuphdr *tupHdr,
-							 MemoryContext mcxt, UndoChainCallback callback,
-							 void *arg);
+							  MemoryContext mcxt, UndoChainCallback callback,
+							  void *arg);
 extern OTuple btree_iterate_undo_chain(BTreeIterator *it, void *end,
 									   BTreeKeyType endKind, bool endInclude,
 									   bool *scanEnd, BTreeLocationHint *hint,
