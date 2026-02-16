@@ -29,10 +29,6 @@
 #include "miscadmin.h"
 #include "utils/memutils.h"
 
-/* Callback for walking undo chains */
-typedef bool (*UndoChainCallback) (OTuple tuple, BTreeLeafTuphdr *tupHdr,
-								   void *arg);
-
 /* Iterates through undo images */
 typedef struct
 {

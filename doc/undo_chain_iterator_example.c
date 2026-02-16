@@ -283,6 +283,7 @@ typedef struct
 	List	   *versions;	/* List of collected tuple versions */
 	int			max_versions;	/* Maximum versions to collect */
 	MemoryContext mcxt;		/* Memory context for allocations */
+	BTreeDescr *desc;		/* B-tree descriptor for tuple operations */
 } CollectVersionsContext;
 
 typedef struct
@@ -311,7 +312,11 @@ collect_versions_callback(OTuple tuple, BTreeLeafTuphdr *tupHdr, void *arg)
 
 	if (!O_TUPLE_IS_NULL(tuple))
 	{
-		int			tuple_len = tuple.formatFlags;	/* Simplified */
+		BTreeDescr *desc = ctx->desc;
+		int			tuple_len;
+
+		/* Get the actual tuple length using the descriptor */
+		tuple_len = o_btree_len(desc, tuple, OTupleLength);
 
 		version->tuple.data = (Pointer) MemoryContextAlloc(ctx->mcxt, tuple_len);
 		memcpy(version->tuple.data, tuple.data, tuple_len);
@@ -338,6 +343,7 @@ example4_collect_tuple_versions(BTreeDescr *desc, void *key, int max_versions,
 	ctx.versions = NIL;
 	ctx.max_versions = max_versions;
 	ctx.mcxt = mcxt;
+	ctx.desc = desc;
 
 	/* Create iterator for specific key */
 	it = o_btree_iterator_create(desc, key, BTreeKeyBound,
