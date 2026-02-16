@@ -35,6 +35,7 @@
 #include "tableam/tree.h"
 #include "tableam/vacuum.h"
 #include "transam/oxid.h"
+#include "transam/undo.h"
 #include "tuple/slot.h"
 #include "tuple/sort.h"
 #include "utils/compress.h"
@@ -1590,6 +1591,17 @@ extract_pk_from_validation_tuple(OTuple validationTuple, OIndexDescr *secIndex, 
 	return result;
 }
 
+/*
+ * orioledb_index_validate_scan - Validate secondary index by comparing with primary
+ *
+ * This function performs index validation by doing a merge-join between tuples
+ * from the primary index and tuples from the secondary index (via tuplesort).
+ *
+ * NOTE: Currently walks the undo chains only on the secondary index side
+ * (via orioledb_ambulkdelete callback). Walking undo chains on the primary
+ * index side would require more complex integration with the merge-join logic.
+ * TODO: Consider adding undo chain walking for primary index tuples as well.
+ */
 static void
 orioledb_index_validate_scan(Relation heapRelation,
 							 Relation indexRelation,
