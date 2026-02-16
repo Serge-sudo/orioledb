@@ -65,6 +65,14 @@ struct BTreeIterator
 	/* callback for fetching tuple version */
 	TupleFetchCallback fetchCallback;
 	void	   *fetchCallbackArg;
+	/* walk tuple-level undo chains? */
+	bool		walkUndoChains;
+	/* current undo chain location being walked */
+	UndoLocation currentUndoChainLoc;
+	/* tuple we're currently walking undo chain for */
+	OTuple		currentChainTuple;
+	/* whether we have a pending undo chain tuple to return */
+	bool		hasUndoChainTuple;
 #ifdef USE_ASSERT_CHECKING
 	/* additional check for iteration order */
 	OFixedTuple prevTuple;
@@ -435,6 +443,10 @@ o_btree_iterator_create(BTreeDescr *desc, void *key, BTreeKeyType kind,
 	it->tupleCxt = CurrentMemoryContext;
 	it->fetchCallback = NULL;
 	it->fetchCallbackArg = NULL;
+	it->walkUndoChains = false;
+	it->currentUndoChainLoc = InvalidUndoLocation;
+	O_TUPLE_SET_NULL(it->currentChainTuple);
+	it->hasUndoChainTuple = false;
 	BTREE_PAGE_LOCATOR_SET_INVALID(&it->undoLoc);
 #ifdef USE_ASSERT_CHECKING
 	O_TUPLE_SET_NULL(it->prevTuple.tuple);
@@ -507,6 +519,72 @@ o_btree_iterator_set_callback(BTreeIterator *it,
 {
 	it->fetchCallback = callback;
 	it->fetchCallbackArg = arg;
+}
+
+/*
+ * Enable or disable walking of tuple-level undo chains during iteration.
+ * When enabled, for each visible tuple, the iterator will also yield all
+ * versions from its undo chain.
+ */
+void
+o_btree_iterator_set_undo_chain_walking(BTreeIterator *it, bool enable)
+{
+	it->walkUndoChains = enable;
+}
+
+/*
+ * Fetch the next tuple from an undo chain. Returns NULL tuple when the chain is exhausted.
+ */
+static OTuple
+fetch_next_undo_chain_tuple(BTreeIterator *it)
+{
+	BTreeDescr *desc = it->context.desc;
+	OTuple		result;
+	BTreeModifyUndoStackItem item;
+	Size		headerSize = sizeof(BTreeModifyUndoStackItem);
+	Size		tupleSize;
+	MemoryContext oldContext;
+	
+	O_TUPLE_SET_NULL(result);
+	
+	/* Check if we have a valid undo location to read from */
+	if (!UndoLocationIsValid(it->currentUndoChainLoc))
+		return result;
+		
+	/* Check if undo record exists */
+	if (!UNDO_REC_EXISTS(desc->undoType, it->currentUndoChainLoc))
+	{
+		it->currentUndoChainLoc = InvalidUndoLocation;
+		return result;
+	}
+	
+	/* Read the undo record header */
+	undo_read(desc->undoType, it->currentUndoChainLoc, headerSize, (Pointer) &item);
+	
+	/* Check if this is a BTree modify operation */
+	if (item.header.type != ModifyUndoItemType)
+	{
+		it->currentUndoChainLoc = InvalidUndoLocation;
+		return result;
+	}
+	
+	/* Calculate tuple size */
+	tupleSize = o_btree_len(desc, it->currentChainTuple, OKeyLength);
+	
+	/* Allocate tuple in iterator's memory context */
+	oldContext = MemoryContextSwitchTo(it->tupleCxt);
+	result.data = (Pointer) palloc(tupleSize);
+	result.formatFlags = item.tuphdr.formatFlags;
+	
+	/* Read tuple data from undo */
+	undo_read(desc->undoType, it->currentUndoChainLoc + headerSize, tupleSize, result.data);
+	
+	MemoryContextSwitchTo(oldContext);
+	
+	/* Move to next undo record in chain */
+	it->currentUndoChainLoc = item.tuphdr.undoLocation;
+	
+	return result;
 }
 
 OTuple
@@ -677,6 +755,20 @@ o_btree_iterator_fetch_internal(BTreeIterator *it, CommitSeqNo *tupleCsn)
 				htup;
 	int			cmp;
 
+	/* If undo chain walking is enabled and we have a pending undo tuple, return it */
+	if (it->walkUndoChains && it->hasUndoChainTuple)
+	{
+		result = fetch_next_undo_chain_tuple(it);
+		if (!O_TUPLE_IS_NULL(result))
+		{
+			if (tupleCsn)
+				*tupleCsn = COMMITSEQNO_INPROGRESS;
+			return result;
+		}
+		/* Undo chain exhausted, move to next tuple */
+		it->hasUndoChainTuple = false;
+	}
+
 	while (true)
 	{
 		if (!btree_iterator_check_load_next_page(it))
@@ -719,7 +811,21 @@ o_btree_iterator_fetch_internal(BTreeIterator *it, CommitSeqNo *tupleCsn)
 					UNDO_IT_NEXT_OFFSET(&it->undoIt, &it->undoLoc);
 
 				if (!O_TUPLE_IS_NULL(result))
+				{
+					/* Start walking undo chain if enabled */
+					if (it->walkUndoChains)
+					{
+						BTreeLeafTuphdr *tupHdr;
+						tupHdr = (BTreeLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(img, &leaf_item->locator);
+						if (UndoLocationIsValid(tupHdr->undoLocation))
+						{
+							it->currentUndoChainLoc = tupHdr->undoLocation;
+							it->currentChainTuple = result;
+							it->hasUndoChainTuple = true;
+						}
+					}
 					return result;
+				}
 			}
 			else
 			{
@@ -733,7 +839,21 @@ o_btree_iterator_fetch_internal(BTreeIterator *it, CommitSeqNo *tupleCsn)
 				UNDO_IT_NEXT_OFFSET(&it->undoIt, &it->undoLoc);
 
 				if (!O_TUPLE_IS_NULL(result))
+				{
+					/* Start walking undo chain if enabled */
+					if (it->walkUndoChains)
+					{
+						BTreeLeafTuphdr *tupHdr;
+						tupHdr = (BTreeLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(hImg, &it->undoLoc);
+						if (UndoLocationIsValid(tupHdr->undoLocation))
+						{
+							it->currentUndoChainLoc = tupHdr->undoLocation;
+							it->currentChainTuple = result;
+							it->hasUndoChainTuple = true;
+						}
+					}
 					return result;
+				}
 			}
 		}
 		else
@@ -748,6 +868,34 @@ o_btree_iterator_fetch_internal(BTreeIterator *it, CommitSeqNo *tupleCsn)
 			IT_NEXT_OFFSET(it, &leaf_item->locator);
 
 			if (!O_TUPLE_IS_NULL(result))
+			{
+				/* Start walking undo chain if enabled */
+				if (it->walkUndoChains)
+				{
+					BTreeLeafTuphdr *tupHdr;
+					OBTreeFindPageContext *ctx = &it->context;
+					OBtreePageFindItem *item = &ctx->items[ctx->index];
+					
+					/* Need to get tuple header - back up locator to get it */
+					BTreePageItemLocator tempLoc = item->locator;
+					if (IT_IS_FORWARD(it))
+						BTREE_PAGE_LOCATOR_PREV(img, &tempLoc);
+					else
+						BTREE_PAGE_LOCATOR_NEXT(img, &tempLoc);
+						
+					tupHdr = (BTreeLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(img, &tempLoc);
+					if (UndoLocationIsValid(tupHdr->undoLocation))
+					{
+						it->currentUndoChainLoc = tupHdr->undoLocation;
+						it->currentChainTuple = result;
+						it->hasUndoChainTuple = true;
+					}
+				}
+				return result;
+			}
+		}
+	}
+}
 				return result;
 		}
 	}

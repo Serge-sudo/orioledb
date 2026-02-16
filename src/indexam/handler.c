@@ -19,7 +19,6 @@
 
 #include "btree/iterator.h"
 #include "btree/modify.h"
-#include "btree/undo.h"
 #include "catalog/indices.h"
 #include "catalog/o_tables.h"
 #include "indexam/handler.h"
@@ -27,7 +26,6 @@
 #include "tableam/index_scan.h"
 #include "tableam/operations.h"
 #include "tableam/tree.h"
-#include "transam/undo.h"
 #include "tuple/format.h"
 #include "tuple/slot.h"
 #include "utils/compress.h"
@@ -963,173 +961,69 @@ orioledb_amdelete(Relation rel, Datum *values, bool *isnull,
  *
  * If the callback returns true (requesting deletion), we throw an error since
  * deletion is not supported.
-/*
- * Helper function to walk undo chain and call callback for each version
- *
- * This function walks the undo chain for a given tuple, reading each undo
- * record and calling the callback for each historical version. This ensures
- * that validation sees all versions of a tuple, not just the current one.
  */
-static void
-walk_tuple_undo_chain(BTreeDescr *desc, OTuple currentTuple, 
-					  BTreeLeafTuphdr *tuphdr,
-					  IndexBulkDeleteCallback callback, void *callback_state,
-					  OIndexDescr *index_descr, double *num_tuples)
-{
-	UndoLocation undoLoc;
-	ItemPointerData itemptr;
-	bool should_delete;
-	
-	/* Check if there's an undo chain to walk */
-	if (!UndoLocationIsValid(tuphdr->undoLocation))
-		return;
-		
-	undoLoc = tuphdr->undoLocation;
-	
-	/* Walk the undo chain */
-	while (UndoLocationIsValid(undoLoc) && UNDO_REC_EXISTS(desc->undoType, undoLoc))
-	{
-		BTreeModifyUndoStackItem item;
-		OTuple undoTuple;
-		Size headerSize = sizeof(BTreeModifyUndoStackItem);
-		
-		/* Read the undo record header */
-		undo_read(desc->undoType, undoLoc, headerSize, (Pointer) &item);
-		
-		/* Check if this is a BTree modify operation */
-		if (item.header.type != ModifyUndoItemType)
-			break;
-			
-		/* Calculate tuple data location in undo */
-		undoTuple.formatFlags = item.tuphdr.formatFlags;
-		
-		/* Allocate and read the tuple data from undo */
-		Size tupleSize = o_btree_len(desc, currentTuple, OKeyLength);
-		undoTuple.data = (Pointer) palloc(tupleSize);
-		undo_read(desc->undoType, undoLoc + headerSize, tupleSize, undoTuple.data);
-		
-		(*num_tuples)++;
-		
-		/* Call callback with this undo version */
-		if (callback_state)
-		{
-			((OValidateIndexState *) callback_state)->current_tuple = undoTuple;
-			((OValidateIndexState *) callback_state)->index_descr = index_descr;
-		}
-		
-		ItemPointerSetInvalid(&itemptr);
-		should_delete = callback(&itemptr, callback_state);
-		
-		pfree(undoTuple.data);
-		
-		if (should_delete)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("bulk deletion is not supported for orioledb indexes")));
-		}
-		
-		/* Move to previous undo record */
-		undoLoc = item.header.prev;
-	}
-}
-
 IndexBulkDeleteResult *
 orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 					  IndexBulkDeleteCallback callback, void *callback_state)
 {
-	OBTOptions *options = (OBTOptions *) info->index->rd_options;
-	ORelOids	oids;
-	OIndexDescr *index_descr;
-	OTableDescr *descr;
+	Relation	index = info->index;
+	OBTOptions *options = (OBTOptions *) index->rd_options;
 	BTreeIterator *it;
+	OIndexDescr *index_descr;
 	OSnapshot	oSnapshot;
-	OTuple		tuple;
-	double		num_tuples = 0;
-	ItemPointerData	itemptr;
-	bool		should_delete;
+	double		num_tuples = 0.0;
+	ORelOids	oids;
 
 	if (options && !options->orioledb_index)
 		return btbulkdelete(info, stats, callback, callback_state);
 
 	/* Get index descriptor */
-	ORelOidsSetFromRel(oids, info->index);
+	ORelOidsSetFromRel(oids, index);
 	index_descr = o_fetch_index_descr(oids, oIndexInvalid, false, NULL);
 	if (index_descr == NULL)
-		elog(ERROR, "index descriptor not found for index %u", info->index->rd_id);
-	
-	descr = o_fetch_table_descr(index_descr->tableOids);
-	if (descr == NULL)
-		elog(ERROR, "table descriptor not found for index %u", info->index->rd_id);
+		elog(ERROR, "index descriptor not found for index %u", index->rd_id);
 
-	/*
-	 * Use SnapshotAny to see ALL tuples including in-progress ones.
-	 * This matches the snapshot used in orioledb_index_validate_scan to
-	 * ensure consistent visibility of tuples during index validation.
-	 */
+	/* Use SnapshotAny to see all tuples */
 	O_LOAD_SNAPSHOT(&oSnapshot, SnapshotAny);
-
-	/* Create iterator to scan all tuples in the index */
 	it = o_btree_iterator_create(&index_descr->desc, NULL, BTreeKeyNone,
 								 &oSnapshot, ForwardScanDirection);
 
-	/* Iterate through all tuples in the index */
+	/* Enable undo chain walking for complete tuple version visibility */
+	o_btree_iterator_set_undo_chain_walking(it, true);
+
+	/* Iterate over all tuples and their undo chain versions */
 	while (true)
 	{
-		CommitSeqNo tupleCsn;
-		BTreeLeafTuphdr *tuphdr;
-		Pointer tupleData;
-		
-		/* Fetch next tuple */
-		tuple = o_btree_iterator_fetch(it, &tupleCsn, NULL, BTreeKeyNone, false, NULL);
-		
+		OTuple		tuple;
+		ItemPointerData itemptr;
+		bool		should_delete;
+
+		tuple = o_btree_iterator_fetch(it, NULL, NULL, BTreeKeyNone, false, NULL);
+
 		if (O_TUPLE_IS_NULL(tuple))
 			break;
 
 		num_tuples++;
 
-		/*
-		 * For orioledb, we pass the primary key tuple itself to the callback
-		 * instead of just an ItemPointer. The callback can then collect these
-		 * tuples (e.g., into a tuplesort) for validation purposes.
-		 * 
-		 * We store the tuple and index descriptor in callback_state for the 
-		 * callback to access and extract the PK fields.
-		 */
+		/* Call callback */
 		if (callback_state)
 		{
 			((OValidateIndexState *) callback_state)->current_tuple = tuple;
 			((OValidateIndexState *) callback_state)->index_descr = index_descr;
 		}
 
-		/* Call the callback with a dummy ItemPointer */
 		ItemPointerSetInvalid(&itemptr);
 		should_delete = callback(&itemptr, callback_state);
 
-		/*
-		 * If callback returns true (requesting deletion), throw an error.
-		 * Deletion is not supported in orioledb_ambulkdelete.
-		 */
+		pfree(tuple.data);
+
 		if (should_delete)
 		{
-			/* Clean up before erroring out */
 			btree_iterator_free(it);
-			
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("bulk deletion is not supported for orioledb indexes"),
-					 errdetail("Index: %s", RelationGetRelationName(info->index))));
+					 errmsg("bulk deletion is not supported for orioledb indexes")));
 		}
-		
-		/*
-		 * Walk the undo chain for this tuple to process all historical versions.
-		 * Extract the tuple header to get the undo location.
-		 */
-		tupleData = tuple.data - BTreeLeafTuphdrSize;
-		tuphdr = (BTreeLeafTuphdr *) tupleData;
-		
-		walk_tuple_undo_chain(&index_descr->desc, tuple, tuphdr, callback, 
-							  callback_state, index_descr, &num_tuples);
 	}
 
 	/* Clean up */
