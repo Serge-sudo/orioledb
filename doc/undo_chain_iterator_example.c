@@ -28,7 +28,7 @@ example1_iterate_all_versions(BTreeDescr *desc)
 	bool		scanEnd = false;
 	int			total_versions = 0;
 	int			current_tuple_num = 0;
-	BTreeLeafTuphdr *prev_tupHdr = NULL;
+	bool		in_undo_chain = false;
 
 	/* Create an iterator starting from the beginning */
 	it = o_btree_iterator_create(desc, NULL, BTreeKeyNone,
@@ -38,6 +38,7 @@ example1_iterate_all_versions(BTreeDescr *desc)
 	{
 		BTreeLeafTuphdr *tupHdr;
 		OTuple		tup;
+		bool		was_in_chain = in_undo_chain;
 
 		/* Get next version (current or undo) */
 		tup = btree_iterate_undo_chain(it, NULL, BTreeKeyNone, false,
@@ -46,12 +47,20 @@ example1_iterate_all_versions(BTreeDescr *desc)
 		if (!O_TUPLE_IS_NULL(tup) || tupHdr != NULL)
 		{
 			/* Check if this is a new tuple (not an undo version) */
-			if (prev_tupHdr == NULL ||
-				prev_tupHdr->undoLocation != tupHdr->undoLocation)
+			if (was_in_chain && !UndoLocationIsValid(tupHdr->undoLocation))
 			{
-				if (prev_tupHdr != NULL)
-					current_tuple_num++;
+				/* Just finished an undo chain */
+				in_undo_chain = false;
+			}
+			else if (!was_in_chain)
+			{
+				/* Starting a new tuple */
+				current_tuple_num++;
 				elog(DEBUG1, "Tuple %d:", current_tuple_num);
+
+				/* Check if it has an undo chain */
+				if (UndoLocationIsValid(tupHdr->undoLocation))
+					in_undo_chain = true;
 			}
 
 			total_versions++;
@@ -61,8 +70,6 @@ example1_iterate_all_versions(BTreeDescr *desc)
 				 total_versions,
 				 (unsigned long) tupHdr->xactInfo,
 				 (int) tupHdr->deleted);
-
-			prev_tupHdr = tupHdr;
 		}
 	}
 

@@ -1213,15 +1213,6 @@ btree_iterate_undo_chain(BTreeIterator *it, void *end, BTreeKeyType endKind,
 
 	return result;
 }
-	 */
-	(void) find_non_lock_only_undo_record(it->context.desc->undoType, *tupHdr);
-
-	/* Return the undo location for the caller to walk if needed */
-	if (undoLocation)
-		*undoLocation = (*tupHdr)->undoLocation;
-
-	return result;
-}
 
 /*
  * Fills basic fields of undo iterator
