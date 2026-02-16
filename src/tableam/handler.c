@@ -1578,7 +1578,6 @@ add_undo_version_to_sk(OIndexDescr *secIndexDescr,
 	OInMemoryBlkno blkno;
 	BTreePageItemLocator *loc;
 	BTreeLeafTuphdr *tupHdr;
-	BTreeLeafTuphdr	newTupHdr;
 	OTuple		leafTup;
 	OTuple		skTuple;
 	int			cmp;
@@ -1636,9 +1635,6 @@ add_undo_version_to_sk(OIndexDescr *secIndexDescr,
 				 * - First undo points to second undo, etc.
 				 * - We're adding a new undo record that will become the first in chain
 				 */
-				
-				/* Save the current tuple header - we'll need it for linking */
-				newTupHdr = *tupHdr;
 				
 				/*
 				 * Create an undo record with the SK tuple data.
