@@ -1629,6 +1629,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 	Datum		heapRowIdDatum;
 	bool		rowIdIsNull;
 	OInMemoryBlkno lastBlkno = OInvalidInMemoryBlkno;
+	OTuple		currentPK = {0};	/* Track the current PK tuple for undo chain handling */
 
 	Assert(state != NULL);
 	Assert(state->tuplesort != NULL);
@@ -1671,6 +1672,8 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 	tuplesort_rescan(state->tuplesort);
 
+	O_TUPLE_SET_NULL(currentPK);
+
 	while (true)
 	{
 		oslot = (OTableSlot *) primarySlot;
@@ -1680,6 +1683,58 @@ orioledb_index_validate_scan(Relation heapRelation,
 		
 		if (O_TUPLE_IS_NULL(tup))
 			break;
+
+		/*
+		 * Check if this tuple is an undo version of the current PK or a new PK.
+		 * With undo chain walking enabled, the iterator returns:
+		 * 1. Main tuple for PK1
+		 * 2. Undo version(s) of PK1 (same key, older versions)
+		 * 3. Main tuple for PK2
+		 * etc.
+		 */
+		if (!O_TUPLE_IS_NULL(currentPK))
+		{
+			int pkCmp = o_btree_cmp(&GET_PRIMARY(descr)->desc,
+									&currentPK, BTreeKeyLeafTuple,
+									&tup, BTreeKeyLeafTuple);
+			
+			if (pkCmp == 0)
+			{
+				/*
+				 * This is an undo version of the current PK tuple.
+				 * Transform it to SK format and add to SK's undo chain.
+				 * 
+				 * TODO: Implement undo chain transformation:
+				 * 1. Store the undo version in slot and extract SK values
+				 * 2. Find the corresponding SK tuple we previously inserted
+				 * 3. Create an undo record for the SK with this version's data
+				 * 4. Link it to the SK tuple's undo chain
+				 *
+				 * For now, we log this for debugging and skip to next iteration.
+				 */
+				elog(DEBUG2, "Processing undo version for PK during validation");
+				
+				/* Free the undo tuple and continue to next iteration */
+				pfree(tup.data);
+				continue;
+			}
+			else
+			{
+				/* This is a new PK tuple, not an undo version */
+				/* Free the previous PK tuple */
+				if (currentPK.data != NULL)
+					pfree(currentPK.data);
+				O_TUPLE_SET_NULL(currentPK);
+			}
+		}
+
+		/*
+		 * This is a new PK tuple (not an undo version).
+		 * Store it as the current PK for future undo version detection.
+		 */
+		currentPK.data = (Pointer) palloc(o_btree_len(&GET_PRIMARY(descr)->desc, tup, OTupleLength));
+		memcpy(currentPK.data, tup.data, o_btree_len(&GET_PRIMARY(descr)->desc, tup, OTupleLength));
+		currentPK.formatFlags = tup.formatFlags;
 
 		tts_orioledb_store_tuple(primarySlot, tup, descr, tupleCsn, PrimaryIndexNumber, true, &hint);
 		slot_getallattrs(primarySlot);
@@ -1890,6 +1945,10 @@ orioledb_index_validate_scan(Relation heapRelation,
 		ExecClearTuple(primarySlot);
 		pfree(tup.data);
 	}
+
+	/* Clean up currentPK if it was allocated */
+	if (!O_TUPLE_IS_NULL(currentPK) && currentPK.data != NULL)
+		pfree(currentPK.data);
 
 	/*
 	 * Clear the validation boundary - validation is now complete.
