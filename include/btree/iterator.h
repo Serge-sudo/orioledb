@@ -64,19 +64,10 @@ extern OTuple btree_iterate_all(BTreeIterator *it, void *end,
 								BTreeKeyType endKind, bool endInclude,
 								bool *scanEnd, BTreeLocationHint *hint,
 								BTreeLeafTuphdr **tupHdr);
-
-/* Callback for walking undo chains */
-typedef bool (*UndoChainCallback) (OTuple tuple, BTreeLeafTuphdr *tupHdr,
-								   void *arg);
-
-extern void o_walk_undo_chain(BTreeDescr *desc, BTreeLeafTuphdr *tupHdr,
-							  MemoryContext mcxt, UndoChainCallback callback,
-							  void *arg);
 extern OTuple btree_iterate_undo_chain(BTreeIterator *it, void *end,
 									   BTreeKeyType endKind, bool endInclude,
 									   bool *scanEnd, BTreeLocationHint *hint,
-									   BTreeLeafTuphdr **tupHdr,
-									   UndoLocation *undoLocation);
+									   BTreeLeafTuphdr **tupHdr);
 extern void btree_iterator_free(BTreeIterator *it);
 
 extern OTuple o_btree_find_tuple_by_key_cb(BTreeDescr *desc, void *key,

@@ -65,6 +65,11 @@ struct BTreeIterator
 	/* callback for fetching tuple version */
 	TupleFetchCallback fetchCallback;
 	void	   *fetchCallbackArg;
+	/* state for undo chain iteration */
+	bool		processingUndoChain;
+	BTreeLeafTuphdr undoChainTupHdr;
+	OTuple		undoChainTuple;
+	bool		undoChainTupleAllocated;
 #ifdef USE_ASSERT_CHECKING
 	/* additional check for iteration order */
 	OFixedTuple prevTuple;
@@ -476,6 +481,9 @@ o_btree_iterator_create(BTreeDescr *desc, void *key, BTreeKeyType kind,
 	it->tupleCxt = CurrentMemoryContext;
 	it->fetchCallback = NULL;
 	it->fetchCallbackArg = NULL;
+	it->processingUndoChain = false;
+	it->undoChainTupleAllocated = false;
+	O_TUPLE_SET_NULL(it->undoChainTuple);
 	BTREE_PAGE_LOCATOR_SET_INVALID(&it->undoLoc);
 #ifdef USE_ASSERT_CHECKING
 	O_TUPLE_SET_NULL(it->prevTuple.tuple);
@@ -608,6 +616,9 @@ o_btree_iterator_fetch(BTreeIterator *it, CommitSeqNo *tupleCsn,
 void
 btree_iterator_free(BTreeIterator *it)
 {
+	/* Free any allocated tuple from undo chain iteration */
+	if (it->undoChainTupleAllocated && it->undoChainTuple.data != NULL)
+		pfree(it->undoChainTuple.data);
 	pfree(it);
 }
 
@@ -1056,107 +1067,11 @@ btree_iterate_all(BTreeIterator *it, void *end, BTreeKeyType endKind,
 }
 
 /*
- * Walk through all versions of a tuple in its undo chain.
- *
- * This function takes a tuple header with an undoLocation and walks through
- * all previous versions in the undo chain, calling the callback function for
- * each version.
- *
- * Parameters:
- *   desc: B-tree descriptor
- *   tupHdr: Initial tuple header (will be modified to contain each version)
- *   mcxt: Memory context for tuple allocations
- *   callback: Function to call for each version (can be NULL)
- *   arg: Argument to pass to callback
- *
- * The callback receives:
- *   - tuple: The tuple data for this version (NULL for deleted/lock-only)
- *   - tupHdr: The tuple header for this version
- *   - arg: User-provided argument
- *
- * If callback returns false, iteration stops early.
- *
- * Example usage:
- *
- *   static bool my_callback(OTuple tuple, BTreeLeafTuphdr *tupHdr, void *arg)
- *   {
- *       MyData *data = (MyData *) arg;
- *       // Process tuple and tupHdr
- *       data->version_count++;
- *       if (O_TUPLE_IS_NULL(tuple))
- *           data->deleted_count++;
- *       return true; // continue iteration
- *   }
- *
- *   BTreeLeafTuphdr myTupHdr = ...;
- *   MyData data = {0};
- *   o_walk_undo_chain(desc, &myTupHdr, CurrentMemoryContext, my_callback, &data);
- */
-void
-o_walk_undo_chain(BTreeDescr *desc, BTreeLeafTuphdr *tupHdr,
-				  MemoryContext mcxt, UndoChainCallback callback, void *arg)
-{
-	UndoLocation undoLocation;
-	MemoryContext prevMctx;
-	bool		curTupleAllocated = false;
-	OTuple		curTuple;
-
-	Assert(tupHdr != NULL);
-
-	prevMctx = MemoryContextSwitchTo(mcxt);
-
-	/*
-	 * Skip lock-only records to find first non-lock-only undo record.
-	 * This modifies tupHdr->undoLocation as a side effect.
-	 */
-	undoLocation = find_non_lock_only_undo_record(desc->undoType, tupHdr);
-
-	O_TUPLE_SET_NULL(curTuple);
-
-	/* Walk through the undo chain */
-	while (UndoLocationIsValid(tupHdr->undoLocation))
-	{
-		undoLocation = tupHdr->undoLocation;
-
-		/* Get previous version from undo log */
-		if (tupHdr->deleted != BTreeLeafTupleNonDeleted ||
-			XACT_INFO_IS_LOCK_ONLY(tupHdr->xactInfo))
-		{
-			/* This is a delete or lock-only record, just update header */
-			get_prev_leaf_header_from_undo(desc->undoType, tupHdr, true);
-		}
-		else
-		{
-			/* This is an update, get both header and tuple */
-			if (curTupleAllocated)
-				pfree(curTuple.data);
-			get_prev_leaf_header_and_tuple_from_undo(desc->undoType, tupHdr,
-													 &curTuple, 0);
-			curTupleAllocated = true;
-		}
-
-		Assert(UNDO_REC_EXISTS(desc->undoType, undoLocation));
-
-		/* Call the callback if provided */
-		if (callback && !callback(curTuple, tupHdr, arg))
-		{
-			/* Callback requested early termination */
-			break;
-		}
-	}
-
-	if (curTupleAllocated)
-		pfree(curTuple.data);
-
-	MemoryContextSwitchTo(prevMctx);
-}
-
-/*
  * Iterate over leaf page tuples including all versions in their undo chains.
  *
- * This iterator combines btree_iterate_all with undo chain traversal. For each
- * tuple on the leaf page, it returns the current version followed by all
- * versions in the undo chain.
+ * This iterator returns each version one at a time. It first returns the current
+ * version from the leaf page, then returns each version from the undo chain on
+ * subsequent calls, and finally moves to the next tuple when the chain is exhausted.
  *
  * Unlike o_btree_iterator_fetch, this does NOT apply snapshot visibility checks.
  * ALL versions are returned regardless of transaction state or commit status.
@@ -1167,16 +1082,11 @@ o_walk_undo_chain(BTreeDescr *desc, BTreeLeafTuphdr *tupHdr,
  *   scanEnd: Set to true when scan is complete
  *   hint: Optional location hint for optimization
  *   tupHdr: Returns tuple header for current version
- *   undoLocation: Returns undo location, or InvalidUndoLocation if no more versions
+ *
+ * Returns:
+ *   OTuple for the current version (may be NULL for deleted/lock-only versions)
  *
  * Usage pattern:
- *   1. Call btree_iterate_undo_chain to get current tuple on page
- *   2. If returned tuple is not NULL and undoLocation is valid:
- *      - Call o_walk_undo_chain to process all versions in the chain
- *   3. Repeat from step 1 until scanEnd is true
- *
- * Example usage:
- *
  *   BTreeIterator *it = o_btree_iterator_create(desc, NULL, BTreeKeyNone,
  *                                                NULL, ForwardScanDirection);
  *   bool scanEnd = false;
@@ -1184,22 +1094,13 @@ o_walk_undo_chain(BTreeDescr *desc, BTreeLeafTuphdr *tupHdr,
  *   while (!scanEnd)
  *   {
  *       BTreeLeafTuphdr *tupHdr;
- *       UndoLocation undoLoc;
  *       OTuple tup = btree_iterate_undo_chain(it, NULL, BTreeKeyNone, false,
- *                                              &scanEnd, NULL, &tupHdr, &undoLoc);
+ *                                              &scanEnd, NULL, &tupHdr);
  *
- *       if (!O_TUPLE_IS_NULL(tup))
+ *       if (!O_TUPLE_IS_NULL(tup) || tupHdr != NULL)
  *       {
- *           // Process current version
- *           process_tuple(tup, tupHdr);
- *
- *           // Walk undo chain if available
- *           if (UndoLocationIsValid(undoLoc))
- *           {
- *               BTreeLeafTuphdr undoHdr = *tupHdr;
- *               o_walk_undo_chain(desc, &undoHdr, CurrentMemoryContext,
- *                                 my_callback, my_arg);
- *           }
+ *           // Process version (check tupHdr->deleted for deleted tuples)
+ *           process_version(tup, tupHdr);
  *       }
  *   }
  *
@@ -1208,35 +1109,110 @@ o_walk_undo_chain(BTreeDescr *desc, BTreeLeafTuphdr *tupHdr,
 OTuple
 btree_iterate_undo_chain(BTreeIterator *it, void *end, BTreeKeyType endKind,
 						 bool endInclude, bool *scanEnd,
-						 BTreeLocationHint *hint, BTreeLeafTuphdr **tupHdr,
-						 UndoLocation *undoLocation)
+						 BTreeLocationHint *hint, BTreeLeafTuphdr **tupHdr)
 {
+	BTreeDescr *desc = it->context.desc;
 	OTuple		result;
+	MemoryContext prevMctx;
+
+	*scanEnd = false;
 
 	/* tupHdr must be provided by caller since we need to return it */
 	if (tupHdr == NULL)
 	{
-		if (undoLocation)
-			*undoLocation = InvalidUndoLocation;
 		O_TUPLE_SET_NULL(result);
+		*scanEnd = true;
 		return result;
 	}
 
-	/* Get next tuple from leaf pages (includes deleted tuples) */
+	/*
+	 * If we're currently processing an undo chain, continue with the next
+	 * version from the chain.
+	 */
+	if (it->processingUndoChain && UndoLocationIsValid(it->undoChainTupHdr.undoLocation))
+	{
+		UndoLocation undoLocation = it->undoChainTupHdr.undoLocation;
+
+		prevMctx = MemoryContextSwitchTo(it->tupleCxt);
+
+		/* Get previous version from undo log */
+		if (it->undoChainTupHdr.deleted != BTreeLeafTupleNonDeleted ||
+			XACT_INFO_IS_LOCK_ONLY(it->undoChainTupHdr.xactInfo))
+		{
+			/* This is a delete or lock-only record, just update header */
+			get_prev_leaf_header_from_undo(desc->undoType, &it->undoChainTupHdr, true);
+			O_TUPLE_SET_NULL(result);
+		}
+		else
+		{
+			/* This is an update, get both header and tuple */
+			if (it->undoChainTupleAllocated && it->undoChainTuple.data != NULL)
+				pfree(it->undoChainTuple.data);
+			get_prev_leaf_header_and_tuple_from_undo(desc->undoType,
+													 &it->undoChainTupHdr,
+													 &it->undoChainTuple, 0);
+			it->undoChainTupleAllocated = true;
+			result = it->undoChainTuple;
+		}
+
+		MemoryContextSwitchTo(prevMctx);
+
+		Assert(UNDO_REC_EXISTS(desc->undoType, undoLocation));
+
+		*tupHdr = &it->undoChainTupHdr;
+
+		/* Check if we've exhausted the undo chain */
+		if (!UndoLocationIsValid(it->undoChainTupHdr.undoLocation))
+		{
+			it->processingUndoChain = false;
+		}
+
+		return result;
+	}
+
+	/*
+	 * Not processing undo chain or finished with previous one.
+	 * Get next tuple from leaf pages.
+	 */
+	it->processingUndoChain = false;
+
+	/* Free any previously allocated tuple */
+	if (it->undoChainTupleAllocated && it->undoChainTuple.data != NULL)
+	{
+		pfree(it->undoChainTuple.data);
+		it->undoChainTuple.data = NULL;
+		it->undoChainTupleAllocated = false;
+	}
+
 	result = btree_iterate_all(it, end, endKind, endInclude, scanEnd,
 							   hint, tupHdr);
 
 	if (*scanEnd || O_TUPLE_IS_NULL(result))
 	{
-		if (undoLocation)
-			*undoLocation = InvalidUndoLocation;
 		return result;
 	}
 
 	/*
+	 * We have a new tuple from the page. Save its header and check if it has
+	 * an undo chain.
+	 */
+	it->undoChainTupHdr = **tupHdr;
+
+	/*
 	 * Skip lock-only records to find the actual undo chain.
-	 * This modifies (*tupHdr)->undoLocation to point to first non-lock-only
+	 * This modifies undoChainTupHdr.undoLocation to point to first non-lock-only
 	 * undo record. We don't need the return value, just the side effect.
+	 */
+	(void) find_non_lock_only_undo_record(desc->undoType, &it->undoChainTupHdr);
+
+	/* If this tuple has an undo chain, mark that we'll process it next time */
+	if (UndoLocationIsValid(it->undoChainTupHdr.undoLocation))
+	{
+		it->processingUndoChain = true;
+	}
+
+	return result;
+}
 	 */
 	(void) find_non_lock_only_undo_record(it->context.desc->undoType, *tupHdr);
 
