@@ -1074,11 +1074,27 @@ btree_iterate_all(BTreeIterator *it, void *end, BTreeKeyType endKind,
  *   arg: Argument to pass to callback
  *
  * The callback receives:
- *   - tuple: The tuple data for this version
+ *   - tuple: The tuple data for this version (NULL for deleted/lock-only)
  *   - tupHdr: The tuple header for this version
  *   - arg: User-provided argument
  *
  * If callback returns false, iteration stops early.
+ *
+ * Example usage:
+ *
+ *   static bool my_callback(OTuple tuple, BTreeLeafTuphdr *tupHdr, void *arg)
+ *   {
+ *       MyData *data = (MyData *) arg;
+ *       // Process tuple and tupHdr
+ *       data->version_count++;
+ *       if (O_TUPLE_IS_NULL(tuple))
+ *           data->deleted_count++;
+ *       return true; // continue iteration
+ *   }
+ *
+ *   BTreeLeafTuphdr myTupHdr = ...;
+ *   MyData data = {0};
+ *   o_walk_undo_chain(desc, &myTupHdr, CurrentMemoryContext, my_callback, &data);
  */
 void
 o_walk_undo_chain(BTreeDescr *desc, BTreeLeafTuphdr *tupHdr,
@@ -1155,10 +1171,40 @@ o_walk_undo_chain(BTreeDescr *desc, BTreeLeafTuphdr *tupHdr,
  *   undoLocation: Returns undo location, or InvalidUndoLocation if no more versions
  *
  * Usage pattern:
- *   1. Call btree_iterate_undo_chain to get first tuple
+ *   1. Call btree_iterate_undo_chain to get current tuple on page
  *   2. If returned tuple is not NULL and undoLocation is valid:
  *      - Call o_walk_undo_chain to process all versions in the chain
  *   3. Repeat from step 1 until scanEnd is true
+ *
+ * Example usage:
+ *
+ *   BTreeIterator *it = o_btree_iterator_create(desc, NULL, BTreeKeyNone,
+ *                                                NULL, ForwardScanDirection);
+ *   bool scanEnd = false;
+ *   
+ *   while (!scanEnd)
+ *   {
+ *       BTreeLeafTuphdr *tupHdr;
+ *       UndoLocation undoLoc;
+ *       OTuple tup = btree_iterate_undo_chain(it, NULL, BTreeKeyNone, false,
+ *                                              &scanEnd, NULL, &tupHdr, &undoLoc);
+ *       
+ *       if (!O_TUPLE_IS_NULL(tup))
+ *       {
+ *           // Process current version
+ *           process_tuple(tup, tupHdr);
+ *           
+ *           // Walk undo chain if available
+ *           if (UndoLocationIsValid(undoLoc))
+ *           {
+ *               BTreeLeafTuphdr undoHdr = *tupHdr;
+ *               o_walk_undo_chain(desc, &undoHdr, CurrentMemoryContext,
+ *                                 my_callback, my_arg);
+ *           }
+ *       }
+ *   }
+ *   
+ *   btree_iterator_free(it);
  */
 OTuple
 btree_iterate_undo_chain(BTreeIterator *it, void *end, BTreeKeyType endKind,
@@ -1172,7 +1218,7 @@ btree_iterate_undo_chain(BTreeIterator *it, void *end, BTreeKeyType endKind,
 	result = btree_iterate_all(it, end, endKind, endInclude, scanEnd,
 							   hint, tupHdr);
 	
-	if (scanEnd || O_TUPLE_IS_NULL(result) || tupHdr == NULL)
+	if (*scanEnd || O_TUPLE_IS_NULL(result) || tupHdr == NULL)
 	{
 		if (undoLocation)
 			*undoLocation = InvalidUndoLocation;
