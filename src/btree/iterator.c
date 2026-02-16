@@ -29,6 +29,10 @@
 #include "miscadmin.h"
 #include "utils/memutils.h"
 
+/* Callback for walking undo chains */
+typedef bool (*UndoChainCallback) (OTuple tuple, BTreeLeafTuphdr *tupHdr,
+								   void *arg);
+
 /* Iterates through undo images */
 typedef struct
 {
@@ -1053,6 +1057,136 @@ btree_iterate_all(BTreeIterator *it, void *end, BTreeKeyType endKind,
 {
 	return btree_iterate_raw_internal(it, end, endKind, endInclude, scanEnd,
 									  hint, false, tupHdr);
+}
+
+/*
+ * Walk through all versions of a tuple in its undo chain.
+ *
+ * This function takes a tuple header with an undoLocation and walks through
+ * all previous versions in the undo chain, calling the callback function for
+ * each version.
+ *
+ * Parameters:
+ *   desc: B-tree descriptor
+ *   tupHdr: Initial tuple header (will be modified to contain each version)
+ *   mcxt: Memory context for tuple allocations
+ *   callback: Function to call for each version (can be NULL)
+ *   arg: Argument to pass to callback
+ *
+ * The callback receives:
+ *   - tuple: The tuple data for this version
+ *   - tupHdr: The tuple header for this version
+ *   - arg: User-provided argument
+ *
+ * If callback returns false, iteration stops early.
+ */
+void
+o_walk_undo_chain(BTreeDescr *desc, BTreeLeafTuphdr *tupHdr,
+				  MemoryContext mcxt, UndoChainCallback callback, void *arg)
+{
+	UndoLocation undoLocation;
+	MemoryContext prevMctx;
+	bool		curTupleAllocated = false;
+	OTuple		curTuple;
+
+	Assert(tupHdr != NULL);
+	
+	prevMctx = MemoryContextSwitchTo(mcxt);
+	
+	/* Skip lock-only records */
+	undoLocation = find_non_lock_only_undo_record(desc->undoType, tupHdr);
+	
+	O_TUPLE_SET_NULL(curTuple);
+	
+	/* Walk through the undo chain */
+	while (UndoLocationIsValid(tupHdr->undoLocation))
+	{
+		undoLocation = tupHdr->undoLocation;
+		
+		/* Get previous version from undo log */
+		if (tupHdr->deleted != BTreeLeafTupleNonDeleted ||
+			XACT_INFO_IS_LOCK_ONLY(tupHdr->xactInfo))
+		{
+			/* This is a delete or lock-only record, just update header */
+			get_prev_leaf_header_from_undo(desc->undoType, tupHdr, true);
+		}
+		else
+		{
+			/* This is an update, get both header and tuple */
+			if (curTupleAllocated)
+				pfree(curTuple.data);
+			get_prev_leaf_header_and_tuple_from_undo(desc->undoType, tupHdr,
+													 &curTuple, 0);
+			curTupleAllocated = true;
+		}
+		
+		Assert(UNDO_REC_EXISTS(desc->undoType, undoLocation));
+		
+		/* Call the callback if provided */
+		if (callback && !callback(curTuple, tupHdr, arg))
+		{
+			/* Callback requested early termination */
+			break;
+		}
+	}
+	
+	if (curTupleAllocated)
+		pfree(curTuple.data);
+	
+	MemoryContextSwitchTo(prevMctx);
+}
+
+/*
+ * Iterate over leaf page tuples including all versions in their undo chains.
+ * 
+ * This iterator combines btree_iterate_all with undo chain traversal. For each
+ * tuple on the leaf page, it returns the current version followed by all 
+ * versions in the undo chain.
+ *
+ * Unlike o_btree_iterator_fetch, this does NOT apply snapshot visibility checks.
+ * ALL versions are returned regardless of transaction state or commit status.
+ *
+ * Parameters:
+ *   it: Iterator state
+ *   end, endKind, endInclude: Scan boundary conditions  
+ *   scanEnd: Set to true when scan is complete
+ *   hint: Optional location hint for optimization
+ *   tupHdr: Returns tuple header for current version
+ *   undoLocation: Returns undo location, or InvalidUndoLocation if no more versions
+ *
+ * Usage pattern:
+ *   1. Call btree_iterate_undo_chain to get first tuple
+ *   2. If returned tuple is not NULL and undoLocation is valid:
+ *      - Call o_walk_undo_chain to process all versions in the chain
+ *   3. Repeat from step 1 until scanEnd is true
+ */
+OTuple
+btree_iterate_undo_chain(BTreeIterator *it, void *end, BTreeKeyType endKind,
+						 bool endInclude, bool *scanEnd,
+						 BTreeLocationHint *hint, BTreeLeafTuphdr **tupHdr,
+						 UndoLocation *undoLocation)
+{
+	OTuple		result;
+	
+	/* Get next tuple from leaf pages (includes deleted tuples) */
+	result = btree_iterate_all(it, end, endKind, endInclude, scanEnd,
+							   hint, tupHdr);
+	
+	if (scanEnd || O_TUPLE_IS_NULL(result) || tupHdr == NULL)
+	{
+		if (undoLocation)
+			*undoLocation = InvalidUndoLocation;
+		return result;
+	}
+	
+	/* Skip lock-only records to find the actual undo chain */
+	(void) find_non_lock_only_undo_record(it->context.desc->undoType, *tupHdr);
+	
+	/* Return the undo location for the caller to walk if needed */
+	if (undoLocation)
+		*undoLocation = (*tupHdr)->undoLocation;
+	
+	return result;
 }
 
 /*
