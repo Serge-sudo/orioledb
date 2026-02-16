@@ -1550,12 +1550,13 @@ convert_secondary_tuple_for_validation(OTuple secTuple, OIndexDescr *secIndex, O
 /*
  * add_undo_version_to_sk - Add an undo version to a secondary key tuple's undo chain
  * 
- * This function finds the secondary key tuple and adds an undo record corresponding
- * to an older version from the primary key's undo chain.
+ * This function finds the secondary key tuple and creates an undo record corresponding
+ * to an older version from the primary key's undo chain, properly linking it into the
+ * SK tuple's undo chain.
  * 
  * Parameters:
  *   secIndexDescr - Secondary index descriptor
- *   skSlot - Slot containing the secondary key tuple
+ *   skSlot - Slot containing the secondary key tuple (transformed from PK version)
  *   pkTupleVersion - The PK tuple version to transform and add as undo
  *   primaryDescr - Primary index descriptor
  *   tableDescr - Table descriptor
@@ -1577,15 +1578,22 @@ add_undo_version_to_sk(OIndexDescr *secIndexDescr,
 	OInMemoryBlkno blkno;
 	BTreePageItemLocator *loc;
 	BTreeLeafTuphdr *tupHdr;
+	BTreeLeafTuphdr	newTupHdr;
 	OTuple		leafTup;
+	OTuple		skTuple;
 	int			cmp;
 	bool		success = false;
+	UndoLocation newUndoLocation;
+	uint32		pageChangeCount;
 
 	/*
 	 * Form a key bound for the secondary index tuple using the slot.
 	 * This will be used to find the SK tuple in the BTree.
 	 */
 	tts_orioledb_fill_key_bound(skSlot, secIndexDescr, &bound);
+
+	/* Get the SK tuple from the slot */
+	skTuple = ((OTableSlot *) skSlot)->tuple;
 
 	/* Load shared memory for secondary index */
 	o_btree_load_shmem(secDesc);
@@ -1605,6 +1613,7 @@ add_undo_version_to_sk(OIndexDescr *secIndexDescr,
 		blkno = context.items[context.index].blkno;
 		p = O_GET_IN_MEMORY_PAGE(blkno);
 		loc = &context.items[context.index].locator;
+		pageChangeCount = context.items[context.index].pageChangeCount;
 
 		/* Verify the tuple exists and matches our key */
 		if (BTREE_PAGE_LOCATOR_IS_VALID(p, loc))
@@ -1619,23 +1628,44 @@ add_undo_version_to_sk(OIndexDescr *secIndexDescr,
 			if (cmp == 0)
 			{
 				/*
-				 * Found the SK tuple. Now we need to create an undo record
-				 * for this older version and link it to the tuple's undo chain.
+				 * Found the SK tuple. Create an undo record for this older version
+				 * and link it to the tuple's undo chain.
 				 *
-				 * TODO: Complete undo record creation:
-				 * 1. Transform pkTupleVersion to SK tuple format
-				 * 2. Call make_undo_record() with BTreeOperationUpdate
-				 * 3. Update the tuple header's undoLocation to point to new undo
-				 * 4. Mark the page as dirty
-				 *
-				 * This is complex because:
-				 * - We need to construct the full SK tuple from pkTupleVersion
-				 * - We need to preserve the existing undo chain link
-				 * - We need proper locking and page modification
-				 *
-				 * For now, we just log that we found the tuple.
+				 * The undo chain structure:
+				 * - Current tuple in BTree page has undoLocation pointing to first undo
+				 * - First undo points to second undo, etc.
+				 * - We're adding a new undo record that will become the first in chain
 				 */
-				elog(DEBUG2, "Found SK tuple for undo chain addition during validation");
+				
+				/* Save the current tuple header - we'll need it for linking */
+				newTupHdr = *tupHdr;
+				
+				/*
+				 * Create an undo record with the SK tuple data.
+				 * The undo record will contain the old version's data,
+				 * and will point to the existing undo chain.
+				 */
+				newUndoLocation = make_undo_record(secDesc, skTuple, true,
+												   BTreeOperationUpdate,
+												   blkno, pageChangeCount,
+												   tupHdr);
+				
+				/*
+				 * Update the tuple header in the page to point to our new undo record.
+				 * This makes our new undo the first in the chain.
+				 */
+				page_block_reads(blkno);
+				
+				/* Get the tuple header pointer again (it might have moved) */
+				tupHdr = (BTreeLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(p, loc);
+				
+				/* Update the undoLocation to point to our new undo record */
+				tupHdr->undoLocation = newUndoLocation;
+				
+				/* Mark the page as dirty */
+				MARK_DIRTY(secDesc, blkno);
+				
+				elog(DEBUG2, "Created undo record for SK tuple during validation, undoLocation: %lu", newUndoLocation);
 				success = true;
 			}
 		}
