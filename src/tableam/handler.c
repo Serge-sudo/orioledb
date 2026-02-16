@@ -1609,6 +1609,7 @@ add_undo_version_to_sk(OIndexDescr *secIndexDescr,
 		/* Verify the tuple exists and matches our key */
 		if (BTREE_PAGE_LOCATOR_IS_VALID(p, loc))
 		{
+			/* Read both tuple header and data - tupHdr will be needed for undo chain linking */
 			BTREE_PAGE_READ_LEAF_ITEM(tupHdr, leafTup, p, loc);
 			
 			/* Compare to ensure we found the right tuple */
@@ -1850,7 +1851,6 @@ orioledb_index_validate_scan(Relation heapRelation,
 				/* Free the previous PK tuple if it exists */
 				if (!O_TUPLE_IS_NULL(currentPK))
 					pfree(currentPK.data);
-				O_TUPLE_SET_NULL(currentPK);
 			}
 		}
 
@@ -1859,11 +1859,6 @@ orioledb_index_validate_scan(Relation heapRelation,
 		 * Store it as the current PK for future undo version detection.
 		 */
 		Size pkTupleLen = o_btree_len(&GET_PRIMARY(descr)->desc, tup, OTupleLength);
-		
-		/* Free existing currentPK if allocated (shouldn't happen, but be safe) */
-		if (!O_TUPLE_IS_NULL(currentPK))
-			pfree(currentPK.data);
-			
 		currentPK.data = (Pointer) palloc(pkTupleLen);
 		memcpy(currentPK.data, tup.data, pkTupleLen);
 		currentPK.formatFlags = tup.formatFlags;
