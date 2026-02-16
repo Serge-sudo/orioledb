@@ -1105,7 +1105,10 @@ o_walk_undo_chain(BTreeDescr *desc, BTreeLeafTuphdr *tupHdr,
 
 	prevMctx = MemoryContextSwitchTo(mcxt);
 
-	/* Skip lock-only records */
+	/*
+	 * Skip lock-only records to find first non-lock-only undo record.
+	 * This modifies tupHdr->undoLocation as a side effect.
+	 */
 	undoLocation = find_non_lock_only_undo_record(desc->undoType, tupHdr);
 
 	O_TUPLE_SET_NULL(curTuple);
@@ -1230,7 +1233,11 @@ btree_iterate_undo_chain(BTreeIterator *it, void *end, BTreeKeyType endKind,
 		return result;
 	}
 
-	/* Skip lock-only records to find the actual undo chain */
+	/*
+	 * Skip lock-only records to find the actual undo chain.
+	 * This modifies (*tupHdr)->undoLocation to point to first non-lock-only
+	 * undo record. We don't need the return value, just the side effect.
+	 */
 	(void) find_non_lock_only_undo_record(it->context.desc->undoType, *tupHdr);
 
 	/* Return the undo location for the caller to walk if needed */
