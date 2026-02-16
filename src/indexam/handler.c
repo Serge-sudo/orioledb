@@ -988,10 +988,14 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	it = o_btree_iterator_create(&index_descr->desc, NULL, BTreeKeyNone,
 								 &oSnapshot, ForwardScanDirection);
 
-	/* Enable undo chain walking for complete tuple version visibility */
-	o_btree_iterator_set_undo_chain_walking(it, true);
+	/*
+	 * Note: We don't enable undo chain walking here because at this point
+	 * the index is ready but the boundary is not visible yet, so there are
+	 * no undo chains. Undo chain walking is only needed during validation
+	 * scan on the primary index side.
+	 */
 
-	/* Iterate over all tuples and their undo chain versions */
+	/* Iterate over all tuples */
 	while (true)
 	{
 		OTuple		tuple;

@@ -1597,10 +1597,9 @@ extract_pk_from_validation_tuple(OTuple validationTuple, OIndexDescr *secIndex, 
  * This function performs index validation by doing a merge-join between tuples
  * from the primary index and tuples from the secondary index (via tuplesort).
  *
- * NOTE: Currently walks the undo chains only on the secondary index side
- * (via orioledb_ambulkdelete callback). Walking undo chains on the primary
- * index side would require more complex integration with the merge-join logic.
- * TODO: Consider adding undo chain walking for primary index tuples as well.
+ * Undo chain walking is enabled on the primary index iterator to ensure complete
+ * transfer of all tuple versions from PK to secondary index, including both the
+ * final tuple and all historical versions from undo chains.
  */
 static void
 orioledb_index_validate_scan(Relation heapRelation,
@@ -1656,6 +1655,14 @@ orioledb_index_validate_scan(Relation heapRelation,
 	 */
 	iterator = o_btree_iterator_create(&GET_PRIMARY(descr)->desc, NULL, BTreeKeyNone,
 									   &oSnapshot, ForwardScanDirection);
+	
+	/*
+	 * Enable undo chain walking for the primary index iterator.
+	 * This ensures we transfer the entire undo chain from PK to secondary index,
+	 * including both the final tuple and all undo versions.
+	 * This is critical for validation during concurrent modifications.
+	 */
+	o_btree_iterator_set_undo_chain_walking(iterator, true);
 	
 	primarySlot = MakeSingleTupleTableSlot(descr->tupdesc, &TTSOpsOrioleDB);
 	econtext->ecxt_scantuple = primarySlot;
