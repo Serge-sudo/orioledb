@@ -1637,9 +1637,10 @@ add_undo_version_to_sk(OIndexDescr *secIndexDescr,
 				 */
 				
 				/*
-				 * Create an undo record with the SK tuple data.
-				 * The undo record will contain the old version's data,
-				 * and will point to the existing undo chain.
+				 * Create an undo record with the SK tuple data from the slot.
+				 * Note: skTuple contains the older version (transformed from pkTupleVersion),
+				 * not the current version. This is correct - the undo record stores the
+				 * historical version's data.
 				 */
 				newUndoLocation = make_undo_record(secDesc, skTuple, true,
 												   BTreeOperationUpdate,
@@ -1652,7 +1653,10 @@ add_undo_version_to_sk(OIndexDescr *secIndexDescr,
 				 */
 				page_block_reads(blkno);
 				
-				/* Get the tuple header pointer again (it might have moved) */
+				/* Refresh page pointer after blocking reads */
+				p = O_GET_IN_MEMORY_PAGE(blkno);
+				
+				/* Get the tuple header pointer (page may have been reorganized) */
 				tupHdr = (BTreeLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(p, loc);
 				
 				/* Update the undoLocation to point to our new undo record */
@@ -1661,7 +1665,7 @@ add_undo_version_to_sk(OIndexDescr *secIndexDescr,
 				/* Mark the page as dirty */
 				MARK_DIRTY(secDesc, blkno);
 				
-				elog(DEBUG2, "Created undo record for SK tuple during validation, undoLocation: %lu", newUndoLocation);
+				elog(DEBUG2, "Created undo record for SK tuple during validation");
 				success = true;
 			}
 		}
