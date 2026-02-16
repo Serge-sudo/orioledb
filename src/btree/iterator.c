@@ -640,6 +640,97 @@ o_btree_iterator_fetch(BTreeIterator *it, CommitSeqNo *tupleCsn,
 }
 
 /*
+ * Enhanced iterator fetch that returns metadata about undo chain status.
+ *
+ * This function provides additional information about whether the returned
+ * tuple is from an undo chain, and whether there are more undo versions
+ * available. This is useful for validation and other operations that need
+ * to process undo chains explicitly.
+ */
+OBTreeIteratorFetchResult
+o_btree_iterator_fetch_enhanced(BTreeIterator *it,
+								void *end,
+								BTreeKeyType endType,
+								bool endIsIncluded,
+								BTreeLocationHint *hint)
+{
+	BTreeDescr *desc = it->context.desc;
+	OBTreeIteratorFetchResult result;
+	bool		wasInUndoChain;
+	
+	/* Initialize result structure */
+	O_TUPLE_SET_NULL(result.tuple);
+	result.csn = COMMITSEQNO_INPROGRESS;
+	result.isUndoVersion = false;
+	result.hasMoreUndoVersions = false;
+	result.undoLocation = InvalidUndoLocation;
+	
+	/* Check if we're currently walking an undo chain */
+	wasInUndoChain = it->walkUndoChains && it->hasUndoChainTuple;
+	
+	/* Fetch the next tuple */
+	result.tuple = o_btree_iterator_fetch_internal(it, &result.csn);
+	
+	/* If we got a tuple and were in an undo chain, mark it as an undo version */
+	if (!O_TUPLE_IS_NULL(result.tuple) && wasInUndoChain)
+	{
+		result.isUndoVersion = true;
+		result.undoLocation = it->currentUndoChainLoc;
+		
+		/* Check if there are more undo versions */
+		result.hasMoreUndoVersions = UndoLocationIsValid(it->currentUndoChainLoc);
+	}
+	else if (!O_TUPLE_IS_NULL(result.tuple) && it->walkUndoChains)
+	{
+		/* This is a new tuple (not from undo chain) */
+		result.isUndoVersion = false;
+		
+		/* Check if this tuple has undo versions */
+		result.hasMoreUndoVersions = it->hasUndoChainTuple;
+	}
+	
+	/* Apply end boundary check */
+	if (!O_TUPLE_IS_NULL(result.tuple) && end != NULL)
+	{
+		int			cmp = o_btree_cmp(desc, &result.tuple, BTreeKeyLeafTuple, end, endType);
+		
+		if (IT_IS_BACKWARD(it))
+			cmp *= -1;
+		
+		if (cmp >= (endIsIncluded ? 1 : 0))
+		{
+			pfree(result.tuple.data);
+			O_TUPLE_SET_NULL(result.tuple);
+			return result;
+		}
+	}
+	
+#ifdef USE_ASSERT_CHECKING
+	if (!O_TUPLE_IS_NULL(result.tuple))
+	{
+		if (!O_TUPLE_IS_NULL(it->prevTuple.tuple))
+		{
+			int			cmp;
+			
+			cmp = o_btree_cmp(desc, &it->prevTuple.tuple, BTreeKeyLeafTuple,
+							  &result.tuple, BTreeKeyLeafTuple);
+			
+			Assert((IT_IS_FORWARD(it) && cmp < 0) || cmp > 0);
+		}
+		copy_fixed_tuple(desc, &it->prevTuple, result.tuple);
+	}
+#endif
+	
+	if (hint && !O_TUPLE_IS_NULL(result.tuple))
+	{
+		hint->blkno = it->context.items[it->context.index].blkno;
+		hint->pageChangeCount = it->context.items[it->context.index].pageChangeCount;
+	}
+	
+	return result;
+}
+
+/*
  * Free resouces associated with iterator.
  */
 void

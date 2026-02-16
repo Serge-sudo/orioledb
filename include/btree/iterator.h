@@ -36,6 +36,19 @@ typedef TupleFetchCallbackResult (*TupleFetchCallback) (OTuple tuple,
 														void *arg,
 														TupleFetchCallbackCheckType check_type);
 
+/*
+ * Enhanced fetch result structure that provides information about
+ * whether the tuple is from an undo chain and related metadata.
+ */
+typedef struct OBTreeIteratorFetchResult
+{
+	OTuple		tuple;			/* The fetched tuple */
+	CommitSeqNo	csn;			/* Commit sequence number */
+	bool		isUndoVersion;	/* True if this is from an undo chain */
+	bool		hasMoreUndoVersions; /* True if there are more undo versions */
+	UndoLocation undoLocation;	/* Location of the undo record (if isUndoVersion) */
+} OBTreeIteratorFetchResult;
+
 extern OTuple o_btree_find_tuple_by_key(BTreeDescr *desc, void *key,
 										BTreeKeyType kind,
 										OSnapshot *read_o_snapshot,
@@ -59,6 +72,11 @@ extern OTuple o_btree_iterator_fetch(BTreeIterator *it,
 									 void *end, BTreeKeyType endType,
 									 bool endIsIncluded,
 									 BTreeLocationHint *hint);
+extern OBTreeIteratorFetchResult o_btree_iterator_fetch_enhanced(BTreeIterator *it,
+																 void *end,
+																 BTreeKeyType endType,
+																 bool endIsIncluded,
+																 BTreeLocationHint *hint);
 extern OTuple btree_iterate_raw(BTreeIterator *it, void *end,
 								BTreeKeyType endKind, bool endInclude,
 								bool *scanEnd, BTreeLocationHint *hint);

@@ -1810,84 +1810,72 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 	while (true)
 	{
+		OBTreeIteratorFetchResult fetchResult;
+		
 		oslot = (OTableSlot *) primarySlot;
 
-		/* Fetch next tuple from iterator in PK order */
-		tup = o_btree_iterator_fetch(iterator, &tupleCsn, NULL, BTreeKeyNone, true, &hint);
+		/* Fetch next tuple from iterator with enhanced metadata */
+		fetchResult = o_btree_iterator_fetch_enhanced(iterator, NULL, BTreeKeyNone, true, &hint);
+		tup = fetchResult.tuple;
+		tupleCsn = fetchResult.csn;
 		
 		if (O_TUPLE_IS_NULL(tup))
 			break;
 
 		/*
-		 * Check if this tuple is an undo version of the current PK or a new PK.
-		 * With undo chain walking enabled, the iterator returns:
-		 * 1. Main tuple for PK1
-		 * 2. Undo version(s) of PK1 (same key, older versions)
-		 * 3. Main tuple for PK2
-		 * etc.
+		 * The enhanced iterator tells us explicitly if this is an undo version.
+		 * This is cleaner than manually comparing tuples.
 		 */
-		if (!O_TUPLE_IS_NULL(currentPK))
+		if (fetchResult.isUndoVersion)
 		{
-			int pkCmp = o_btree_cmp(&GET_PRIMARY(descr)->desc,
-									&currentPK, BTreeKeyLeafTuple,
-									&tup, BTreeKeyLeafTuple);
+			/*
+			 * This is an undo version of the current PK tuple.
+			 * Transform it to SK format and add to SK's undo chain.
+			 */
+			OTuple		skTuple;
 			
-			if (pkCmp == 0)
+			/* Transform the undo version from PK format to SK format */
+			tts_orioledb_store_tuple(primarySlot, tup, descr, tupleCsn,
+									 PrimaryIndexNumber, true, NULL);
+			slot_getallattrs(primarySlot);
+
+			MemoryContextReset(econtext->ecxt_per_tuple_memory);
+
+			/* Create SK tuple and store in secondary slot */
+			skTuple = tts_orioledb_make_secondary_tuple(primarySlot, state->index_descr, true);
+			tts_orioledb_store_tuple(secondarySlot, skTuple, descr, tupleCsn,
+									 state->index_descr->index_mctx.dsc->oids.reloid,
+									 false, NULL);
+
+			/*
+			 * Add this undo version to the secondary key's undo chain.
+			 * The helper function will find the SK tuple and create an undo record.
+			 */
+			if (add_undo_version_to_sk(state->index_descr, secondarySlot,
+									   tup, GET_PRIMARY(descr), descr))
 			{
-				/*
-				 * This is an undo version of the current PK tuple.
-				 * Transform it to SK format and add to SK's undo chain.
-				 */
-				OTuple		skTuple;
-				
-				/* Transform the undo version from PK format to SK format */
-				tts_orioledb_store_tuple(primarySlot, tup, descr, tupleCsn,
-										 PrimaryIndexNumber, true, NULL);
-				slot_getallattrs(primarySlot);
-
-				MemoryContextReset(econtext->ecxt_per_tuple_memory);
-
-				/* Create SK tuple and store in secondary slot */
-				skTuple = tts_orioledb_make_secondary_tuple(primarySlot, state->index_descr, true);
-				tts_orioledb_store_tuple(secondarySlot, skTuple, descr, tupleCsn,
-										 state->index_descr->index_mctx.dsc->oids.reloid,
-										 false, NULL);
-
-				/*
-				 * Add this undo version to the secondary key's undo chain.
-				 * The helper function will find the SK tuple and create an undo record.
-				 */
-				if (add_undo_version_to_sk(state->index_descr, secondarySlot,
-										   tup, GET_PRIMARY(descr), descr))
-				{
-					elog(DEBUG2, "Successfully added undo version to SK during validation");
-				}
-				else
-				{
-					elog(WARNING, "Failed to add undo version to SK during validation");
-				}
-				
-				/* Clean up */
-				if (skTuple.data != NULL)
-					pfree(skTuple.data);
-				ExecClearTuple(primarySlot);
-				ExecClearTuple(secondarySlot);
-				pfree(tup.data);
-				continue;
+				elog(DEBUG2, "Successfully added undo version to SK during validation");
 			}
 			else
 			{
-				/* This is a new PK tuple, not an undo version */
-				/* Free the previous PK tuple if it exists */
-				if (!O_TUPLE_IS_NULL(currentPK))
-					pfree(currentPK.data);
+				elog(WARNING, "Failed to add undo version to SK during validation");
 			}
+			
+			/* Clean up */
+			if (skTuple.data != NULL)
+				pfree(skTuple.data);
+			ExecClearTuple(primarySlot);
+			ExecClearTuple(secondarySlot);
+			pfree(tup.data);
+			continue;
 		}
 
 		/*
 		 * This is a new PK tuple (not an undo version).
-		 * Store it as the current PK for future undo version detection.
+		 * Free the previous PK if it exists and store the new one.
 		 */
+		if (!O_TUPLE_IS_NULL(currentPK))
+			pfree(currentPK.data);
 		Size pkTupleLen = o_btree_len(&GET_PRIMARY(descr)->desc, tup, OTupleLength);
 		currentPK.data = (Pointer) palloc(pkTupleLen);
 		memcpy(currentPK.data, tup.data, pkTupleLen);
