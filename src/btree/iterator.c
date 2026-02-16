@@ -657,6 +657,7 @@ o_btree_iterator_fetch_enhanced(BTreeIterator *it,
 	BTreeDescr *desc = it->context.desc;
 	OBTreeIteratorFetchResult result;
 	bool		wasInUndoChain;
+	UndoLocation undoLocBeforeFetch;
 	
 	/* Initialize result structure */
 	O_TUPLE_SET_NULL(result.tuple);
@@ -665,8 +666,12 @@ o_btree_iterator_fetch_enhanced(BTreeIterator *it,
 	result.hasMoreUndoVersions = false;
 	result.undoLocation = InvalidUndoLocation;
 	
-	/* Check if we're currently walking an undo chain */
+	/* 
+	 * Check if we're currently walking an undo chain.
+	 * Save the undo location before fetch to use as metadata.
+	 */
 	wasInUndoChain = it->walkUndoChains && it->hasUndoChainTuple;
+	undoLocBeforeFetch = it->currentUndoChainLoc;
 	
 	/* Fetch the next tuple */
 	result.tuple = o_btree_iterator_fetch_internal(it, &result.csn);
@@ -675,9 +680,12 @@ o_btree_iterator_fetch_enhanced(BTreeIterator *it,
 	if (!O_TUPLE_IS_NULL(result.tuple) && wasInUndoChain)
 	{
 		result.isUndoVersion = true;
-		result.undoLocation = it->currentUndoChainLoc;
+		result.undoLocation = undoLocBeforeFetch;
 		
-		/* Check if there are more undo versions */
+		/* 
+		 * After fetch_next_undo_chain_tuple(), currentUndoChainLoc points to
+		 * the NEXT undo in the chain. If it's valid, there are more versions.
+		 */
 		result.hasMoreUndoVersions = UndoLocationIsValid(it->currentUndoChainLoc);
 	}
 	else if (!O_TUPLE_IS_NULL(result.tuple) && it->walkUndoChains)
@@ -685,7 +693,7 @@ o_btree_iterator_fetch_enhanced(BTreeIterator *it,
 		/* This is a new tuple (not from undo chain) */
 		result.isUndoVersion = false;
 		
-		/* Check if this tuple has undo versions */
+		/* Check if this tuple has undo versions that will be fetched next */
 		result.hasMoreUndoVersions = it->hasUndoChainTuple;
 	}
 	
@@ -715,7 +723,9 @@ o_btree_iterator_fetch_enhanced(BTreeIterator *it,
 			cmp = o_btree_cmp(desc, &it->prevTuple.tuple, BTreeKeyLeafTuple,
 							  &result.tuple, BTreeKeyLeafTuple);
 			
-			Assert((IT_IS_FORWARD(it) && cmp < 0) || cmp > 0);
+			/* For forward iteration, current should be > previous (cmp < 0 from prev's perspective)
+			 * For backward iteration, current should be < previous (cmp > 0 from prev's perspective) */
+			Assert((IT_IS_FORWARD(it) && cmp < 0) || (!IT_IS_FORWARD(it) && cmp > 0));
 		}
 		copy_fixed_tuple(desc, &it->prevTuple, result.tuple);
 	}
