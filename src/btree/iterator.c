@@ -723,8 +723,8 @@ o_btree_iterator_fetch_enhanced(BTreeIterator *it,
 			cmp = o_btree_cmp(desc, &it->prevTuple.tuple, BTreeKeyLeafTuple,
 							  &result.tuple, BTreeKeyLeafTuple);
 			
-			/* For forward iteration, current should be > previous (cmp < 0 from prev's perspective)
-			 * For backward iteration, current should be < previous (cmp > 0 from prev's perspective) */
+			/* For forward iteration: prev < current (cmp < 0)
+			 * For backward iteration: prev > current (cmp > 0) */
 			Assert((IT_IS_FORWARD(it) && cmp < 0) || (!IT_IS_FORWARD(it) && cmp > 0));
 		}
 		copy_fixed_tuple(desc, &it->prevTuple, result.tuple);
