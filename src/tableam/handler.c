@@ -1728,7 +1728,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 	Datum		heapRowIdDatum;
 	bool		rowIdIsNull;
 	OInMemoryBlkno lastBlkno = OInvalidInMemoryBlkno;
-	OTuple		currentPK = {0};	/* Track the current PK tuple for undo chain handling */
+	OTuple		currentPK;	/* Track the current PK tuple for undo chain handling */
 	TupleTableSlot *secondarySlot = NULL;	/* Slot for transformed SK tuples from undo versions */
 
 	Assert(state != NULL);
@@ -1808,8 +1808,6 @@ orioledb_index_validate_scan(Relation heapRelation,
 				 * Transform it to SK format and add to SK's undo chain.
 				 */
 				OTuple		skTuple;
-				Datum		undoValues[INDEX_MAX_KEYS];
-				bool		undoIsnull[INDEX_MAX_KEYS];
 				
 				/* Transform the undo version from PK format to SK format */
 				tts_orioledb_store_tuple(primarySlot, tup, descr, tupleCsn,
@@ -1817,9 +1815,6 @@ orioledb_index_validate_scan(Relation heapRelation,
 				slot_getallattrs(primarySlot);
 
 				MemoryContextReset(econtext->ecxt_per_tuple_memory);
-
-				/* Form secondary index datum from the undo version */
-				FormIndexDatum(indexInfo, primarySlot, estate, undoValues, undoIsnull);
 
 				/* Create SK tuple and store in secondary slot */
 				skTuple = tts_orioledb_make_secondary_tuple(primarySlot, state->index_descr, true);
@@ -1852,8 +1847,9 @@ orioledb_index_validate_scan(Relation heapRelation,
 			else
 			{
 				/* This is a new PK tuple, not an undo version */
-				/* Free the previous PK tuple */
-				pfree(currentPK.data);
+				/* Free the previous PK tuple if it exists */
+				if (!O_TUPLE_IS_NULL(currentPK))
+					pfree(currentPK.data);
 				O_TUPLE_SET_NULL(currentPK);
 			}
 		}
@@ -1863,6 +1859,11 @@ orioledb_index_validate_scan(Relation heapRelation,
 		 * Store it as the current PK for future undo version detection.
 		 */
 		Size pkTupleLen = o_btree_len(&GET_PRIMARY(descr)->desc, tup, OTupleLength);
+		
+		/* Free existing currentPK if allocated (shouldn't happen, but be safe) */
+		if (!O_TUPLE_IS_NULL(currentPK))
+			pfree(currentPK.data);
+			
 		currentPK.data = (Pointer) palloc(pkTupleLen);
 		memcpy(currentPK.data, tup.data, pkTupleLen);
 		currentPK.formatFlags = tup.formatFlags;
@@ -2078,7 +2079,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 	}
 
 	/* Clean up currentPK if it was allocated */
-	if (!O_TUPLE_IS_NULL(currentPK) && currentPK.data != NULL)
+	if (!O_TUPLE_IS_NULL(currentPK))
 		pfree(currentPK.data);
 
 	/*
