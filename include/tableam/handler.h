@@ -316,6 +316,7 @@ typedef struct OValidateIndexState
 	
 	/* Orioledb-specific fields */
 	OTuple		current_tuple;	/* Current tuple being processed by ambulkdelete */
+	OTupleXactInfo current_xact_info; /* Transaction info (includes OXID) for current tuple */
 	OIndexDescr *index_descr;	/* Index descriptor for extracting PK from tuples */
 	OTableDescr *table_descr;	/* Table descriptor */
 	ORelOids	index_oids;		/* Index OIDs for finding index number */

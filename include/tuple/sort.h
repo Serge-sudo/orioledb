@@ -30,7 +30,7 @@ extern Tuplesortstate *tuplesort_begin_orioledb_toast(OIndexDescr *toast,
 													  int workMem,
 													  bool randomAccess,
 													  SortCoordinate coordinate);
-extern OTuple tuplesort_getotuple(Tuplesortstate *state, bool forward);
-extern void tuplesort_putotuple(Tuplesortstate *state, OTuple tup);
+extern OTuple tuplesort_getotuple(Tuplesortstate *state, bool forward, OXid *oxid);
+extern void tuplesort_putotuple(Tuplesortstate *state, OTuple tup, OXid oxid);
 
 #endif							/* __TUPLE_SORT_H */

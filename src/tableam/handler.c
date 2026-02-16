@@ -1446,8 +1446,10 @@ validate_index_callback(ItemPointer itemptr, void *callback_state)
 		/* 
 		 * Put the converted tuple into tuplesort.
 		 * The tuplesort comparator will sort by PK fields for merge-join.
+		 * Also store the OXID from the tuple header for later comparison.
 		 */
-		tuplesort_putotuple(state->tuplesort, fullIndexTuple);
+		OXid oxid = XACT_INFO_GET_OXID(state->current_xact_info);
+		tuplesort_putotuple(state->tuplesort, fullIndexTuple, oxid);
 		
 		/* Free the allocated tuple */
 		pfree(fullIndexTuple.data);
@@ -1460,9 +1462,10 @@ validate_index_callback(ItemPointer itemptr, void *callback_state)
 static bool
 orioledb_validate_next_index_tid(Tuplesortstate *tuplesort,
 								 OTuple *indexTuple,
+								 OXid *oxid,
 								 double *itups)
 {
-	*indexTuple = tuplesort_getotuple(tuplesort, true);
+	*indexTuple = tuplesort_getotuple(tuplesort, true, oxid);
 	
 	if (O_TUPLE_IS_NULL(*indexTuple))
 		return false;
@@ -1761,6 +1764,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 	OInMemoryBlkno lastBlkno = OInvalidInMemoryBlkno;
 	OTuple		currentPK;	/* Track the current PK tuple for undo chain handling */
 	TupleTableSlot *secondarySlot = NULL;	/* Slot for transformed SK tuples from undo versions */
+	OXid		indexTupleOxid;	/* OXID from secondary index tuple for comparison */
 
 	Assert(state != NULL);
 	Assert(state->tuplesort != NULL);
@@ -1920,6 +1924,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 			{
 				indexTupleValid = orioledb_validate_next_index_tid(state->tuplesort,
 																   &indexTuple,
+																   &indexTupleOxid,
 																   &state->itups);
 				if (!indexTupleValid)
 					indexDone = true;

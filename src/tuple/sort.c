@@ -32,22 +32,29 @@ typedef struct
 } OIndexBuildSortArg;
 
 static void
-write_o_tuple(void *ptr, OTuple tup, int tupsize)
+write_o_tuple(void *ptr, OTuple tup, int tupsize, OXid oxid)
 {
 	Pointer		p = (Pointer) ptr;
 
 	*((uint8 *) p) = tup.formatFlags;
 	p += MAXIMUM_ALIGNOF;
+	/* Store OXID after formatFlags */
+	*((OXid *) p) = oxid;
+	p += MAXIMUM_ALIGNOF;
 	memcpy(p, tup.data, tupsize);
 }
 
 static OTuple
-read_o_tuple(void *ptr)
+read_o_tuple(void *ptr, OXid *oxid)
 {
 	OTuple		tup;
 	Pointer		p = (Pointer) ptr;
 
 	tup.formatFlags = *((uint8 *) p);
+	p += MAXIMUM_ALIGNOF;
+	/* Read OXID after formatFlags */
+	if (oxid)
+		*oxid = *((OXid *) p);
 	p += MAXIMUM_ALIGNOF;
 	tup.data = p;
 
@@ -81,8 +88,8 @@ comparetup_orioledb_index(const SortTuple *a, const SortTuple *b, Tuplesortstate
 		return compare;
 
 	/* Compare additional sort keys */
-	ltup = read_o_tuple(a->tuple);
-	rtup = read_o_tuple(b->tuple);
+	ltup = read_o_tuple(a->tuple, NULL);
+	rtup = read_o_tuple(b->tuple, NULL);
 	tupDesc = arg->tupDesc;
 
 	if (sortKey->abbrev_converter)
@@ -155,14 +162,17 @@ writetup_orioledb_index(Tuplesortstate *state, LogicalTape *tape, SortTuple *stu
 	OIndexBuildSortArg *arg = (OIndexBuildSortArg *) base->arg;
 	OTupleFixedFormatSpec *spec = &arg->id->leafSpec;
 	OTuple		tuple;
+	OXid		oxid;
 	int			tuplen;
 
-	tuple = read_o_tuple(stup->tuple);
-	tuplen = o_tuple_size(tuple, spec) + sizeof(int) + 1;
+	tuple = read_o_tuple(stup->tuple, &oxid);
+	/* Account for tuple data + oxid + formatFlags + length markers */
+	tuplen = o_tuple_size(tuple, spec) + sizeof(OXid) + sizeof(int) + 1;
 
 	LogicalTapeWrite(tape, (void *) &tuplen, sizeof(tuplen));
 	LogicalTapeWrite(tape, (void *) tuple.data, o_tuple_size(tuple, spec));
 	LogicalTapeWrite(tape, (void *) &tuple.formatFlags, 1);
+	LogicalTapeWrite(tape, (void *) &oxid, sizeof(OXid));
 	if (base->sortopt & TUPLESORT_RANDOMACCESS) /* need trailing length word? */
 		LogicalTapeWrite(tape, (void *) &tuplen, sizeof(tuplen));
 }
@@ -174,17 +184,20 @@ readtup_orioledb_index(Tuplesortstate *state, SortTuple *stup,
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	OIndexBuildSortArg *arg = (OIndexBuildSortArg *) base->arg;
 	OTupleFixedFormatSpec *spec = &arg->id->leafSpec;
-	uint32		tuplen = len - sizeof(int) - 1;
-	Pointer		tup = (Pointer) tuplesort_readtup_alloc(state, MAXIMUM_ALIGNOF + tuplen);
+	uint32		tuplen = len - sizeof(OXid) - sizeof(int) - 1;
+	/* Allocate space for formatFlags + OXID + tuple data */
+	Pointer		tup = (Pointer) tuplesort_readtup_alloc(state, MAXIMUM_ALIGNOF + MAXIMUM_ALIGNOF + tuplen);
 	OTuple		tuple;
+	OXid		oxid;
 
-	/* read in the tuple proper */
-	LogicalTapeReadExact(tape, tup + MAXIMUM_ALIGNOF, tuplen);
-	LogicalTapeReadExact(tape, tup, 1);
+	/* read in the tuple proper, formatFlags, and OXID */
+	LogicalTapeReadExact(tape, tup + MAXIMUM_ALIGNOF + MAXIMUM_ALIGNOF, tuplen);
+	LogicalTapeReadExact(tape, tup, 1); /* formatFlags */
+	LogicalTapeReadExact(tape, tup + MAXIMUM_ALIGNOF, sizeof(OXid)); /* OXID */
 	if (base->sortopt & TUPLESORT_RANDOMACCESS) /* need trailing length word? */
 		LogicalTapeReadExact(tape, &tuplen, sizeof(tuplen));
 	stup->tuple = (void *) tup;
-	tuple = read_o_tuple(tup);
+	tuple = read_o_tuple(tup, NULL);
 	/* set up first-column key value */
 	stup->datum1 = o_fastgetattr(tuple,
 								 base->sortKeys[0].ssup_attno,
@@ -207,7 +220,7 @@ removeabbrev_orioledb_index(Tuplesortstate *state, SortTuple *stups,
 		SortTuple  *stup = &stups[i];
 		OTuple		tup;
 
-		tup = read_o_tuple(stup->tuple);
+		tup = read_o_tuple(stup->tuple, NULL);
 
 		stup->datum1 = o_fastgetattr(tup,
 									 base->sortKeys[0].ssup_attno,
@@ -490,7 +503,7 @@ tuplesort_begin_orioledb_toast(OIndexDescr *toast,
 }
 
 OTuple
-tuplesort_getotuple(Tuplesortstate *state, bool forward)
+tuplesort_getotuple(Tuplesortstate *state, bool forward, OXid *oxid)
 {
 	MemoryContext oldcontext = MemoryContextSwitchTo(TuplesortstateGetPublic(state)->sortcontext);
 	SortTuple	stup;
@@ -503,19 +516,21 @@ tuplesort_getotuple(Tuplesortstate *state, bool forward)
 
 	if (stup.tuple)
 	{
-		result = read_o_tuple(stup.tuple);
+		result = read_o_tuple(stup.tuple, oxid);
 	}
 	else
 	{
 		result.data = NULL;
 		result.formatFlags = 0;
+		if (oxid)
+			*oxid = InvalidOXid;
 	}
 
 	return result;
 }
 
 void
-tuplesort_putotuple(Tuplesortstate *state, OTuple tup)
+tuplesort_putotuple(Tuplesortstate *state, OTuple tup, OXid oxid)
 {
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	OIndexBuildSortArg *arg = (OIndexBuildSortArg *) base->arg;
@@ -533,9 +548,10 @@ tuplesort_putotuple(Tuplesortstate *state, OTuple tup)
 	 * Then call the common code.
 	 */
 	tupsize = o_tuple_size(tup, spec);
-	stup.tuple = MemoryContextAlloc(base->tuplecontext, MAXIMUM_ALIGNOF + tupsize);
-	write_o_tuple(stup.tuple, tup, tupsize);
-	written_tup = read_o_tuple(stup.tuple);
+	/* Allocate space for formatFlags + OXID + tuple data */
+	stup.tuple = MemoryContextAlloc(base->tuplecontext, MAXIMUM_ALIGNOF + MAXIMUM_ALIGNOF + tupsize);
+	write_o_tuple(stup.tuple, tup, tupsize, oxid);
+	written_tup = read_o_tuple(stup.tuple, NULL);
 
 	stup.datum1 = o_fastgetattr(written_tup,
 								base->sortKeys[0].ssup_attno,
