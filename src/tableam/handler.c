@@ -1691,6 +1691,8 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 	while (true)
 	{
 		UndoLocation newUndoLocation;
+		BTreeOperationType pkAction;
+		BTreeDescr *primaryDesc = &pkDescr->desc;
 
 		/* Fetch next undo version from PK iterator */
 		previousPkTuple = o_btree_iterator_fetch(pkIterator, &previousCsn,
@@ -1702,6 +1704,54 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 		 */
 		if (O_TUPLE_IS_NULL(previousPkTuple))
 			break;
+
+		/*
+		 * Read the PK undo record to determine the operation type.
+		 * The tupHdrCopy.undoLocation points to the undo record that
+		 * created this historical version in the PK.
+		 */
+		if (UndoLocationIsValid(tupHdrCopy.undoLocation))
+		{
+			BTreeModifyUndoStackItem pkUndoItem;
+			UndoLocation pkUndoLoc;
+
+			/*
+			 * The undoLocation in the tuple header points to the tuphdr
+			 * field within the undo record. We need to subtract the offset
+			 * to get to the beginning of the BTreeModifyUndoStackItem.
+			 */
+			pkUndoLoc = tupHdrCopy.undoLocation - offsetof(BTreeModifyUndoStackItem, tuphdr);
+
+			if (UNDO_REC_EXISTS(primaryDesc->undoType, pkUndoLoc))
+			{
+				undo_read(primaryDesc->undoType, pkUndoLoc,
+						  sizeof(BTreeModifyUndoStackItem),
+						  (Pointer) &pkUndoItem);
+
+				/*
+				 * Use the same action type from the PK undo record.
+				 * This ensures we replicate the exact same operation
+				 * sequence in the secondary index.
+				 */
+				if (pkUndoItem.header.type == ModifyUndoItemType)
+					pkAction = pkUndoItem.action;
+				else
+					pkAction = BTreeOperationUpdate;  /* Fallback for non-modify undo */
+			}
+			else
+			{
+				/* Undo record doesn't exist, use Update as default */
+				pkAction = BTreeOperationUpdate;
+			}
+		}
+		else
+		{
+			/*
+			 * No valid undo location - this must be the first version.
+			 * Use Insert operation for the initial version.
+			 */
+			pkAction = BTreeOperationInsert;
+		}
 
 		/*
 		 * Mark page as dirty before first modification.
@@ -1735,14 +1785,15 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 		if (!O_TUPLE_IS_NULL(previousSecTuple))
 		{
 			/*
-			 * Create an undo record for this historical version.
+			 * Create an undo record for this historical version using the
+			 * same operation type as in the PK undo chain.
 			 * The undo record will contain the previous tuple data and
 			 * will link to the existing undo chain via tupHdrCopy.undoLocation.
 			 */
 			newUndoLocation = make_undo_record(secondaryDesc,
 											   previousSecTuple,
 											   true,
-											   BTreeOperationUpdate,
+											   pkAction,
 											   blkno,
 											   context.items[context.index].pageChangeCount,
 											   &tupHdrCopy);
