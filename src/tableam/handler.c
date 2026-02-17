@@ -1602,7 +1602,8 @@ extract_pk_from_validation_tuple(OTuple validationTuple, OIndexDescr *secIndex, 
  *   - pkIterator: Iterator on the primary index, positioned at the latest state of the row
  *                 with undo-chain walking enabled
  *   - secIndexDescr: Descriptor for the secondary index being validated
- *   - pkDescr: Descriptor for the primary index
+ *   - pkDescr: Descriptor for the primary index (kept for API consistency, may be
+ *              used in future for validation or debugging purposes)
  *   - indexTuple: The latest secondary index tuple (already exists in secondary index)
  *   - primarySlot: TupleTableSlot for converting PK tuples to secondary index format
  *
@@ -1646,6 +1647,7 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 	OFindPageResult findResult;
 	BTreeLeafTuphdr *currentTupHdr;
 	BTreeLeafTuphdr tupHdrCopy;
+	bool		pageModified = false;
 
 	/* Load shared memory for secondary index once before the loop */
 	o_btree_load_shmem(secondaryDesc);
@@ -1683,11 +1685,6 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 	tupHdrCopy = *currentTupHdr;
 
 	/*
-	 * Mark page as dirty before we start modifying it.
-	 */
-	page_block_reads(blkno);
-
-	/*
 	 * Now walk backwards through the PK undo chain and create corresponding
 	 * undo records in the secondary index.
 	 */
@@ -1705,6 +1702,17 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 		 */
 		if (O_TUPLE_IS_NULL(previousPkTuple))
 			break;
+
+		/*
+		 * Mark page as dirty before first modification.
+		 * We do this here (not before the loop) to avoid locking the page
+		 * if there are no undo versions to replay.
+		 */
+		if (!pageModified)
+		{
+			page_block_reads(blkno);
+			pageModified = true;
+		}
 
 		/*
 		 * Store the previous PK tuple in the slot so we can convert it
@@ -1762,11 +1770,17 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 		pfree(previousPkTuple.data);
 	}
 
-	/* Mark the page as modified and unlock */
-	if (versionsReplayed > 0)
+	/* Mark the page as modified and unlock if we made changes */
+	if (pageModified)
+	{
 		MARK_DIRTY(secondaryDesc, blkno);
-
-	unlock_page(blkno);
+		unlock_page(blkno);
+	}
+	else
+	{
+		/* No changes made, just unlock */
+		unlock_page(blkno);
+	}
 
 	return versionsReplayed;
 }
