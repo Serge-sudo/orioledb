@@ -1595,8 +1595,8 @@ extract_pk_from_validation_tuple(OTuple validationTuple, OIndexDescr *secIndex, 
  * replay_undo_chain_to_secondary_index - Replay undo chain for a single PK tuple
  *                                          into a secondary index.
  *
- * This helper function is used from validation_scan to recreate historical versions
- * of a tuple in the secondary index by walking the undo chain from the primary index.
+ * This helper function is used from validation_scan to create undo chains in the
+ * secondary index by walking the undo chain from the primary index.
  *
  * Parameters:
  *   - pkIterator: Iterator on the primary index, positioned at the latest state of the row
@@ -1607,11 +1607,13 @@ extract_pk_from_validation_tuple(OTuple validationTuple, OIndexDescr *secIndex, 
  *   - primarySlot: TupleTableSlot for converting PK tuples to secondary index format
  *
  * Algorithm:
- *   1. Uses indexTuple to locate the current entry in the secondary index
+ *   1. Locates the existing entry in the secondary index (the latest version)
  *   2. Loops while the PK iterator is in undo-chain state:
  *      - Fetches the previous version via o_btree_iterator_fetch()
  *      - Converts it to secondary index tuple format
- *      - Applies DML changes to reconstruct history in secondary index
+ *      - Creates an undo record for this version
+ *      - Updates the secondary index tuple header to point to the new undo record
+ *      - The undo records form a chain (each points to the previous one)
  *   3. Stops when iterator exits undo-chain mode (no more undo versions)
  *
  * Lock undo records:
@@ -1632,22 +1634,67 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 {
 	int			versionsReplayed = 0;
 	BTreeDescr *secondaryDesc = &secIndexDescr->desc;
-	BTreeDescr *primaryDesc = &pkDescr->desc;
 	OTuple		previousPkTuple;
 	OTuple		previousSecTuple;
 	CommitSeqNo previousCsn;
 	BTreeLocationHint hint;
 	OTableSlot *oslot = (OTableSlot *) primarySlot;
+	Page		p;
+	OInMemoryBlkno blkno;
+	BTreePageItemLocator *loc;
+	OBTreeFindPageContext context;
+	OFindPageResult findResult;
+	BTreeLeafTuphdr *currentTupHdr;
+	BTreeLeafTuphdr tupHdrCopy;
 
 	/* Load shared memory for secondary index once before the loop */
 	o_btree_load_shmem(secondaryDesc);
 
 	/*
-	 * The latest state is already in the secondary index (indexTuple).
-	 * We now walk backwards through undo to replay historical versions.
+	 * First, locate the existing entry in the secondary index (the latest version).
+	 * We need this to update its tuple header with undo chain information.
+	 */
+	init_page_find_context(&context, secondaryDesc,
+						   COMMITSEQNO_INPROGRESS,
+						   BTREE_PAGE_FIND_MODIFY);
+
+	findResult = find_page(&context, (Pointer) &indexTuple,
+						   BTreeKeyLeafTuple, 0);
+
+	if (findResult != OFindPageResultSuccess)
+	{
+		/* Tuple not found in secondary index - nothing to do */
+		return 0;
+	}
+
+	blkno = context.items[context.index].blkno;
+	p = O_GET_IN_MEMORY_PAGE(blkno);
+	loc = &context.items[context.index].locator;
+
+	if (!BTREE_PAGE_LOCATOR_IS_VALID(p, loc))
+	{
+		/* Invalid locator - nothing to do */
+		unlock_page(blkno);
+		return 0;
+	}
+
+	/* Get the current tuple header */
+	currentTupHdr = (BTreeLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(p, loc);
+	tupHdrCopy = *currentTupHdr;
+
+	/*
+	 * Mark page as dirty before we start modifying it.
+	 */
+	page_block_reads(blkno);
+
+	/*
+	 * Now walk backwards through the PK undo chain and create corresponding
+	 * undo records in the secondary index.
 	 */
 	while (true)
 	{
+		UndoLocation newUndoLocation;
+
 		/* Fetch next undo version from PK iterator */
 		previousPkTuple = o_btree_iterator_fetch(pkIterator, &previousCsn,
 												 NULL, BTreeKeyNone, true, &hint);
@@ -1658,7 +1705,7 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 		 */
 		if (O_TUPLE_IS_NULL(previousPkTuple))
 			break;
-		
+
 		/*
 		 * Store the previous PK tuple in the slot so we can convert it
 		 * to secondary index format.
@@ -1677,43 +1724,34 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 															 secIndexDescr,
 															 true);
 
-		/*
-		 * Now we need to apply this historical version to the secondary index.
-		 * Since we're walking backwards through undo, we need to determine what
-		 * operation to perform.
-		 *
-		 * The undo chain walk gives us previous versions in reverse chronological
-		 * order. We need to reconstruct the history by inserting these previous
-		 * versions into the secondary index.
-		 *
-		 * For validation purposes during concurrent index builds, we simply
-		 * insert the historical version into the secondary index using
-		 * autonomous insert (non-transactional).
-		 */
 		if (!O_TUPLE_IS_NULL(previousSecTuple))
 		{
-			bool		insertSuccess;
+			/*
+			 * Create an undo record for this historical version.
+			 * The undo record will contain the previous tuple data and
+			 * will link to the existing undo chain via tupHdrCopy.undoLocation.
+			 */
+			newUndoLocation = make_undo_record(secondaryDesc,
+											   previousSecTuple,
+											   true,
+											   BTreeOperationUpdate,
+											   blkno,
+											   context.items[context.index].pageChangeCount,
+											   &tupHdrCopy);
 
 			/*
-			 * Use autonomous insert to add the historical version.
-			 * This is a non-transactional insert used during validation.
+			 * Update the tuple header to point to the new undo record.
+			 * This creates the undo chain.
 			 */
-			insertSuccess = o_btree_autonomous_insert(secondaryDesc, previousSecTuple);
+			currentTupHdr->undoLocation = newUndoLocation;
 
-			if (insertSuccess)
-			{
-				versionsReplayed++;
-			}
-			else
-			{
-				/*
-				 * Autonomous insert failed. This can happen if:
-				 * 1. The tuple already exists (duplicate) - expected during concurrent builds
-				 * 2. Index is corrupted or has inconsistencies
-				 * We continue processing other versions but note the failure.
-				 */
-				elog(DEBUG2, "replay_undo_chain: autonomous insert failed for historical version");
-			}
+			/*
+			 * Update our copy of the header for the next iteration.
+			 * The next undo record will point to this one.
+			 */
+			tupHdrCopy.undoLocation = newUndoLocation;
+
+			versionsReplayed++;
 
 			/* Free the secondary tuple */
 			pfree(previousSecTuple.data);
@@ -1723,6 +1761,12 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 		ExecClearTuple(primarySlot);
 		pfree(previousPkTuple.data);
 	}
+
+	/* Mark the page as modified and unlock */
+	if (versionsReplayed > 0)
+		MARK_DIRTY(secondaryDesc, blkno);
+
+	unlock_page(blkno);
 
 	return versionsReplayed;
 }
