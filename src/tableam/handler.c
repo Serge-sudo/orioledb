@@ -1640,14 +1640,14 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 	CommitSeqNo previousCsn;
 	BTreeLocationHint hint;
 	OTableSlot *oslot = (OTableSlot *) primarySlot;
-	Page		p;
-	OInMemoryBlkno blkno;
-	BTreePageItemLocator *loc;
 	OBTreeFindPageContext context;
 	OFindPageResult findResult;
 	BTreeLeafTuphdr *currentTupHdr;
 	BTreeLeafTuphdr tupHdrCopy;
 	bool		pageModified = false;
+	Page		p;
+	OInMemoryBlkno blkno;
+	BTreePageItemLocator *loc;
 
 	/* Load shared memory for secondary index once before the loop */
 	o_btree_load_shmem(secondaryDesc);
@@ -1770,17 +1770,11 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 		pfree(previousPkTuple.data);
 	}
 
-	/* Mark the page as modified and unlock if we made changes */
+	/* Mark the page as modified if we made changes */
 	if (pageModified)
-	{
 		MARK_DIRTY(secondaryDesc, blkno);
-		unlock_page(blkno);
-	}
-	else
-	{
-		/* No changes made, just unlock */
-		unlock_page(blkno);
-	}
+
+	unlock_page(blkno);
 
 	return versionsReplayed;
 }
