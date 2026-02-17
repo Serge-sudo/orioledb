@@ -1592,6 +1592,130 @@ extract_pk_from_validation_tuple(OTuple validationTuple, OIndexDescr *secIndex, 
 }
 
 /*
+ * replay_undo_chain_to_secondary_index - Replay undo chain for a single PK tuple
+ *                                          into a secondary index.
+ *
+ * This helper function is used from validation_scan to recreate historical versions
+ * of a tuple in the secondary index by walking the undo chain from the primary index.
+ *
+ * Parameters:
+ *   - pkIterator: Iterator on the primary index, positioned at the latest state of the row
+ *                 with undo-chain walking enabled
+ *   - secIndexDescr: Descriptor for the secondary index being validated
+ *   - pkDescr: Descriptor for the primary index
+ *   - indexTuple: The latest secondary index tuple (already exists in secondary index)
+ *   - primarySlot: TupleTableSlot for converting PK tuples to secondary index format
+ *
+ * Algorithm:
+ *   1. Uses indexTuple to locate the current entry in the secondary index
+ *   2. Loops while the PK iterator is in undo-chain state:
+ *      - Fetches the previous version via iterator->next()
+ *      - Converts it to secondary index tuple format
+ *      - Applies DML changes to reconstruct history in secondary index
+ *   3. Stops when iterator exits undo-chain mode (no more undo versions)
+ *
+ * Lock undo records:
+ *   - Lock undo (RowLockUndoItemType) is only applicable to PRIMARY indexes
+ *   - Secondary indexes only have ModifyUndoItemType records
+ *   - Therefore, we only need to handle ModifyUndoItemType (INSERT/UPDATE/DELETE)
+ *   - Lock undo records will be skipped by the undo chain walker automatically
+ *
+ * Returns:
+ *   - Number of undo versions replayed (for debugging/logging)
+ */
+static int
+replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
+									  OIndexDescr *secIndexDescr,
+									  OIndexDescr *pkDescr,
+									  OTuple indexTuple,
+									  TupleTableSlot *primarySlot)
+{
+	int			versionsReplayed = 0;
+	BTreeDescr *secondaryDesc = &secIndexDescr->desc;
+	BTreeDescr *primaryDesc = &pkDescr->desc;
+	OTuple		previousPkTuple;
+	OTuple		previousSecTuple;
+	CommitSeqNo previousCsn;
+	BTreeLocationHint hint;
+	OTableSlot *oslot = (OTableSlot *) primarySlot;
+	
+	/*
+	 * The latest state is already in the secondary index (indexTuple).
+	 * We now walk backwards through undo to replay historical versions.
+	 */
+	while (true)
+	{
+		/* Fetch next undo version from PK iterator */
+		previousPkTuple = o_btree_iterator_fetch(pkIterator, &previousCsn,
+												 NULL, BTreeKeyNone, true, &hint);
+		
+		/*
+		 * If we got a NULL tuple, the undo chain is exhausted or the iterator
+		 * has moved to a different row (exited undo-chain mode for this tuple).
+		 */
+		if (O_TUPLE_IS_NULL(previousPkTuple))
+			break;
+		
+		/*
+		 * Store the previous PK tuple in the slot so we can convert it
+		 * to secondary index format.
+		 */
+		tts_orioledb_store_tuple(primarySlot, previousPkTuple, 
+								 oslot->descr, previousCsn,
+								 PrimaryIndexNumber, true, &hint);
+		slot_getallattrs(primarySlot);
+		
+		/*
+		 * Convert the previous PK tuple to secondary index tuple format.
+		 * This respects INCLUDE columns (they're ignored) and only uses
+		 * key fields + PK fields as needed by the secondary index.
+		 */
+		previousSecTuple = tts_orioledb_make_secondary_tuple(primarySlot,
+															 secIndexDescr,
+															 true);
+		
+		/*
+		 * Now we need to apply this historical version to the secondary index.
+		 * Since we're walking backwards through undo, we need to determine what
+		 * operation to perform.
+		 *
+		 * The undo chain walk gives us previous versions in reverse chronological
+		 * order. We need to reconstruct the history by inserting these previous
+		 * versions into the secondary index.
+		 *
+		 * For validation purposes during concurrent index builds, we simply
+		 * insert the historical version into the secondary index using
+		 * autonomous insert (non-transactional).
+		 */
+		if (!O_TUPLE_IS_NULL(previousSecTuple))
+		{
+			bool insertSuccess;
+			
+			/* Load shared memory for secondary index */
+			o_btree_load_shmem(secondaryDesc);
+			
+			/*
+			 * Use autonomous insert to add the historical version.
+			 * This is a non-transactional insert used during validation.
+			 */
+			insertSuccess = o_btree_autonomous_insert(secondaryDesc, previousSecTuple);
+			
+			if (insertSuccess)
+				versionsReplayed++;
+			
+			/* Free the secondary tuple */
+			pfree(previousSecTuple.data);
+		}
+		
+		/* Clean up the primary tuple */
+		ExecClearTuple(primarySlot);
+		pfree(previousPkTuple.data);
+	}
+	
+	return versionsReplayed;
+}
+
+/*
  * orioledb_index_validate_scan - Validate secondary index by comparing with primary
  *
  * This function performs index validation by doing a merge-join between tuples
