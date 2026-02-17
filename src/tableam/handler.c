@@ -1639,6 +1639,9 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 	BTreeLocationHint hint;
 	OTableSlot *oslot = (OTableSlot *) primarySlot;
 
+	/* Load shared memory for secondary index once before the loop */
+	o_btree_load_shmem(secondaryDesc);
+
 	/*
 	 * The latest state is already in the secondary index (indexTuple).
 	 * We now walk backwards through undo to replay historical versions.
@@ -1689,10 +1692,7 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 		 */
 		if (!O_TUPLE_IS_NULL(previousSecTuple))
 		{
-			bool insertSuccess;
-
-			/* Load shared memory for secondary index */
-			o_btree_load_shmem(secondaryDesc);
+			bool		insertSuccess;
 
 			/*
 			 * Use autonomous insert to add the historical version.
@@ -1701,7 +1701,19 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 			insertSuccess = o_btree_autonomous_insert(secondaryDesc, previousSecTuple);
 
 			if (insertSuccess)
+			{
 				versionsReplayed++;
+			}
+			else
+			{
+				/*
+				 * Autonomous insert failed. This can happen if:
+				 * 1. The tuple already exists (duplicate) - expected during concurrent builds
+				 * 2. Index is corrupted or has inconsistencies
+				 * We continue processing other versions but note the failure.
+				 */
+				elog(DEBUG2, "replay_undo_chain: autonomous insert failed for historical version");
+			}
 
 			/* Free the secondary tuple */
 			pfree(previousSecTuple.data);
