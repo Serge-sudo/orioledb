@@ -1168,14 +1168,24 @@ orioledb_index_validate(Relation heapRelation,
 	Assert(descr != NULL);
 
 	/*
-	 * Use tuplesort_begin_orioledb_index with the primary index descriptor.
-	 * This ensures tuples are sorted in the same order as the primary key,
-	 * which is essential for the merge join algorithm in validate_scan.
+	 * Get secondary index descriptor being validated.
 	 */
-	state.tuplesort = tuplesort_begin_orioledb_index(GET_PRIMARY(descr),
-													 maintenance_work_mem,
-													 false,
-													 NULL);
+	ORelOids secondary_oids;
+	ORelOidsSetFromRel(secondary_oids, indexRelation);
+	OIndexDescr *secondaryIndex = o_fetch_index_descr(secondary_oids, oIndexInvalid, false, NULL);
+	if (secondaryIndex == NULL)
+		elog(ERROR, "index descriptor not found for index %u", indexRelation->rd_id);
+
+	/*
+	 * Use tuplesort_begin_orioledb_index_secondary_pk with both secondary and primary index descriptors.
+	 * This creates a tuplesort that sorts by PK and can store tuples with format:
+	 * [secondary_key_fields, pk_fields, oxid]
+	 */
+	state.tuplesort = tuplesort_begin_orioledb_index_secondary_pk(secondaryIndex,
+																  GET_PRIMARY(descr),
+																  maintenance_work_mem,
+																  false,
+																  NULL);
 	state.htups = state.itups = state.tups_inserted = state.tups_deleted = 0;
 	state.current_tuple.data = NULL; /* Initialize */
 	state.current_oxid = InvalidOXid; /* Initialize */

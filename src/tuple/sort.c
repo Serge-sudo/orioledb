@@ -323,11 +323,11 @@ tuplesort_begin_orioledb_index_secondary_pk(OIndexDescr *secondary,
 
 	/*
 	 * Calculate field counts:
-	 * - secondary_key_fields: only the key fields of secondary index (NOT including PK)
-	 * - pk_fields: number of PK key fields
+	 * - secondary_key_fields: only the actual secondary key fields (NOT including PK)
+	 * - pk_fields: number of PK key fields  
 	 * - total_fields: secondary key fields + PK fields + oxid field
 	 */
-	secondary_key_fields = secondary->nKeyFields;
+	secondary_key_fields = secondary->nKeyFields - secondary->nPrimaryFields;
 	pk_fields = primary->nKeyFields;
 	total_fields = secondary_key_fields + pk_fields + 1; /* +1 for oxid */
 
