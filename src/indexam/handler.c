@@ -1001,8 +1001,10 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		OTuple		tuple;
 		ItemPointerData itemptr;
 		bool		should_delete;
+		BTreeLeafTuphdr *tupHdr = NULL;
+		bool		scanEnd = false;
 
-		tuple = o_btree_iterator_fetch(it, NULL, NULL, BTreeKeyNone, false, NULL);
+		tuple = btree_iterate_all(it, NULL, BTreeKeyNone, false, &scanEnd, NULL, &tupHdr);
 
 		if (O_TUPLE_IS_NULL(tuple))
 			break;
@@ -1012,7 +1014,14 @@ orioledb_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		/* Call callback */
 		if (callback_state)
 		{
+			OXid oxid = InvalidOXid;
+			
+			/* Extract oxid from tuple header if available */
+			if (tupHdr != NULL)
+				oxid = XACT_INFO_GET_OXID(tupHdr->xactInfo);
+			
 			((OValidateIndexState *) callback_state)->current_tuple = tuple;
+			((OValidateIndexState *) callback_state)->current_oxid = oxid;
 			((OValidateIndexState *) callback_state)->index_descr = index_descr;
 		}
 

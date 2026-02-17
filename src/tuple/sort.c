@@ -325,16 +325,17 @@ tuplesort_begin_orioledb_index_secondary_pk(OIndexDescr *secondary,
 	 * Calculate field counts:
 	 * - secondary_key_fields: only the key fields of secondary index (NOT including PK)
 	 * - pk_fields: number of PK key fields
-	 * - total_fields: secondary key fields + PK fields (no duplication)
+	 * - total_fields: secondary key fields + PK fields + oxid field
 	 */
 	secondary_key_fields = secondary->nKeyFields;
 	pk_fields = primary->nKeyFields;
-	total_fields = secondary_key_fields + pk_fields;
+	total_fields = secondary_key_fields + pk_fields + 1; /* +1 for oxid */
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
 	
 	/*
-	 * Create combined tuple descriptor with secondary key fields first, then PK fields.
+	 * Create combined tuple descriptor with secondary key fields first, then PK fields,
+	 * then oxid field at the end.
 	 * We use the primary index for comparison (stored in arg->id), but the tupDesc
 	 * includes all fields.
 	 */
@@ -365,6 +366,15 @@ tuplesort_begin_orioledb_index_secondary_pk(OIndexDescr *secondary,
 		combinedTupDesc->attrs[secondary_key_fields + i].attcollation =
 			primary->leafTupdesc->attrs[i].attcollation;
 	}
+	
+	/* Add oxid field at the end */
+	TupleDescInitEntry(combinedTupDesc,
+					   secondary_key_fields + pk_fields + 1,
+					   "oxid",
+					   INT8OID,  /* OXid is uint64, which maps to INT8OID */
+					   -1,
+					   0);
+	combinedTupDesc->attrs[secondary_key_fields + pk_fields].attcollation = InvalidOid;
 	
 	arg = (OIndexBuildSortArg *) palloc0(sizeof(OIndexBuildSortArg));
 	arg->id = primary;  /* Use primary for comparison logic */

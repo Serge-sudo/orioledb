@@ -1178,6 +1178,7 @@ orioledb_index_validate(Relation heapRelation,
 													 NULL);
 	state.htups = state.itups = state.tups_inserted = state.tups_deleted = 0;
 	state.current_tuple.data = NULL; /* Initialize */
+	state.current_oxid = InvalidOXid; /* Initialize */
 	state.index_descr = NULL; /* Will be set by ambulkdelete */
 	state.table_descr = descr;
 	state.index_oids.datoid = MyDatabaseId;
@@ -1427,7 +1428,7 @@ validate_index_callback(ItemPointer itemptr, void *callback_state)
 	/*
 	 * For orioledb, the actual tuple is stored in state->current_tuple
 	 * by orioledb_ambulkdelete. For validation with deletion support, we need
-	 * to convert the secondary index tuple into (secondary_key_fields, pk_fields)
+	 * to convert the secondary index tuple into (secondary_key_fields, pk_fields, oxid)
 	 * format, excluding any INCLUDE fields that are not needed for validation.
 	 *
 	 * The tuplesort will sort these tuples by PK (using a custom comparator),
@@ -1437,8 +1438,8 @@ validate_index_callback(ItemPointer itemptr, void *callback_state)
 	{
 		OIndexDescr *pkIndex = GET_PRIMARY(table_descr);
 		
-		/* Convert secondary tuple to (secondary_key_fields, pk_fields) format */
-		fullIndexTuple = convert_secondary_tuple_for_validation(state->current_tuple, id, pkIndex);
+		/* Convert secondary tuple to (secondary_key_fields, pk_fields, oxid) format */
+		fullIndexTuple = convert_secondary_tuple_for_validation(state->current_tuple, id, pkIndex, state->current_oxid);
 		
 		/* Debug: Print tuple before adding to tuplesort */
 		debug_print_validate_tuple(fullIndexTuple, table_descr, id);
@@ -1472,7 +1473,7 @@ orioledb_validate_next_index_tid(Tuplesortstate *tuplesort,
 }
 
 /*
- * Convert a secondary index tuple into (secondary_key_fields, pk_fields) format
+ * Convert a secondary index tuple into (secondary_key_fields, pk_fields, oxid) format
  * for validation tuplesort.
  * 
  * Secondary index tuples may have:
@@ -1480,44 +1481,54 @@ orioledb_validate_next_index_tid(Tuplesortstate *tuplesort,
  * - Primary key fields (at the end of the key)
  * - INCLUDE fields (non-key attributes that we don't need for validation)
  * 
- * This function extracts only the key fields (secondary + PK) and converts them
- * into a tuple formatted for the specialized tuplesort that has:
- *   [secondary_key_field_1, ..., secondary_key_field_N, pk_field_1, ..., pk_field_M]
+ * This function extracts only the key fields (secondary + PK) and appends the oxid,
+ * converting them into a tuple formatted for the specialized tuplesort that has:
+ *   [secondary_key_field_1, ..., secondary_key_field_N, pk_field_1, ..., pk_field_M, oxid]
  * 
- * Most of the time we can pass the secondary index tuple directly (if it has no
- * INCLUDE fields), but when INCLUDE fields exist, we need to extract only the
- * key portion.
+ * The oxid is appended as raw binary data at the end of the tuple.
  * 
- * Returns: A new OTuple in the format (secondary_key_fields, pk_fields).
+ * Returns: A new OTuple in the format (secondary_key_fields, pk_fields, oxid).
  *          Caller must pfree the returned tuple data.
  */
 static OTuple
-convert_secondary_tuple_for_validation(OTuple secTuple, OIndexDescr *secIndex, OIndexDescr *pkIndex)
+convert_secondary_tuple_for_validation(OTuple secTuple, OIndexDescr *secIndex, OIndexDescr *pkIndex, OXid oxid)
 {
 	BTreeDescr *secDesc = &secIndex->desc;
-	BTreeDescr *pkDesc = &pkIndex->desc;
 	int			nKeyFields = secIndex->nKeyFields;
 	int			nFields = secIndex->nFields;
 	OTuple		result;
+	Size		tupleLen;
+	Size		totalLen;
+	Pointer		oxidPtr;
 	
 	/*
 	 * If secondary index has no INCLUDE fields (nFields == nKeyFields),
-	 * we can use the tuple directly since it already has the correct format:
-	 * (secondary_key_fields, pk_fields).
+	 * we can copy the tuple directly and append oxid.
 	 */
 	if (nKeyFields == nFields)
 	{
-		/* Make a copy of the tuple */
-		Size tupleLen = o_btree_len(secDesc, secTuple, OTupleLength);
-		result.data = (Pointer) palloc(tupleLen);
+		/* Calculate lengths: tuple + oxid */
+		tupleLen = o_btree_len(secDesc, secTuple, OTupleLength);
+		totalLen = tupleLen + sizeof(OXid);
+		
+		/* Allocate space for tuple + oxid */
+		result.data = (Pointer) palloc(totalLen);
+		
+		/* Copy the original tuple */
 		memcpy(result.data, secTuple.data, tupleLen);
 		result.formatFlags = secTuple.formatFlags;
+		
+		/* Append oxid at the end */
+		oxidPtr = result.data + tupleLen;
+		memcpy(oxidPtr, &oxid, sizeof(OXid));
+		
 		return result;
 	}
 	
 	/*
 	 * Secondary index has INCLUDE fields that we need to exclude.
-	 * Extract only the key fields (secondary key + PK) and create a new tuple.
+	 * Extract only the key fields (secondary key + PK), create a new tuple,
+	 * and append oxid.
 	 */
 	{
 		Datum		values[INDEX_MAX_KEYS];
@@ -1527,6 +1538,7 @@ convert_secondary_tuple_for_validation(OTuple secTuple, OIndexDescr *secIndex, O
 		Size		len;
 		TupleDesc	secLeafTupdesc = secDesc->leafTupdesc;
 		OTupleFixedFormatSpec *secLeafSpec = &secDesc->leafSpec;
+		OTuple		tempTuple;
 		
 		/* Extract all key fields (secondary key fields + PK fields) */
 		for (i = 0; i < nKeyFields; i++)
@@ -1535,13 +1547,27 @@ convert_secondary_tuple_for_validation(OTuple secTuple, OIndexDescr *secIndex, O
 		}
 		
 		/*
-		 * Create a new tuple with only the key fields.
-		 * We use the secondary index's leafTupdesc/leafSpec for extraction,
-		 * but create the tuple in a format suitable for validation tuplesort.
+		 * Create a temporary tuple with only the key fields.
 		 */
 		len = o_new_tuple_size(secLeafTupdesc, secLeafSpec, NULL, NULL, version, values, isnull, NULL);
-		result.data = (Pointer) palloc0(len);
-		o_tuple_fill(secLeafTupdesc, secLeafSpec, &result, len, NULL, NULL, version, values, isnull, NULL);
+		tempTuple.data = (Pointer) palloc0(len);
+		o_tuple_fill(secLeafTupdesc, secLeafSpec, &tempTuple, len, NULL, NULL, version, values, isnull, NULL);
+		tempTuple.formatFlags = secTuple.formatFlags;
+		
+		/* Now create final tuple with oxid appended */
+		totalLen = len + sizeof(OXid);
+		result.data = (Pointer) palloc(totalLen);
+		
+		/* Copy the temp tuple */
+		memcpy(result.data, tempTuple.data, len);
+		result.formatFlags = tempTuple.formatFlags;
+		
+		/* Append oxid at the end */
+		oxidPtr = result.data + len;
+		memcpy(oxidPtr, &oxid, sizeof(OXid));
+		
+		/* Free the temporary tuple */
+		pfree(tempTuple.data);
 		
 		return result;
 	}
@@ -1550,8 +1576,9 @@ convert_secondary_tuple_for_validation(OTuple secTuple, OIndexDescr *secIndex, O
 /*
  * Extract PK tuple from a validation tuplesort tuple.
  * 
- * Validation tuples from tuplesort are in format: (secondary_key_fields, pk_fields).
+ * Validation tuples from tuplesort are in format: (secondary_key_fields, pk_fields, oxid).
  * This function extracts just the PK portion for comparison with primary index tuples.
+ * The oxid field at the end is ignored.
  * 
  * Returns: A new OTuple containing only PK fields. Caller must pfree the returned tuple data.
  */
