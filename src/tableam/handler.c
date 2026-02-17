@@ -1691,7 +1691,7 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 	while (true)
 	{
 		UndoLocation newUndoLocation;
-		BTreeOperationType pkAction;
+		BTreeOperationType pkAction = BTreeOperationUpdate;  /* Default to Update */
 		BTreeDescr *primaryDesc = &pkDescr->desc;
 
 		/* Fetch next undo version from PK iterator */
@@ -1732,16 +1732,11 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 				 * Use the same action type from the PK undo record.
 				 * This ensures we replicate the exact same operation
 				 * sequence in the secondary index.
+				 * If it's not a modify undo or something unexpected,
+				 * keep the default Update operation.
 				 */
 				if (pkUndoItem.header.type == ModifyUndoItemType)
 					pkAction = pkUndoItem.action;
-				else
-					pkAction = BTreeOperationUpdate;  /* Fallback for non-modify undo */
-			}
-			else
-			{
-				/* Undo record doesn't exist, use Update as default */
-				pkAction = BTreeOperationUpdate;
 			}
 		}
 		else
