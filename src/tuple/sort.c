@@ -194,25 +194,11 @@ readtup_orioledb_index(Tuplesortstate *state, SortTuple *stup,
 	OIndexBuildSortArg *arg = (OIndexBuildSortArg *) base->arg;
 	OTupleFixedFormatSpec *spec = &arg->id->leafSpec;
 	uint32		tuplen = len - sizeof(int) - 1;
-	
-	/* Adjust for oxid if present */
-	if (arg->hasOxidField)
-		tuplen -= sizeof(OXid);
-	
-	uint32		alloclen = tuplen;
-	if (arg->hasOxidField)
-		alloclen += sizeof(OXid);
-	
-	Pointer		tup = (Pointer) tuplesort_readtup_alloc(state, MAXIMUM_ALIGNOF + alloclen);
+	Pointer		tup = (Pointer) tuplesort_readtup_alloc(state, MAXIMUM_ALIGNOF + tuplen);
 	OTuple		tuple;
 
-	/* read in the tuple proper */
+	/* read in the tuple proper (includes oxid if hasOxidField is true) */
 	LogicalTapeReadExact(tape, tup + MAXIMUM_ALIGNOF, tuplen);
-	
-	/* Read oxid if present */
-	if (arg->hasOxidField)
-		LogicalTapeReadExact(tape, tup + MAXIMUM_ALIGNOF + tuplen, sizeof(OXid));
-	
 	LogicalTapeReadExact(tape, tup, 1);
 	if (base->sortopt & TUPLESORT_RANDOMACCESS) /* need trailing length word? */
 		LogicalTapeReadExact(tape, &tuplen, sizeof(tuplen));

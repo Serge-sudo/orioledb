@@ -1560,7 +1560,7 @@ convert_secondary_tuple_for_validation(OTuple secTuple, OIndexDescr *secIndex, O
 		 * Create a temporary tuple with only the key fields.
 		 */
 		len = o_new_tuple_size(secLeafTupdesc, secLeafSpec, NULL, NULL, version, values, isnull, NULL);
-		tempTuple.data = (Pointer) palloc0(len);
+		tempTuple.data = (Pointer) palloc(len);
 		o_tuple_fill(secLeafTupdesc, secLeafSpec, &tempTuple, len, NULL, NULL, version, values, isnull, NULL);
 		tempTuple.formatFlags = secTuple.formatFlags;
 		
