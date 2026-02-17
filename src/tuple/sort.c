@@ -29,6 +29,7 @@ typedef struct
 	TupleDesc	tupDesc;
 	OIndexDescr *id;
 	bool		enforceUnique;
+	bool		hasOxidField;	/* True if tuples have oxid appended at end */
 } OIndexBuildSortArg;
 
 static void
@@ -159,9 +160,21 @@ writetup_orioledb_index(Tuplesortstate *state, LogicalTape *tape, SortTuple *stu
 
 	tuple = read_o_tuple(stup->tuple);
 	tuplen = o_tuple_size(tuple, spec) + sizeof(int) + 1;
+	
+	/* Add oxid size for validation tuples */
+	if (arg->hasOxidField)
+		tuplen += sizeof(OXid);
 
 	LogicalTapeWrite(tape, (void *) &tuplen, sizeof(tuplen));
 	LogicalTapeWrite(tape, (void *) tuple.data, o_tuple_size(tuple, spec));
+	
+	/* Write oxid if present */
+	if (arg->hasOxidField)
+	{
+		Pointer oxidPtr = tuple.data + o_tuple_size(tuple, spec);
+		LogicalTapeWrite(tape, oxidPtr, sizeof(OXid));
+	}
+	
 	LogicalTapeWrite(tape, (void *) &tuple.formatFlags, 1);
 	if (base->sortopt & TUPLESORT_RANDOMACCESS) /* need trailing length word? */
 		LogicalTapeWrite(tape, (void *) &tuplen, sizeof(tuplen));
@@ -175,11 +188,25 @@ readtup_orioledb_index(Tuplesortstate *state, SortTuple *stup,
 	OIndexBuildSortArg *arg = (OIndexBuildSortArg *) base->arg;
 	OTupleFixedFormatSpec *spec = &arg->id->leafSpec;
 	uint32		tuplen = len - sizeof(int) - 1;
-	Pointer		tup = (Pointer) tuplesort_readtup_alloc(state, MAXIMUM_ALIGNOF + tuplen);
+	
+	/* Adjust for oxid if present */
+	if (arg->hasOxidField)
+		tuplen -= sizeof(OXid);
+	
+	uint32		alloclen = tuplen;
+	if (arg->hasOxidField)
+		alloclen += sizeof(OXid);
+	
+	Pointer		tup = (Pointer) tuplesort_readtup_alloc(state, MAXIMUM_ALIGNOF + alloclen);
 	OTuple		tuple;
 
 	/* read in the tuple proper */
 	LogicalTapeReadExact(tape, tup + MAXIMUM_ALIGNOF, tuplen);
+	
+	/* Read oxid if present */
+	if (arg->hasOxidField)
+		LogicalTapeReadExact(tape, tup + MAXIMUM_ALIGNOF + tuplen, sizeof(OXid));
+	
 	LogicalTapeReadExact(tape, tup, 1);
 	if (base->sortopt & TUPLESORT_RANDOMACCESS) /* need trailing length word? */
 		LogicalTapeReadExact(tape, &tuplen, sizeof(tuplen));
@@ -380,6 +407,7 @@ tuplesort_begin_orioledb_index_secondary_pk(OIndexDescr *secondary,
 	arg->id = primary;  /* Use primary for comparison logic */
 	arg->tupDesc = combinedTupDesc;
 	arg->enforceUnique = false;  /* Secondary index validation doesn't enforce uniqueness on PK */
+	arg->hasOxidField = true;  /* Validation tuples have oxid appended */
 
 	/*
 	 * Set up sort keys - we only sort by PK fields, which are at the end
@@ -543,6 +571,11 @@ tuplesort_putotuple(Tuplesortstate *state, OTuple tup)
 	 * Then call the common code.
 	 */
 	tupsize = o_tuple_size(tup, spec);
+	
+	/* Add oxid size for validation tuples */
+	if (arg->hasOxidField)
+		tupsize += sizeof(OXid);
+	
 	stup.tuple = MemoryContextAlloc(base->tuplecontext, MAXIMUM_ALIGNOF + tupsize);
 	write_o_tuple(stup.tuple, tup, tupsize);
 	written_tup = read_o_tuple(stup.tuple);
