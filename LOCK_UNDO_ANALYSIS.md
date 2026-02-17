@@ -111,3 +111,15 @@ This design is architecturally sound and does not represent a limitation or bug.
 5. **Secondary index operations:** `src/tableam/operations.c:1479, 1329`
 6. **Secondary index undo:** `src/btree/undo.c:415-550`
 7. **Undo type assignment:** `src/tableam/tree.c:124`
+
+## Testing
+
+A test file has been created at `test/sql/lock_undo_secondary_indexes.sql` that demonstrates:
+- Row locks are applied via the primary index
+- Accessing via secondary index still locks via primary index
+- Lock undo works on primary index during rollback
+- Secondary index operations use modify undo, not lock undo
+
+## Recommendations
+
+None. The current implementation is correct and does not require any changes. This analysis document serves to clarify the intended behavior for developers who might wonder whether lock undo should be supported in secondary indexes.
