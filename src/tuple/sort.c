@@ -74,6 +74,12 @@ comparetup_orioledb_index(const SortTuple *a, const SortTuple *b, Tuplesortstate
 	OIndexBuildSortArg *arg = (OIndexBuildSortArg *) base->arg;
 	OTupleFixedFormatSpec *spec = &arg->id->leafSpec;
 
+	/*
+	 * Note: For validation tuples with hasOxidField=true, the oxid field is appended
+	 * at the end of the tuple but is not used for comparison. The oxid is preserved
+	 * through sorting but does not affect sort order.
+	 */
+
 	/* Compare the leading sort key */
 	compare = ApplySortComparator(a->datum1, a->isnull1,
 								  b->datum1, b->isnull1,
@@ -312,14 +318,16 @@ tuplesort_begin_orioledb_index(OIndexDescr *idx,
  * The tuples stored have a special layout:
  * - First: Secondary index key fields (only the actual key fields, not including PK)
  * - Then: Primary key fields
+ * - Finally: OXid field (appended as raw binary data at the end)
  *
  * The sorting is done ONLY by the primary key fields, which enables merge-join
- * validation with the primary index scan. The tupDesc describes all fields (secondary key + PK),
- * but the sortKeys only reference the PK portion for sorting.
+ * validation with the primary index scan. The tupDesc describes all fields (secondary key + PK + oxid),
+ * but the sortKeys only reference the PK portion for sorting. The oxid field is preserved
+ * through sorting but does not affect sort order.
  *
  * This is essential for functional secondary indexes where secondary key values cannot
  * be computed from PK tuples alone - we must store the actual secondary key values
- * from the index being validated.
+ * from the index being validated. The oxid is needed for validation logic.
  *
  * Parameters:
  *   secondary - The secondary index descriptor (provides secondary key field information)
