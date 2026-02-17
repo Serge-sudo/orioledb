@@ -1609,7 +1609,7 @@ extract_pk_from_validation_tuple(OTuple validationTuple, OIndexDescr *secIndex, 
  * Algorithm:
  *   1. Uses indexTuple to locate the current entry in the secondary index
  *   2. Loops while the PK iterator is in undo-chain state:
- *      - Fetches the previous version via iterator->next()
+ *      - Fetches the previous version via o_btree_iterator_fetch()
  *      - Converts it to secondary index tuple format
  *      - Applies DML changes to reconstruct history in secondary index
  *   3. Stops when iterator exits undo-chain mode (no more undo versions)
@@ -1638,7 +1638,7 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 	CommitSeqNo previousCsn;
 	BTreeLocationHint hint;
 	OTableSlot *oslot = (OTableSlot *) primarySlot;
-	
+
 	/*
 	 * The latest state is already in the secondary index (indexTuple).
 	 * We now walk backwards through undo to replay historical versions.
@@ -1648,7 +1648,7 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 		/* Fetch next undo version from PK iterator */
 		previousPkTuple = o_btree_iterator_fetch(pkIterator, &previousCsn,
 												 NULL, BTreeKeyNone, true, &hint);
-		
+
 		/*
 		 * If we got a NULL tuple, the undo chain is exhausted or the iterator
 		 * has moved to a different row (exited undo-chain mode for this tuple).
@@ -1660,11 +1660,11 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 		 * Store the previous PK tuple in the slot so we can convert it
 		 * to secondary index format.
 		 */
-		tts_orioledb_store_tuple(primarySlot, previousPkTuple, 
+		tts_orioledb_store_tuple(primarySlot, previousPkTuple,
 								 oslot->descr, previousCsn,
 								 PrimaryIndexNumber, true, &hint);
 		slot_getallattrs(primarySlot);
-		
+
 		/*
 		 * Convert the previous PK tuple to secondary index tuple format.
 		 * This respects INCLUDE columns (they're ignored) and only uses
@@ -1673,7 +1673,7 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 		previousSecTuple = tts_orioledb_make_secondary_tuple(primarySlot,
 															 secIndexDescr,
 															 true);
-		
+
 		/*
 		 * Now we need to apply this historical version to the secondary index.
 		 * Since we're walking backwards through undo, we need to determine what
@@ -1690,28 +1690,28 @@ replay_undo_chain_to_secondary_index(BTreeIterator *pkIterator,
 		if (!O_TUPLE_IS_NULL(previousSecTuple))
 		{
 			bool insertSuccess;
-			
+
 			/* Load shared memory for secondary index */
 			o_btree_load_shmem(secondaryDesc);
-			
+
 			/*
 			 * Use autonomous insert to add the historical version.
 			 * This is a non-transactional insert used during validation.
 			 */
 			insertSuccess = o_btree_autonomous_insert(secondaryDesc, previousSecTuple);
-			
+
 			if (insertSuccess)
 				versionsReplayed++;
-			
+
 			/* Free the secondary tuple */
 			pfree(previousSecTuple.data);
 		}
-		
+
 		/* Clean up the primary tuple */
 		ExecClearTuple(primarySlot);
 		pfree(previousPkTuple.data);
 	}
-	
+
 	return versionsReplayed;
 }
 
