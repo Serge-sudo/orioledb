@@ -1620,9 +1620,23 @@ wait_tuple_finished_for_everybody(BTreeLeafTuphdr *tupHdr)
 	while (!xid_is_finished_for_everybody(tupleOxid))
 	{
 		OXid		runXmin = pg_atomic_read_u64(&xid_meta->runXmin);
+		OXid		waitOxid;
 
 		CHECK_FOR_INTERRUPTS();
-		(void) wait_for_oxid(runXmin, true);
+		if (runXmin > tupleOxid)
+			continue;
+
+		waitOxid = runXmin;
+		while (true)
+		{
+			while (!wait_for_oxid(waitOxid, true))
+				CHECK_FOR_INTERRUPTS();
+			if (waitOxid == tupleOxid)
+				break;
+			if (waitOxid == UINT64_MAX)
+				break;
+			waitOxid++;
+		}
 	}
 }
 
