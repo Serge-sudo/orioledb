@@ -1543,6 +1543,7 @@ orioledb_index_rows(PG_FUNCTION_ARGS)
 				tbl;
 	OTableDescr *descr;
 	OIndexNumber ix_num;
+	char	   *idxName;
 	int64		total = 0,
 				dead = 0;
 	BTreeIterator *it;
@@ -1553,6 +1554,7 @@ orioledb_index_rows(PG_FUNCTION_ARGS)
 	bool		nulls[2];
 
 	idx = index_open(ix_reloid, AccessShareLock);
+	idxName = pstrdup(NameStr(idx->rd_rel->relname));
 	tbl = table_open(idx->rd_index->indrelid, AccessShareLock);
 	descr = relation_get_descr(tbl);
 	ix_num = o_find_ix_num_by_name(descr, idx->rd_rel->relname.data);
@@ -1560,7 +1562,7 @@ orioledb_index_rows(PG_FUNCTION_ARGS)
 	relation_close(idx, AccessShareLock);
 
 	if (ix_num == InvalidIndexNumber)
-		elog(ERROR, "Invalid index");
+		elog(ERROR, "Index \"%s\" not found in table descriptor", idxName);
 
 	td = &descr->indices[ix_num]->desc;
 	o_btree_load_shmem(td);
