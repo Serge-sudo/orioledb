@@ -1631,8 +1631,6 @@ orioledb_index_validate_scan(Relation heapRelation,
 	Datum		heapRowIdDatum;
 	bool		rowIdIsNull;
 	OInMemoryBlkno lastBlkno = OInvalidInMemoryBlkno;
-	OInMemoryBlkno lockBlkno = OInvalidInMemoryBlkno;
-	bool		pageLocked = false;
 	bool		scanEnd;
 	BTreeLeafTuphdr *tupHdr = NULL;
 	bool		tupleDeleted;
@@ -1662,6 +1660,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 	 */
 	iterator = o_btree_iterator_create(&GET_PRIMARY(descr)->desc, NULL, BTreeKeyNone,
 									   &oSnapshot, ForwardScanDirection);
+	o_btree_iterator_set_lock_page_reads(iterator, true);
 	
 	primarySlot = MakeSingleTupleTableSlot(descr->tupdesc, &TTSOpsOrioleDB);
 	econtext->ecxt_scantuple = primarySlot;
@@ -1675,34 +1674,11 @@ orioledb_index_validate_scan(Relation heapRelation,
 		oslot = (OTableSlot *) primarySlot;
 		O_TUPLE_SET_NULL(heapTuple);
 
-		if (!pageLocked && OInMemoryBlknoIsValid(lockBlkno))
-		{
-			lock_page(lockBlkno);
-			pageLocked = true;
-		}
-
 		/* Fetch next tuple from current page without undo chain traversal */
 		tup = btree_iterate_all(iterator, NULL, BTreeKeyNone, false, &scanEnd, &hint, &tupHdr);
 
 		if (scanEnd)
 			break;
-
-		if (pageLocked && lockBlkno != hint.blkno)
-		{
-			unlock_page(lockBlkno);
-			pageLocked = false;
-		}
-		lockBlkno = hint.blkno;
-
-		/*
-		 * Allow concurrent rollback/progress while waiting; we'll lock the page
-		 * again before reading next image tuple.
-		 */
-		if (pageLocked)
-		{
-			unlock_page(lockBlkno);
-			pageLocked = false;
-		}
 
 		lookupTuple.formatFlags = tup.formatFlags;
 		lookupTuple.data = palloc(o_btree_len(&GET_PRIMARY(descr)->desc, tup, OTupleLength));
@@ -1956,9 +1932,6 @@ check_boundary:
 		if (!O_TUPLE_IS_NULL(heapTuple))
 			pfree(heapTuple.data);
 	}
-
-	if (pageLocked)
-		unlock_page(lockBlkno);
 
 	/*
 	 * Clear the validation boundary - validation is now complete.

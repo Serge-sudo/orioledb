@@ -52,6 +52,8 @@ extern void o_btree_iterator_set_tuple_ctx(BTreeIterator *it,
 extern void o_btree_iterator_set_callback(BTreeIterator *it,
 										  TupleFetchCallback callback,
 										  void *arg);
+extern void o_btree_iterator_set_lock_page_reads(BTreeIterator *it,
+												 bool enable);
 extern void o_btree_iterator_set_undo_chain_walking(BTreeIterator *it,
 													bool enable);
 extern OTuple o_btree_iterator_fetch(BTreeIterator *it,

@@ -65,6 +65,8 @@ struct BTreeIterator
 	/* callback for fetching tuple version */
 	TupleFetchCallback fetchCallback;
 	void	   *fetchCallbackArg;
+	/* lock and refresh shared page image before reading each tuple */
+	bool		lockPageReads;
 	/* walk tuple-level undo chains? */
 	bool		walkUndoChains;
 	/* current undo chain location being walked */
@@ -443,6 +445,7 @@ o_btree_iterator_create(BTreeDescr *desc, void *key, BTreeKeyType kind,
 	it->tupleCxt = CurrentMemoryContext;
 	it->fetchCallback = NULL;
 	it->fetchCallbackArg = NULL;
+	it->lockPageReads = false;
 	it->walkUndoChains = false;
 	it->currentUndoChainLoc = InvalidUndoLocation;
 	O_TUPLE_SET_NULL(it->currentChainTuple);
@@ -519,6 +522,12 @@ o_btree_iterator_set_callback(BTreeIterator *it,
 {
 	it->fetchCallback = callback;
 	it->fetchCallbackArg = arg;
+}
+
+void
+o_btree_iterator_set_lock_page_reads(BTreeIterator *it, bool enable)
+{
+	it->lockPageReads = enable;
 }
 
 /*
@@ -1071,9 +1080,24 @@ btree_iterate_raw_internal(BTreeIterator *it, void *end, BTreeKeyType endKind,
 	while (true)
 	{
 		BTreePageItemLocator *loc = &context->items[context->index].locator;
+		bool		pageLocked = false;
+		OInMemoryBlkno lockBlkno = OInvalidInMemoryBlkno;
 
 		if (BTREE_PAGE_LOCATOR_IS_VALID(img, loc))
 		{
+			if (it->lockPageReads)
+			{
+				lockBlkno = context->items[context->index].blkno;
+				lock_page(lockBlkno);
+				pageLocked = true;
+				memcpy(context->img, O_GET_IN_MEMORY_PAGE(lockBlkno), ORIOLEDB_BLCKSZ);
+				if (!BTREE_PAGE_LOCATOR_IS_VALID(context->img, loc))
+				{
+					unlock_page(lockBlkno);
+					continue;
+				}
+			}
+
 			BTREE_PAGE_READ_LEAF_ITEM(*tupHdr, result, context->img, loc);
 			IT_NEXT_OFFSET(it, loc);
 
@@ -1085,6 +1109,8 @@ btree_iterate_raw_internal(BTreeIterator *it, void *end, BTreeKeyType endKind,
 				cmp = o_btree_cmp(desc, &result, BTreeKeyLeafTuple, end, endKind);
 				if (cmp > 0 || (cmp == 0 && !endInclude))
 				{
+					if (pageLocked)
+						unlock_page(lockBlkno);
 					*scanEnd = true;
 					O_TUPLE_SET_NULL(result);
 					return result;
@@ -1099,10 +1125,14 @@ btree_iterate_raw_internal(BTreeIterator *it, void *end, BTreeKeyType endKind,
 					hint->blkno = it->context.items[it->context.index].blkno;
 					hint->pageChangeCount = it->context.items[it->context.index].pageChangeCount;
 				}
+				if (pageLocked)
+					unlock_page(lockBlkno);
 				return result;
 			}
 			else
 			{
+				if (pageLocked)
+					unlock_page(lockBlkno);
 				O_TUPLE_SET_NULL(result);
 				return result;
 			}
