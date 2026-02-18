@@ -1597,9 +1597,10 @@ extract_pk_from_validation_tuple(OTuple validationTuple, OIndexDescr *secIndex, 
  * This function performs index validation by doing a merge-join between tuples
  * from the primary index and tuples from the secondary index (via tuplesort).
  *
- * Undo chain walking is enabled on the primary index iterator to ensure complete
- * transfer of all tuple versions from PK to secondary index, including both the
- * final tuple and all historical versions from undo chains.
+ * Validation iterates raw page tuples and waits until each tuple is finalized:
+ * (1) transaction changing the tuple is finished; (2) no snapshots need old
+ * undo versions anymore.  After that we transfer only final tuple versions to
+ * the secondary index.
  */
 static void
 orioledb_index_validate_scan(Relation heapRelation,
@@ -1629,6 +1630,8 @@ orioledb_index_validate_scan(Relation heapRelation,
 	Datum		heapRowIdDatum;
 	bool		rowIdIsNull;
 	OInMemoryBlkno lastBlkno = OInvalidInMemoryBlkno;
+	bool		scanEnd;
+	BTreeLeafTuphdr *tupHdr = NULL;
 
 	Assert(state != NULL);
 	Assert(state->tuplesort != NULL);
@@ -1656,14 +1659,6 @@ orioledb_index_validate_scan(Relation heapRelation,
 	iterator = o_btree_iterator_create(&GET_PRIMARY(descr)->desc, NULL, BTreeKeyNone,
 									   &oSnapshot, ForwardScanDirection);
 	
-	/*
-	 * Enable undo chain walking for the primary index iterator.
-	 * This ensures we transfer the entire undo chain from PK to secondary index,
-	 * including both the final tuple and all undo versions.
-	 * This is critical for validation during concurrent modifications.
-	 */
-	o_btree_iterator_set_undo_chain_walking(iterator, true);
-	
 	primarySlot = MakeSingleTupleTableSlot(descr->tupdesc, &TTSOpsOrioleDB);
 	econtext->ecxt_scantuple = primarySlot;
 
@@ -1675,12 +1670,25 @@ orioledb_index_validate_scan(Relation heapRelation,
 	{
 		oslot = (OTableSlot *) primarySlot;
 
-		/* Fetch next tuple from iterator in PK order */
-		tup = o_btree_iterator_fetch(iterator, &tupleCsn, NULL, BTreeKeyNone, true, &hint);
-		
-		if (O_TUPLE_IS_NULL(tup))
+		/* Fetch next tuple from current page without undo chain traversal */
+		tup = btree_iterate_all(iterator, NULL, BTreeKeyNone, false, &scanEnd, &hint, &tupHdr);
+
+		if (scanEnd)
 			break;
 
+		while (!XACT_INFO_IS_FINISHED(tupHdr->xactInfo))
+			wait_for_oxid(XACT_INFO_GET_OXID(tupHdr->xactInfo), false);
+
+		while (!XACT_INFO_FINISHED_FOR_EVERYBODY(tupHdr->xactInfo))
+		{
+			CHECK_FOR_INTERRUPTS();
+			pg_usleep(1000L);
+		}
+
+		if (tupHdr->deleted != BTreeLeafTupleNonDeleted)
+			continue;
+
+		tupleCsn = XACT_INFO_MAP_CSN(tupHdr->xactInfo);
 		tts_orioledb_store_tuple(primarySlot, tup, descr, tupleCsn, PrimaryIndexNumber, true, &hint);
 		slot_getallattrs(primarySlot);
 		state->htups++;
@@ -1692,7 +1700,6 @@ orioledb_index_validate_scan(Relation heapRelation,
 			if (!ExecQual(predicate, econtext))
 			{
 				ExecClearTuple(primarySlot);
-				pfree(tup.data);
 				continue;
 			}
 		}
@@ -1888,7 +1895,6 @@ orioledb_index_validate_scan(Relation heapRelation,
 		}
 
 		ExecClearTuple(primarySlot);
-		pfree(tup.data);
 	}
 
 	/*
