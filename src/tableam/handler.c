@@ -99,9 +99,8 @@ static void get_keys_from_rowid(OIndexDescr *id, Datum pkDatum, OBTreeKeyBound *
 								uint32 *version, ItemPointer *bridge_ctid);
 static void rowid_set_csn(OIndexDescr *id, Datum pkDatum, CommitSeqNo csn);
 static OTuple convert_secondary_tuple_for_validation(OTuple secTuple, OIndexDescr *secIndex);
-static OTuple extract_pk_from_validation_tuple(OTuple validationTuple,
-											   OIndexDescr *secIndex,
-											   OIndexDescr *pkIndex);
+#define VALIDATE_CHAIN_INITIAL_CAPACITY 8
+#define VALIDATE_CHAIN_GROWTH_FACTOR 2
 
 
 /* ------------------------------------------------------------------------
@@ -1519,83 +1518,99 @@ convert_secondary_tuple_for_validation(OTuple secTuple, OIndexDescr *secIndex)
 }
 
 /*
- * Extract PK tuple from a validation tuplesort tuple.
- * 
- * Validation tuples from tuplesort are in format: (secondary_key_fields, pk_fields).
- * This function extracts just the PK portion for comparison with primary index tuples.
- * 
- * Returns: A new OTuple containing only PK fields. Caller must pfree the returned tuple data.
+ * Replay a single PK undo chain into the secondary index from oldest to newest
+ * version.  We use regular secondary-index update machinery to recreate the
+ * same insert/update/delete history shape.
  */
-static OTuple
-extract_pk_from_validation_tuple(OTuple validationTuple, OIndexDescr *secIndex, OIndexDescr *pkIndex)
+static void
+replay_pk_chain_versions(OIndexDescr *secIndex,
+						 OIndexNumber secIndexNum,
+						 OTuple *chain,
+						 int chainCount,
+						 OTableDescr *descr,
+						 ExprState *predicate,
+						 ExprContext *econtext,
+						 Relation heapRelation,
+						 OValidateIndexState *state)
 {
-	Datum		pkValues[INDEX_MAX_KEYS];
-	bool		pkIsnull[INDEX_MAX_KEYS];
-	uint32		version = o_tuple_get_version(validationTuple);
+	TupleTableSlot *slotA = MakeSingleTupleTableSlot(descr->tupdesc, &TTSOpsOrioleDB);
+	TupleTableSlot *slotB = MakeSingleTupleTableSlot(descr->tupdesc, &TTSOpsOrioleDB);
+	TupleTableSlot *oldSlot = slotA;
+	TupleTableSlot *newSlot = slotB;
+	TupleTableSlot *effectiveOldSlot;
+	bool		old_valid = false;
+	bool		new_valid;
+	OTuple		new_ix_tup;
+	OTableModifyResult mres;
 	int			i;
-	Size		len;
-	OTuple		result;
-	BTreeDescr *secDesc = &secIndex->desc;
-	BTreeDescr *pkDesc = &pkIndex->desc;
-	int			nSecKeyFields = secIndex->nKeyFields - secIndex->nPrimaryFields;
-	
-	/*
-	 * Extract PK fields from the validation tuple.
-	 * PK fields start at position (nSecKeyFields + 1) in the tuple.
-	 */
-	for (i = 0; i < secIndex->nPrimaryFields; i++)
+	OXid		oxid = get_current_oxid();
+
+	Assert(OXidIsValid(oxid));
+	O_TUPLE_SET_NULL(new_ix_tup);
+
+	for (i = chainCount - 1; i >= 0; i--)
 	{
-		pkValues[i] = o_fastgetattr(validationTuple, nSecKeyFields + i + 1,
-									secDesc->leafTupdesc, &secDesc->leafSpec,
-									&pkIsnull[i]);
+		TupleTableSlot *tmp;
+
+		tmp = oldSlot;
+		oldSlot = newSlot;
+		newSlot = tmp;
+
+		tts_orioledb_store_tuple(newSlot, chain[i], descr, COMMITSEQNO_INPROGRESS,
+								 PrimaryIndexNumber, true, NULL);
+		slot_getallattrs(newSlot);
+		econtext->ecxt_scantuple = newSlot;
+		MemoryContextReset(econtext->ecxt_per_tuple_memory);
+		new_valid = (predicate == NULL) ? true : ExecQual(predicate, econtext);
+		if (new_valid)
+			new_ix_tup = tts_orioledb_make_secondary_tuple(newSlot, secIndex, true);
+		else
+			O_TUPLE_SET_NULL(new_ix_tup);
+
+		/*
+		 * old_valid=false for the first (oldest) version means "start from no SK
+		 * entry and apply history forward".
+		 */
+		effectiveOldSlot = old_valid ? oldSlot : newSlot;
+		mres = o_update_secondary_index(secIndex,
+										secIndexNum,
+										new_valid,
+										old_valid,
+										newSlot,
+										new_ix_tup,
+										effectiveOldSlot,
+										oxid,
+										COMMITSEQNO_INPROGRESS);
+		if (!mres.success)
+		{
+			/*
+			 * Snapshot-built SK can already contain the initial version.  Treat
+			 * bootstrap duplicate as already replayed and continue forward.
+			 */
+			if (mres.action != BTreeOperationInsert || old_valid)
+				o_check_tbl_update_mres(mres, descr, heapRelation, newSlot);
+		}
+		else if (!old_valid && new_valid)
+		{
+			state->tups_inserted++;
+		}
+		else if (old_valid && !new_valid)
+		{
+			state->tups_deleted++;
+		}
+
+		old_valid = new_valid;
+		ExecClearTuple(newSlot);
 	}
-	
-	/*
-	 * Create a new tuple with PK fields using the PK descriptor.
-	 */
-	len = o_new_tuple_size(pkDesc->nonLeafTupdesc, &pkDesc->nonLeafSpec, NULL, NULL,
-						   version, pkValues, pkIsnull, NULL);
-	result.data = (Pointer) palloc0(len);
-	o_tuple_fill(pkDesc->nonLeafTupdesc, &pkDesc->nonLeafSpec, &result, len, NULL, NULL,
-				 version, pkValues, pkIsnull, NULL);
-	
-	return result;
+
+	ExecDropSingleTupleTableSlot(slotA);
+	ExecDropSingleTupleTableSlot(slotB);
 }
 
 /*
- * Compare PK tuple from PK iterator with PK key embedded in validation tuple.
- *
- * Validation tuples have layout (secondary_key_fields, pk_fields), and the
- * comparison must ignore INCLUDE columns from the original secondary tuple.
- */
-static int
-compare_pk_to_validation_tuple(OTuple pkTuple,
-							   OTuple validationTuple,
-							   OIndexDescr *secIndex,
-							   OIndexDescr *pkIndex)
-{
-	OTuple		validationPkTuple;
-	int32		cmp;
-
-	validationPkTuple = extract_pk_from_validation_tuple(validationTuple,
-														 secIndex,
-														 pkIndex);
-	cmp = o_btree_cmp(&pkIndex->desc,
-					  validationPkTuple.data, BTreeKeyNonLeafKey,
-					  pkTuple.data, BTreeKeyLeafTuple);
-	if (validationPkTuple.data != NULL)
-		pfree(validationPkTuple.data);
-
-	return cmp;
-}
-
-/*
- * Merge-walk PK iterator (with undo chain walking enabled) against sorted
- * secondary tuples (sorted by PK), and replay missing PK versions into SK.
- *
- * Invariant: both streams are ordered by PK key.  The PK stream contains all
- * visible versions (current plus undo-chain versions), so this pass can rebuild
- * missing secondary entries for concurrent/snapshot validation.
+ * Merge walk PK iterator and replay each PK undo chain into SK from oldest to
+ * newest.  PK stream is expected to include undo-chain versions (newest first
+ * for each PK key); we reverse each same-PK group before replay.
  */
 static void
 o_replay_pk_undo_into_secondary(OIndexDescr *pkIndex,
@@ -1603,148 +1618,49 @@ o_replay_pk_undo_into_secondary(OIndexDescr *pkIndex,
 								Tuplesortstate *skSort,
 								BTreeIterator *iterator,
 								Relation heapRelation,
-								Relation indexRelation,
-								IndexInfo *indexInfo,
 								ExprState *predicate,
-								EState *estate,
 								ExprContext *econtext,
-								TupleTableSlot *primarySlot,
 								OValidateIndexState *state)
 {
 	OTableDescr *descr = state->table_descr;
-	OTuple		tup;
+	OTuple		pending;
+	bool		hasPending = false;
+	BTreeLocationHint pendingHint;
 	BTreeLocationHint hint;
 	CommitSeqNo tupleCsn;
-	Datum		values[INDEX_MAX_KEYS];
-	bool		isnull[INDEX_MAX_KEYS];
-	OTuple		indexTuple = {0};
-	bool		indexTupleValid = false;
-	bool		indexDone = false;
-	IndexUniqueCheck checkUnique = indexInfo->ii_Unique ? UNIQUE_CHECK_YES : UNIQUE_CHECK_NO;
-	Datum		heapRowIdDatum;
-	bool		rowIdIsNull;
 	OInMemoryBlkno lastBlkno = OInvalidInMemoryBlkno;
+	OIndexNumber secIndexNum;
+	OTuple		indexTuple;
 
+	O_TUPLE_SET_NULL(pending);
 	memset(&hint, 0, sizeof(hint));
-	tuplesort_rescan(skSort);
+	memset(&pendingHint, 0, sizeof(pendingHint));
 
+	secIndexNum = find_tree_in_descr(descr, secIndex->oids);
+	Assert(secIndexNum != InvalidIndexNumber);
+
+	tuplesort_rescan(skSort);
 	while (true)
 	{
-		tup = o_btree_iterator_fetch(iterator, &tupleCsn, NULL, BTreeKeyNone, true, &hint);
+		OTuple	   *chain = NULL;
+		int			chainCount = 0;
+		int			chainCap = 0;
+		OTuple		tup;
+		int			i;
+
+		if (hasPending)
+		{
+			tup = pending;
+			hint = pendingHint;
+			hasPending = false;
+		}
+		else
+		{
+			tup = o_btree_iterator_fetch(iterator, &tupleCsn, NULL, BTreeKeyNone, true, &hint);
+		}
+
 		if (O_TUPLE_IS_NULL(tup))
 			break;
-
-		tts_orioledb_store_tuple(primarySlot, tup, descr, tupleCsn, PrimaryIndexNumber, true, &hint);
-		slot_getallattrs(primarySlot);
-		state->htups++;
-
-		MemoryContextReset(econtext->ecxt_per_tuple_memory);
-		if (predicate != NULL && !ExecQual(predicate, econtext))
-		{
-			ExecClearTuple(primarySlot);
-			pfree(tup.data);
-			continue;
-		}
-
-		FormIndexDatum(indexInfo, primarySlot, estate, values, isnull);
-		heapRowIdDatum = slot_getsysattr(primarySlot, RowIdAttributeNumber, &rowIdIsNull);
-		Assert(!rowIdIsNull);
-
-		for (;;)
-		{
-			int32		cmp;
-
-			if (!indexTupleValid && !indexDone)
-			{
-				indexTupleValid = orioledb_validate_next_index_tid(skSort,
-																   &indexTuple,
-																   &state->itups);
-				if (!indexTupleValid)
-					indexDone = true;
-			}
-
-			if (indexDone)
-			{
-				if (index_insert(indexRelation, values, isnull, heapRowIdDatum,
-								 heapRelation, checkUnique, false, indexInfo))
-					state->tups_inserted++;
-				break;
-			}
-
-			cmp = compare_pk_to_validation_tuple(tup, indexTuple, secIndex, pkIndex);
-			if (cmp < 0)
-			{
-				Page		p;
-				OInMemoryBlkno blkno;
-				BTreePageItemLocator *loc;
-				OBTreeFindPageContext context;
-				OFindPageResult findResult;
-				BTreeLeafTuphdr *tupHdr;
-				OTuple		leafTup;
-				int			cmpResult;
-				BTreeDescr *secondaryDesc = &secIndex->desc;
-
-				/*
-				 * Secondary stream contains tuple absent in PK stream.
-				 * Keep eager deletion for now; if we move to a centralized
-				 * cleanup phase this can become a TODO in one place.
-				 */
-				o_btree_load_shmem(secondaryDesc);
-				init_page_find_context(&context, secondaryDesc,
-									   COMMITSEQNO_INPROGRESS,
-									   BTREE_PAGE_FIND_MODIFY);
-				findResult = refind_page(&context, (Pointer) &indexTuple,
-										 BTreeKeyLeafTuple,
-										 0, InvalidInMemoryBlkno,
-										 InvalidOPageChangeCount);
-				if (findResult == OFindPageResultSuccess)
-				{
-					blkno = context.items[context.index].blkno;
-					p = O_GET_IN_MEMORY_PAGE(blkno);
-					loc = &context.items[context.index].locator;
-
-					if (BTREE_PAGE_LOCATOR_IS_VALID(p, loc))
-					{
-						BTREE_PAGE_READ_LEAF_ITEM(tupHdr, leafTup, p, loc);
-						cmpResult = o_btree_cmp(secondaryDesc, &indexTuple, BTreeKeyLeafTuple,
-												&leafTup, BTreeKeyLeafTuple);
-					}
-					else
-					{
-						cmpResult = 1;
-					}
-
-					if (cmpResult == 0)
-					{
-						page_block_reads(blkno);
-						BTREE_PAGE_LOCATOR_SET_INVALID(loc);
-						PAGE_ADD_N_VACATED(p, BTREE_PAGE_GET_ITEM_SIZE(p, loc));
-						MARK_DIRTY(secondaryDesc, blkno);
-						state->tups_deleted++;
-					}
-					unlock_page(blkno);
-				}
-
-				indexTupleValid = false;
-				if (!O_TUPLE_IS_NULL(indexTuple) && indexTuple.data != NULL)
-					pfree(indexTuple.data);
-				continue;
-			}
-
-			if (cmp > 0)
-			{
-				if (index_insert(indexRelation, values, isnull, heapRowIdDatum,
-								 heapRelation, checkUnique, false, indexInfo))
-					state->tups_inserted++;
-			}
-			else
-			{
-				indexTupleValid = false;
-				if (!O_TUPLE_IS_NULL(indexTuple) && indexTuple.data != NULL)
-					pfree(indexTuple.data);
-			}
-			break;
-		}
 
 		if (hint.blkno != lastBlkno)
 		{
@@ -1753,8 +1669,56 @@ o_replay_pk_undo_into_secondary(OIndexDescr *pkIndex,
 			lastBlkno = hint.blkno;
 		}
 
-		ExecClearTuple(primarySlot);
-		pfree(tup.data);
+		while (true)
+		{
+			OTuple		next;
+			int			cmp;
+
+			if (chainCount == chainCap)
+			{
+				chainCap = (chainCap == 0) ? VALIDATE_CHAIN_INITIAL_CAPACITY :
+					chainCap * VALIDATE_CHAIN_GROWTH_FACTOR;
+				chain = repalloc(chain, sizeof(OTuple) * chainCap);
+			}
+			chain[chainCount++] = tup;
+			state->htups++;
+
+			next = o_btree_iterator_fetch(iterator, &tupleCsn, NULL, BTreeKeyNone, true, &hint);
+			if (O_TUPLE_IS_NULL(next))
+				break;
+
+			cmp = o_btree_cmp(&pkIndex->desc,
+							  &chain[0], BTreeKeyLeafTuple,
+							  &next, BTreeKeyLeafTuple);
+			if (cmp == 0)
+			{
+				tup = next;
+				continue;
+			}
+
+			pending = next;
+			pendingHint = hint;
+			hasPending = true;
+			break;
+		}
+
+		replay_pk_chain_versions(secIndex, secIndexNum, chain, chainCount,
+								 descr, predicate, econtext, heapRelation, state);
+
+		for (i = 0; i < chainCount; i++)
+			pfree(chain[i].data);
+		Assert(chain != NULL);
+		pfree(chain);
+	}
+
+	/*
+	 * We only use skSort for tuple accounting in this replay path.  Spurious
+	 * SK cleanup remains handled by existing validation/cleanup paths.
+	 */
+	while (orioledb_validate_next_index_tid(skSort, &indexTuple, &state->itups))
+	{
+		if (!O_TUPLE_IS_NULL(indexTuple) && indexTuple.data != NULL)
+			pfree(indexTuple.data);
 	}
 
 	btree_clear_validation_boundary(&pkIndex->desc);
@@ -1829,12 +1793,8 @@ orioledb_index_validate_scan(Relation heapRelation,
 									state->tuplesort,
 									iterator,
 									heapRelation,
-									indexRelation,
-									indexInfo,
 									predicate,
-									estate,
 									econtext,
-									primarySlot,
 									state);
 
 	ExecDropSingleTupleTableSlot(primarySlot);
