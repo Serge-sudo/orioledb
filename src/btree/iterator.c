@@ -528,6 +528,10 @@ void
 o_btree_iterator_set_lock_page_reads(BTreeIterator *it, bool enable)
 {
 	it->lockPageReads = enable;
+	if (enable)
+		BTREE_PAGE_FIND_SET(&it->context, MODIFY);
+	else
+		BTREE_PAGE_FIND_UNSET(&it->context, MODIFY);
 }
 
 /*
@@ -1147,19 +1151,35 @@ btree_iterate_raw_internal(BTreeIterator *it, void *end, BTreeKeyType endKind,
 
 		if (IT_IS_FORWARD(it))
 		{
+			bool		modifyMode = BTREE_PAGE_FIND_IS(context, MODIFY);
+
+			if (modifyMode)
+				BTREE_PAGE_FIND_UNSET(context, MODIFY);
 			if (!find_right_page(context, &key_buf))
 			{
+				if (modifyMode)
+					BTREE_PAGE_FIND_SET(context, MODIFY);
 				O_TUPLE_SET_NULL(result);
 				return result;
 			}
+			if (modifyMode)
+				BTREE_PAGE_FIND_SET(context, MODIFY);
 		}
 		else
 		{
+			bool		modifyMode = BTREE_PAGE_FIND_IS(context, MODIFY);
+
+			if (modifyMode)
+				BTREE_PAGE_FIND_UNSET(context, MODIFY);
 			if (!find_left_page(context, &key_buf))
 			{
+				if (modifyMode)
+					BTREE_PAGE_FIND_SET(context, MODIFY);
 				O_TUPLE_SET_NULL(result);
 				return result;
 			}
+			if (modifyMode)
+				BTREE_PAGE_FIND_SET(context, MODIFY);
 		}
 	}
 	O_TUPLE_SET_NULL(result);
