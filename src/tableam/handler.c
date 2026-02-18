@@ -1683,6 +1683,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 	bool		scanEnd;
 	BTreeLeafTuphdr *tupHdr = NULL;
 	bool		tupleDeleted;
+	bool		iteratorReset;
 	bool		lookupTupleValid = false;
 
 	Assert(state != NULL);
@@ -1721,6 +1722,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 	{
 		oslot = (OTableSlot *) primarySlot;
 		O_TUPLE_SET_NULL(heapTuple);
+		iteratorReset = false;
 		lookupTupleValid = false;
 
 		/* Fetch next tuple from current page without undo chain traversal */
@@ -1747,20 +1749,24 @@ orioledb_index_validate_scan(Relation heapRelation,
 			tup = btree_iterate_all(iterator, NULL, BTreeKeyNone, false, &scanEnd, &hint, &tupHdr);
 			if (scanEnd)
 				goto check_boundary;
+			iteratorReset = true;
 		}
 
-		heapTuple = o_btree_find_tuple_by_key_cb(&GET_PRIMARY(descr)->desc,
-												 lookupTuple.data,
-												 BTreeKeyLeafTuple,
-												 &oSnapshot,
-												 &tupleCsn,
-												 CurrentMemoryContext,
-												 NULL,
-												 &tupleDeleted,
-												 NULL,
-												 NULL);
-		if (O_TUPLE_IS_NULL(heapTuple) || tupleDeleted)
+		if (tupHdr == NULL)
 			goto check_boundary;
+
+		tupleDeleted = (tupHdr->deleted != BTreeLeafTupleNonDeleted);
+		if (tupleDeleted)
+			goto check_boundary;
+
+		if (iteratorReset && lookupTupleValid &&
+			o_btree_cmp(&GET_PRIMARY(descr)->desc,
+						lookupTuple.data, BTreeKeyLeafTuple,
+						tup.data, BTreeKeyLeafTuple) != 0)
+			goto check_boundary;
+
+		tupleCsn = XACT_INFO_MAP_CSN(tupHdr->xactInfo);
+		heapTuple = tup;
 
 		tts_orioledb_store_tuple(primarySlot, heapTuple, descr, tupleCsn, PrimaryIndexNumber, true, &hint);
 		slot_getallattrs(primarySlot);
@@ -1968,8 +1974,6 @@ check_boundary:
 		ExecClearTuple(primarySlot);
 		if (lookupTupleValid)
 			pfree(lookupTuple.data);
-		if (!O_TUPLE_IS_NULL(heapTuple))
-			pfree(heapTuple.data);
 	}
 
 	/*
