@@ -1688,44 +1688,47 @@ orioledb_index_validate_scan(Relation heapRelation,
 			   o_btree_len(&GET_PRIMARY(descr)->desc, tup, OTupleLength));
 		lookupTupleValid = true;
 
-		unlock_page(hint.blkno);
-
-		while (true)
+		if (!XACT_INFO_FINISHED_FOR_EVERYBODY(tupHdr->xactInfo))
 		{
-			OTupleXactInfo xactInfo = tupHdr->xactInfo;
+			unlock_page(hint.blkno);
 
-			if (XACT_INFO_IS_FINISHED(xactInfo))
-				break;
-
-			CHECK_FOR_INTERRUPTS();
-			wait_for_oxid(XACT_INFO_GET_OXID(xactInfo), false);
-		}
-
-		{
-			const long	initial_wait_us = 1000;
-			const long	max_wait_us = 64000;
-			long		wait_us = initial_wait_us;
-
-			/* Back off while waiting for old undo readers to disappear. */
-			while (!XACT_INFO_FINISHED_FOR_EVERYBODY(tupHdr->xactInfo))
+			while (true)
 			{
-				CHECK_FOR_INTERRUPTS();
-				pg_usleep(wait_us);
-				if (wait_us < max_wait_us)
-					wait_us *= 2;
-			}
-		}
+				OTupleXactInfo xactInfo = tupHdr->xactInfo;
 
-		btree_iterator_free(iterator);
-		iterator = o_btree_iterator_create(&GET_PRIMARY(descr)->desc,
-										   lookupTuple.data,
-										   BTreeKeyLeafTuple,
-										   &oSnapshot,
-										   ForwardScanDirection);
-		o_btree_iterator_set_lock_page_reads(iterator, true);
-		tup = btree_iterate_all(iterator, NULL, BTreeKeyNone, false, &scanEnd, &hint, &tupHdr);
-		if (scanEnd)
-			goto check_boundary;
+				if (XACT_INFO_IS_FINISHED(xactInfo))
+					break;
+
+				CHECK_FOR_INTERRUPTS();
+				wait_for_oxid(XACT_INFO_GET_OXID(xactInfo), false);
+			}
+
+			{
+				const long	initial_wait_us = 1000;
+				const long	max_wait_us = 64000;
+				long		wait_us = initial_wait_us;
+
+				/* Back off while waiting for old undo readers to disappear. */
+				while (!XACT_INFO_FINISHED_FOR_EVERYBODY(tupHdr->xactInfo))
+				{
+					CHECK_FOR_INTERRUPTS();
+					pg_usleep(wait_us);
+					if (wait_us < max_wait_us)
+						wait_us *= 2;
+				}
+			}
+
+			btree_iterator_free(iterator);
+			iterator = o_btree_iterator_create(&GET_PRIMARY(descr)->desc,
+											   lookupTuple.data,
+											   BTreeKeyLeafTuple,
+											   &oSnapshot,
+											   ForwardScanDirection);
+			o_btree_iterator_set_lock_page_reads(iterator, true);
+			tup = btree_iterate_all(iterator, NULL, BTreeKeyNone, false, &scanEnd, &hint, &tupHdr);
+			if (scanEnd)
+				goto check_boundary;
+		}
 
 		heapTuple = o_btree_find_tuple_by_key_cb(&GET_PRIMARY(descr)->desc,
 												 lookupTuple.data,
