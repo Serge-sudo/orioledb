@@ -1,6 +1,8 @@
 from .base_test import BaseTest
+from .base_test import ThreadQueryExecutor
 from testgres.connection import ProgrammingError
 from testgres.exceptions import QueryException
+import time
 
 
 class ReindexTest(BaseTest):
@@ -225,4 +227,43 @@ class ReindexTest(BaseTest):
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		node.stop()
+
+	def test_9(self):
+		node = self.node
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test_undo_wait (
+				id int NOT NULL,
+				val int NOT NULL,
+				PRIMARY KEY (id)
+			) USING orioledb;
+			INSERT INTO o_test_undo_wait
+				SELECT i, i FROM generate_series(1, 200) AS i;
+		""")
+
+		con1 = node.connect()
+		con2 = node.connect()
+
+		con1.execute("BEGIN;")
+		con1.execute("UPDATE o_test_undo_wait SET val = val + 1000 WHERE id <= 100;")
+		con1.execute("UPDATE o_test_undo_wait SET val = val + 1000 WHERE id <= 100;")
+
+		build_thread = ThreadQueryExecutor(
+			con2, "CREATE INDEX CONCURRENTLY o_test_undo_wait_val_idx ON o_test_undo_wait(val);")
+		build_thread.start()
+		time.sleep(1)
+		con1.execute("COMMIT;")
+		build_thread.join()
+
+		con3 = node.connect()
+		con3.execute("SET enable_seqscan = off;")
+		self.assertEqual(
+			con3.execute("SELECT count(*) FROM o_test_undo_wait WHERE val >= 0;")[0][0],
+			200)
+
+		con1.close()
+		con2.close()
+		con3.close()
 		node.stop()
