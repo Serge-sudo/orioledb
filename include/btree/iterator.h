@@ -47,13 +47,17 @@ extern BTreeIterator *o_btree_iterator_create(BTreeDescr *desc, void *key,
 											  BTreeKeyType kind,
 											  OSnapshot *o_snapshot,
 											  ScanDirection scanDir);
+extern BTreeIterator *o_btree_iterator_create_with_flags(BTreeDescr *desc,
+														 void *key,
+														 BTreeKeyType kind,
+														 OSnapshot *o_snapshot,
+														 ScanDirection scanDir,
+														 uint16 flags);
 extern void o_btree_iterator_set_tuple_ctx(BTreeIterator *it,
 										   MemoryContext tupleCxt);
 extern void o_btree_iterator_set_callback(BTreeIterator *it,
 										  TupleFetchCallback callback,
 										  void *arg);
-extern void o_btree_iterator_set_lock_page_reads(BTreeIterator *it,
-												 bool enable);
 extern void o_btree_iterator_set_undo_chain_walking(BTreeIterator *it,
 													bool enable);
 extern OTuple o_btree_iterator_fetch(BTreeIterator *it,

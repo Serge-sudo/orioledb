@@ -65,8 +65,6 @@ struct BTreeIterator
 	/* callback for fetching tuple version */
 	TupleFetchCallback fetchCallback;
 	void	   *fetchCallbackArg;
-	/* lock and refresh shared page image before reading each tuple */
-	bool		lockPageReads;
 	/* walk tuple-level undo chains? */
 	bool		walkUndoChains;
 	/* current undo chain location being walked */
@@ -431,8 +429,9 @@ o_find_tuple_version(BTreeDescr *desc, Page p, BTreePageItemLocator *loc,
 }
 
 BTreeIterator *
-o_btree_iterator_create(BTreeDescr *desc, void *key, BTreeKeyType kind,
-						OSnapshot *o_snapshot, ScanDirection scanDir)
+o_btree_iterator_create_with_flags(BTreeDescr *desc, void *key, BTreeKeyType kind,
+								   OSnapshot *o_snapshot, ScanDirection scanDir,
+								   uint16 flags)
 {
 	BTreeIterator *it;
 	uint16		findFlags = BTREE_PAGE_FIND_IMAGE;
@@ -445,7 +444,6 @@ o_btree_iterator_create(BTreeDescr *desc, void *key, BTreeKeyType kind,
 	it->tupleCxt = CurrentMemoryContext;
 	it->fetchCallback = NULL;
 	it->fetchCallbackArg = NULL;
-	it->lockPageReads = false;
 	it->walkUndoChains = false;
 	it->currentUndoChainLoc = InvalidUndoLocation;
 	O_TUPLE_SET_NULL(it->currentChainTuple);
@@ -459,6 +457,7 @@ o_btree_iterator_create(BTreeDescr *desc, void *key, BTreeKeyType kind,
 
 	if (IT_IS_BACKWARD(it))
 		findFlags |= BTREE_PAGE_FIND_KEEP_LOKEY;
+	findFlags |= flags;
 
 	init_page_find_context(&it->context, desc,
 						   it->combinedResult ? COMMITSEQNO_INPROGRESS : o_snapshot->csn, findFlags);
@@ -509,6 +508,14 @@ o_btree_iterator_create(BTreeDescr *desc, void *key, BTreeKeyType kind,
 	return it;
 }
 
+BTreeIterator *
+o_btree_iterator_create(BTreeDescr *desc, void *key, BTreeKeyType kind,
+						OSnapshot *o_snapshot, ScanDirection scanDir)
+{
+	return o_btree_iterator_create_with_flags(desc, key, kind,
+											  o_snapshot, scanDir, 0);
+}
+
 void
 o_btree_iterator_set_tuple_ctx(BTreeIterator *it, MemoryContext tupleCxt)
 {
@@ -522,30 +529,6 @@ o_btree_iterator_set_callback(BTreeIterator *it,
 {
 	it->fetchCallback = callback;
 	it->fetchCallbackArg = arg;
-}
-
-void
-o_btree_iterator_set_lock_page_reads(BTreeIterator *it, bool enable)
-{
-	it->lockPageReads = enable;
-	if (enable)
-	{
-		BTreePageItemLocator *loc = &it->context.items[it->context.index].locator;
-
-		BTREE_PAGE_FIND_SET(&it->context, MODIFY);
-		if (it->context.img != NULL &&
-			BTREE_PAGE_LOCATOR_IS_VALID(it->context.img, loc))
-		{
-			OTuple		key;
-			OFindPageResult findResult;
-
-			BTREE_PAGE_READ_TUPLE(key, it->context.img, loc);
-			findResult = find_page(&it->context, &key, BTreeKeyLeafTuple, 0);
-			Assert(findResult == OFindPageResultSuccess);
-		}
-	}
-	else
-		BTREE_PAGE_FIND_UNSET(&it->context, MODIFY);
 }
 
 /*

@@ -1659,9 +1659,12 @@ orioledb_index_validate_scan(Relation heapRelation,
 	 * The validation boundary starts unset (validationBoundaryLen == 0) and
 	 * will be updated as we progress through the scan.
 	 */
-	iterator = o_btree_iterator_create(&GET_PRIMARY(descr)->desc, NULL, BTreeKeyNone,
-									   &oSnapshot, ForwardScanDirection);
-	o_btree_iterator_set_lock_page_reads(iterator, true);
+	iterator = o_btree_iterator_create_with_flags(&GET_PRIMARY(descr)->desc,
+												  NULL,
+												  BTreeKeyNone,
+												  &oSnapshot,
+												  ForwardScanDirection,
+												  BTREE_PAGE_FIND_MODIFY);
 	
 	primarySlot = MakeSingleTupleTableSlot(descr->tupdesc, &TTSOpsOrioleDB);
 	econtext->ecxt_scantuple = primarySlot;
@@ -1719,12 +1722,12 @@ orioledb_index_validate_scan(Relation heapRelation,
 			}
 
 			btree_iterator_free(iterator);
-			iterator = o_btree_iterator_create(&GET_PRIMARY(descr)->desc,
-											   lookupTuple.data,
-											   BTreeKeyLeafTuple,
-											   &oSnapshot,
-											   ForwardScanDirection);
-			o_btree_iterator_set_lock_page_reads(iterator, true);
+			iterator = o_btree_iterator_create_with_flags(&GET_PRIMARY(descr)->desc,
+														  lookupTuple.data,
+														  BTreeKeyLeafTuple,
+														  &oSnapshot,
+														  ForwardScanDirection,
+														  BTREE_PAGE_FIND_MODIFY);
 			tup = btree_iterate_all(iterator, NULL, BTreeKeyNone, false, &scanEnd, &hint, &tupHdr);
 			if (scanEnd)
 				goto check_boundary;
