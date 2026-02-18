@@ -253,7 +253,17 @@ class ReindexTest(BaseTest):
 		build_thread = ThreadQueryExecutor(
 			con2, "CREATE INDEX CONCURRENTLY o_test_undo_wait_val_idx ON o_test_undo_wait(val);")
 		build_thread.start()
-		time.sleep(1)
+		started = False
+		for _ in range(100):
+			if node.execute("""
+				SELECT state <> 'idle'
+				FROM pg_stat_activity
+				WHERE pid = %s;
+			""" % (con2.pid, ))[0][0]:
+				started = True
+				break
+			time.sleep(0.1)
+		self.assertTrue(started, "CREATE INDEX CONCURRENTLY did not start in time")
 		con1.execute("COMMIT;")
 		build_thread.join()
 

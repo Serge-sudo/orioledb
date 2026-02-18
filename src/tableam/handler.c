@@ -1676,13 +1676,30 @@ orioledb_index_validate_scan(Relation heapRelation,
 		if (scanEnd)
 			break;
 
-		while (!XACT_INFO_IS_FINISHED(tupHdr->xactInfo))
-			wait_for_oxid(XACT_INFO_GET_OXID(tupHdr->xactInfo), false);
-
-		while (!XACT_INFO_FINISHED_FOR_EVERYBODY(tupHdr->xactInfo))
+		while (true)
 		{
+			OTupleXactInfo xactInfo = tupHdr->xactInfo;
+
+			if (XACT_INFO_IS_FINISHED(xactInfo))
+				break;
+
 			CHECK_FOR_INTERRUPTS();
-			pg_usleep(1000L);
+			wait_for_oxid(XACT_INFO_GET_OXID(xactInfo), false);
+		}
+
+		{
+			const long	initial_wait_us = 1000;
+			const long	max_wait_us = 64000;
+			long		wait_us = initial_wait_us;
+
+			/* Back off while waiting for old undo readers to disappear. */
+			while (!XACT_INFO_FINISHED_FOR_EVERYBODY(tupHdr->xactInfo))
+			{
+				CHECK_FOR_INTERRUPTS();
+				pg_usleep(wait_us);
+				if (wait_us < max_wait_us)
+					wait_us *= 2;
+			}
 		}
 
 		if (tupHdr->deleted != BTreeLeafTupleNonDeleted)
