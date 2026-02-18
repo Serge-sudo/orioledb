@@ -112,6 +112,7 @@ REGRESSCHECKS = btree_sys_check \
 				getsomeattrs \
 				index_bridging \
 				indices \
+				index_rows_versions \
 				indices_build \
 				inherits \
 				ioc \

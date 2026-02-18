@@ -1,0 +1,29 @@
+CREATE SCHEMA index_rows_versions;
+SET SESSION search_path = 'index_rows_versions';
+CREATE EXTENSION orioledb;
+CREATE TABLE o_test (
+	id int PRIMARY KEY,
+	val int
+) USING orioledb;
+INSERT INTO o_test VALUES (1, 10);
+UPDATE o_test SET val = 20 WHERE id = 1;
+DELETE FROM o_test WHERE id = 1;
+WITH versions AS (
+	SELECT r
+	FROM orioledb_index_rows_versions('o_test_pkey'::regclass) r
+)
+SELECT COUNT(*) AS total,
+	   COUNT(*) FILTER (WHERE (r->>'is_updated')::boolean) AS updated,
+	   COUNT(*) FILTER (WHERE (r->>'is_deleted')::boolean) AS deleted,
+	   MIN((r->>'version')::int) AS min_version,
+	   MAX((r->>'version')::int) AS max_version,
+	   BOOL_AND((r->>'oxid') IS NOT NULL) AS has_oxid
+FROM versions;
+ total | updated | deleted | min_version | max_version | has_oxid 
+-------+---------+---------+-------------+-------------+----------
+     3 |       1 |       1 |           0 |           2 | t
+(1 row)
+
+DROP EXTENSION orioledb CASCADE;
+DROP SCHEMA index_rows_versions;
+RESET search_path;

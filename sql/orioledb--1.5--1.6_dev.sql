@@ -19,3 +19,8 @@ CREATE FUNCTION orioledb_int4range_immutable(input_str text)
 RETURNS int4range
 AS 'MODULE_PATHNAME'
 IMMUTABLE LANGUAGE C;
+
+CREATE FUNCTION orioledb_index_rows_versions(relid oid)
+RETURNS SETOF jsonb
+AS 'MODULE_PATHNAME'
+VOLATILE LANGUAGE C;

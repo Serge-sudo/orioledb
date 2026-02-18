@@ -7,3 +7,8 @@ CREATE FUNCTION pg_stopevent_set(eventname text, condition jsonpath, flags text)
 RETURNS void
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT;
+
+CREATE FUNCTION orioledb_index_rows_versions(relid oid)
+RETURNS SETOF jsonb
+AS 'MODULE_PATHNAME'
+VOLATILE LANGUAGE C;

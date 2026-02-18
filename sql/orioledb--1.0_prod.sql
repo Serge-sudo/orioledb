@@ -95,6 +95,11 @@ RETURNS record
 AS 'MODULE_PATHNAME'
 VOLATILE LANGUAGE C;
 
+CREATE FUNCTION orioledb_index_rows_versions(relid oid)
+RETURNS SETOF jsonb
+AS 'MODULE_PATHNAME'
+VOLATILE LANGUAGE C;
+
 CREATE FUNCTION orioledb_table_oids(OUT datoid oid, OUT reloid oid, OUT relnode oid)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME'

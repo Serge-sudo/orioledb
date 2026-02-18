@@ -16,6 +16,7 @@
 #include "orioledb.h"
 
 #include "btree/btree.h"
+#include "btree/undo.h"
 #include "catalog/indices.h"
 #include "catalog/o_indices.h"
 #include "catalog/o_sys_cache.h"
@@ -43,6 +44,7 @@
 PG_FUNCTION_INFO_V1(orioledb_index_oids);
 PG_FUNCTION_INFO_V1(orioledb_index_description);
 PG_FUNCTION_INFO_V1(orioledb_index_rows);
+PG_FUNCTION_INFO_V1(orioledb_index_rows_versions);
 
 static OIndex *make_ctid_o_index(OTable *table);
 
@@ -1598,4 +1600,209 @@ orioledb_index_rows(PG_FUNCTION_ARGS)
 	tuple = heap_form_tuple(tupleDesc, values, nulls);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+typedef struct
+{
+	BTreeLeafTuphdr tuphdr;
+	OTuple		tuple;
+} OIndexRowVersion;
+
+static void
+o_append_index_row_version(BTreeDescr *desc, OIndexRowVersion **versions,
+						   int *versionCount, int *versionAllocated,
+						   BTreeLeafTuphdr *tuphdr, OTuple tuple)
+{
+	OIndexRowVersion *version;
+
+	if (*versionCount >= *versionAllocated)
+	{
+		*versionAllocated *= 2;
+		*versions = repalloc(*versions, sizeof(OIndexRowVersion) * (*versionAllocated));
+	}
+
+	version = &(*versions)[*versionCount];
+	version->tuphdr = *tuphdr;
+	O_TUPLE_SET_NULL(version->tuple);
+	if (!O_TUPLE_IS_NULL(tuple))
+	{
+		int			size = o_btree_len(desc, tuple, OTupleLength);
+
+		version->tuple.data = palloc(size);
+		memcpy(version->tuple.data, tuple.data, size);
+		version->tuple.formatFlags = tuple.formatFlags;
+	}
+	(*versionCount)++;
+}
+
+/*
+ * Returns all available index tuple versions (including historical versions
+ * from undo chains) with update/delete flags and transaction oxid.
+ */
+Datum
+orioledb_index_rows_versions(PG_FUNCTION_ARGS)
+{
+	Oid			ix_reloid = PG_GETARG_OID(0);
+	Relation	idx,
+				tbl;
+	OTableDescr *descr;
+	OIndexNumber ix_num;
+	BTreeIterator *it;
+	BTreeDescr *td;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	TupleDesc	tupdesc;
+	Datum		values[1];
+	bool		nulls[1] = {false};
+	Oid			funcrettype;
+
+	idx = index_open(ix_reloid, AccessShareLock);
+	tbl = table_open(idx->rd_index->indrelid, AccessShareLock);
+	descr = relation_get_descr(tbl);
+	ix_num = o_find_ix_num_by_name(descr, idx->rd_rel->relname.data);
+	relation_close(tbl, AccessShareLock);
+	relation_close(idx, AccessShareLock);
+
+	if (ix_num == InvalidIndexNumber)
+		elog(ERROR, "Invalid index");
+
+	td = &descr->indices[ix_num]->desc;
+	o_btree_load_shmem(td);
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, &funcrettype, NULL) != TYPEFUNC_SCALAR)
+		elog(ERROR, "return type must be a scalar type");
+
+	tupdesc = CreateTemplateTupleDesc(1);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 1, NULL, funcrettype, -1, 0);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	it = o_btree_iterator_create(td, NULL, BTreeKeyNone,
+								 &o_in_progress_snapshot, ForwardScanDirection);
+
+	do
+	{
+		bool		end;
+		BTreeLeafTuphdr *tupHdr;
+		OTuple		tuple;
+		OIndexRowVersion *versions;
+		int			versionCount = 0;
+		int			versionAllocated = 8;
+		BTreeLeafTuphdr curTupHdr;
+		OTuple		curTuple;
+		bool		curTupleAllocated = false;
+
+		tuple = btree_iterate_all(it, NULL, BTreeKeyNone, false, &end, NULL,
+								  &tupHdr);
+
+		if (end)
+			break;
+
+		versions = palloc(sizeof(OIndexRowVersion) * versionAllocated);
+		curTupHdr = *tupHdr;
+		curTuple = tuple;
+
+		for (;;)
+		{
+			if (!XACT_INFO_IS_LOCK_ONLY(curTupHdr.xactInfo))
+				o_append_index_row_version(td, &versions, &versionCount,
+										   &versionAllocated, &curTupHdr,
+										   curTuple);
+
+			if (!UndoLocationIsValid(curTupHdr.undoLocation))
+				break;
+
+			if (XACT_INFO_IS_LOCK_ONLY(curTupHdr.xactInfo))
+			{
+				get_prev_leaf_header_from_undo(td->undoType, &curTupHdr, false);
+			}
+			else if (curTupHdr.deleted == BTreeLeafTupleNonDeleted)
+			{
+				OTuple		prevTuple;
+
+				if (curTupleAllocated)
+					pfree(curTuple.data);
+				get_prev_leaf_header_and_tuple_from_undo(td->undoType, &curTupHdr,
+														 &prevTuple, 0);
+				curTuple = prevTuple;
+				curTupleAllocated = true;
+			}
+			else
+			{
+				if (curTupleAllocated)
+				{
+					pfree(curTuple.data);
+					curTupleAllocated = false;
+				}
+				get_prev_leaf_header_from_undo(td->undoType, &curTupHdr, false);
+				O_TUPLE_SET_NULL(curTuple);
+			}
+		}
+
+		if (curTupleAllocated)
+			pfree(curTuple.data);
+
+		{
+			int			outVersion = 0;
+
+			while (versionCount > 0)
+			{
+				OIndexRowVersion *version = &versions[versionCount - 1];
+				bool		isDeleted = version->tuphdr.deleted != BTreeLeafTupleNonDeleted;
+				JsonbParseState *state = NULL;
+				Jsonb	   *res;
+
+				(void) pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+				jsonb_push_int8_key(&state, "version", outVersion);
+				jsonb_push_int8_key(&state, "oxid", XACT_INFO_GET_OXID(version->tuphdr.xactInfo));
+				jsonb_push_bool_key(&state, "is_deleted", isDeleted);
+				jsonb_push_bool_key(&state, "is_updated", outVersion > 0 && !isDeleted);
+				jsonb_push_key(&state, "tupHdr");
+				(void) pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+				jsonb_push_int8_key(&state, "deleted", version->tuphdr.deleted);
+				(void) pushJsonbValue(&state, WJB_END_OBJECT, NULL);
+				jsonb_push_key(&state, "key");
+				if (O_TUPLE_IS_NULL(version->tuple))
+				{
+					JsonbValue	nullVal;
+
+					nullVal.type = jbvNull;
+					(void) pushJsonbValue(&state, WJB_VALUE, &nullVal);
+				}
+				else
+				{
+					bool		allocated;
+					OTuple		key;
+
+					key = o_btree_tuple_make_key(td, version->tuple, NULL, true, &allocated);
+					(void) o_btree_key_to_jsonb(td, key, &state);
+					if (allocated)
+						pfree(key.data);
+				}
+				res = JsonbValueToJsonb(pushJsonbValue(&state, WJB_END_OBJECT, NULL));
+				values[0] = PointerGetDatum(res);
+				tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
+									 nulls);
+
+				if (!O_TUPLE_IS_NULL(version->tuple))
+					pfree(version->tuple.data);
+				versionCount--;
+				outVersion++;
+			}
+		}
+
+		pfree(versions);
+	} while (true);
+
+	btree_iterator_free(it);
+
+	return (Datum) 0;
 }
