@@ -1335,11 +1335,7 @@ orioledb_index_validate_cleanup_old_concurrent(Relation heapRelation,
 static void
 debug_print_validate_tuple(OTuple tuple, OTableDescr *table_descr, OIndexDescr *index_descr)
 {
-#ifndef USE_ASSERT_CHECKING
-	(void) tuple;
-	(void) table_descr;
-	(void) index_descr;
-#else
+#ifdef USE_ASSERT_CHECKING
 	StringInfoData buf;
 	BTreeDescr *desc = &index_descr->desc;
 	int			nKeyFields = desc->nKeyFields;
@@ -1390,6 +1386,10 @@ debug_print_validate_tuple(OTuple tuple, OTableDescr *table_descr, OIndexDescr *
 
 	elog(DEBUG1, "%s", buf.data);
 	pfree(buf.data);
+#else
+	(void) tuple;
+	(void) table_descr;
+	(void) index_descr;
 #endif
 }
 
@@ -1787,6 +1787,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 	Assert(state != NULL);
 	Assert(state->tuplesort != NULL);
+	/* API requires snapshot, but validation intentionally uses SnapshotAny. */
 	(void) snapshot;
 
 	estate = CreateExecutorState();
