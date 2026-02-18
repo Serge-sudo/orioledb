@@ -529,7 +529,21 @@ o_btree_iterator_set_lock_page_reads(BTreeIterator *it, bool enable)
 {
 	it->lockPageReads = enable;
 	if (enable)
+	{
+		BTreePageItemLocator *loc = &it->context.items[it->context.index].locator;
+
 		BTREE_PAGE_FIND_SET(&it->context, MODIFY);
+		if (it->context.img != NULL &&
+			BTREE_PAGE_LOCATOR_IS_VALID(it->context.img, loc))
+		{
+			OTuple		key;
+			OFindPageResult findResult;
+
+			BTREE_PAGE_READ_TUPLE(key, it->context.img, loc);
+			findResult = find_page(&it->context, &key, BTreeKeyLeafTuple, 0);
+			Assert(findResult == OFindPageResultSuccess);
+		}
+	}
 	else
 		BTREE_PAGE_FIND_UNSET(&it->context, MODIFY);
 }
@@ -1084,24 +1098,9 @@ btree_iterate_raw_internal(BTreeIterator *it, void *end, BTreeKeyType endKind,
 	while (true)
 	{
 		BTreePageItemLocator *loc = &context->items[context->index].locator;
-		bool		pageLocked = false;
-		OInMemoryBlkno lockBlkno = OInvalidInMemoryBlkno;
 
 		if (BTREE_PAGE_LOCATOR_IS_VALID(img, loc))
 		{
-			if (it->lockPageReads)
-			{
-				lockBlkno = context->items[context->index].blkno;
-				lock_page(lockBlkno);
-				pageLocked = true;
-				memcpy(context->img, O_GET_IN_MEMORY_PAGE(lockBlkno), ORIOLEDB_BLCKSZ);
-				if (!BTREE_PAGE_LOCATOR_IS_VALID(context->img, loc))
-				{
-					unlock_page(lockBlkno);
-					continue;
-				}
-			}
-
 			BTREE_PAGE_READ_LEAF_ITEM(*tupHdr, result, context->img, loc);
 			IT_NEXT_OFFSET(it, loc);
 
@@ -1113,8 +1112,6 @@ btree_iterate_raw_internal(BTreeIterator *it, void *end, BTreeKeyType endKind,
 				cmp = o_btree_cmp(desc, &result, BTreeKeyLeafTuple, end, endKind);
 				if (cmp > 0 || (cmp == 0 && !endInclude))
 				{
-					if (pageLocked)
-						unlock_page(lockBlkno);
 					*scanEnd = true;
 					O_TUPLE_SET_NULL(result);
 					return result;
@@ -1129,14 +1126,10 @@ btree_iterate_raw_internal(BTreeIterator *it, void *end, BTreeKeyType endKind,
 					hint->blkno = it->context.items[it->context.index].blkno;
 					hint->pageChangeCount = it->context.items[it->context.index].pageChangeCount;
 				}
-				if (pageLocked)
-					unlock_page(lockBlkno);
 				return result;
 			}
 			else
 			{
-				if (pageLocked)
-					unlock_page(lockBlkno);
 				O_TUPLE_SET_NULL(result);
 				return result;
 			}
@@ -1151,35 +1144,19 @@ btree_iterate_raw_internal(BTreeIterator *it, void *end, BTreeKeyType endKind,
 
 		if (IT_IS_FORWARD(it))
 		{
-			bool		modifyMode = BTREE_PAGE_FIND_IS(context, MODIFY);
-
-			if (modifyMode)
-				BTREE_PAGE_FIND_UNSET(context, MODIFY);
 			if (!find_right_page(context, &key_buf))
 			{
-				if (modifyMode)
-					BTREE_PAGE_FIND_SET(context, MODIFY);
 				O_TUPLE_SET_NULL(result);
 				return result;
 			}
-			if (modifyMode)
-				BTREE_PAGE_FIND_SET(context, MODIFY);
 		}
 		else
 		{
-			bool		modifyMode = BTREE_PAGE_FIND_IS(context, MODIFY);
-
-			if (modifyMode)
-				BTREE_PAGE_FIND_UNSET(context, MODIFY);
 			if (!find_left_page(context, &key_buf))
 			{
-				if (modifyMode)
-					BTREE_PAGE_FIND_SET(context, MODIFY);
 				O_TUPLE_SET_NULL(result);
 				return result;
 			}
-			if (modifyMode)
-				BTREE_PAGE_FIND_SET(context, MODIFY);
 		}
 	}
 	O_TUPLE_SET_NULL(result);

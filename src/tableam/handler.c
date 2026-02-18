@@ -1634,6 +1634,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 	bool		scanEnd;
 	BTreeLeafTuphdr *tupHdr = NULL;
 	bool		tupleDeleted;
+	bool		lookupTupleValid = false;
 
 	Assert(state != NULL);
 	Assert(state->tuplesort != NULL);
@@ -1673,6 +1674,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 	{
 		oslot = (OTableSlot *) primarySlot;
 		O_TUPLE_SET_NULL(heapTuple);
+		lookupTupleValid = false;
 
 		/* Fetch next tuple from current page without undo chain traversal */
 		tup = btree_iterate_all(iterator, NULL, BTreeKeyNone, false, &scanEnd, &hint, &tupHdr);
@@ -1684,6 +1686,9 @@ orioledb_index_validate_scan(Relation heapRelation,
 		lookupTuple.data = palloc(o_btree_len(&GET_PRIMARY(descr)->desc, tup, OTupleLength));
 		memcpy(lookupTuple.data, tup.data,
 			   o_btree_len(&GET_PRIMARY(descr)->desc, tup, OTupleLength));
+		lookupTupleValid = true;
+
+		unlock_page(hint.blkno);
 
 		while (true)
 		{
@@ -1711,6 +1716,17 @@ orioledb_index_validate_scan(Relation heapRelation,
 			}
 		}
 
+		btree_iterator_free(iterator);
+		iterator = o_btree_iterator_create(&GET_PRIMARY(descr)->desc,
+										   lookupTuple.data,
+										   BTreeKeyLeafTuple,
+										   &oSnapshot,
+										   ForwardScanDirection);
+		o_btree_iterator_set_lock_page_reads(iterator, true);
+		tup = btree_iterate_all(iterator, NULL, BTreeKeyNone, false, &scanEnd, &hint, &tupHdr);
+		if (scanEnd)
+			goto check_boundary;
+
 		heapTuple = o_btree_find_tuple_by_key_cb(&GET_PRIMARY(descr)->desc,
 												 lookupTuple.data,
 												 BTreeKeyLeafTuple,
@@ -1721,7 +1737,6 @@ orioledb_index_validate_scan(Relation heapRelation,
 												 &tupleDeleted,
 												 NULL,
 												 NULL);
-		pfree(lookupTuple.data);
 		if (O_TUPLE_IS_NULL(heapTuple) || tupleDeleted)
 			goto check_boundary;
 
@@ -1923,12 +1938,14 @@ check_boundary:
 				 * We've moved to a new page. Set the boundary to the current tuple
 				 * which is on the new page. The iterator holds a lock on this page.
 				 */
-				btree_set_validation_boundary(&GET_PRIMARY(descr)->desc, tup);
+				btree_set_validation_boundary(&GET_PRIMARY(descr)->desc, lookupTupleValid ? lookupTuple : tup);
 			}
 			lastBlkno = hint.blkno;
 		}
 
 		ExecClearTuple(primarySlot);
+		if (lookupTupleValid)
+			pfree(lookupTuple.data);
 		if (!O_TUPLE_IS_NULL(heapTuple))
 			pfree(heapTuple.data);
 	}
