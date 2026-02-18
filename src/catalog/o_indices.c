@@ -16,7 +16,7 @@
 #include "orioledb.h"
 
 #include "btree/btree.h"
-#include "btree/undo.h"
+#include "btree/iterator.h"
 #include "catalog/indices.h"
 #include "catalog/o_indices.h"
 #include "catalog/o_sys_cache.h"
@@ -1604,39 +1604,6 @@ orioledb_index_rows(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
 }
 
-typedef struct
-{
-	BTreeLeafTuphdr tuphdr;
-	OTuple		tuple;
-} OIndexRowVersion;
-
-static void
-o_append_index_row_version(BTreeDescr *desc, OIndexRowVersion **versions,
-						   int *versionCount, int *versionAllocated,
-						   BTreeLeafTuphdr *tuphdr, OTuple tuple)
-{
-	OIndexRowVersion *version;
-
-	if (*versionCount >= *versionAllocated)
-	{
-		*versionAllocated *= 2;
-		*versions = repalloc(*versions, sizeof(OIndexRowVersion) * (*versionAllocated));
-	}
-
-	version = &(*versions)[*versionCount];
-	version->tuphdr = *tuphdr;
-	O_TUPLE_SET_NULL(version->tuple);
-	if (!O_TUPLE_IS_NULL(tuple))
-	{
-		int			size = o_btree_len(desc, tuple, OTupleLength);
-
-		version->tuple.data = palloc(size);
-		memcpy(version->tuple.data, tuple.data, size);
-		version->tuple.formatFlags = tuple.formatFlags;
-	}
-	(*versionCount)++;
-}
-
 /*
  * Returns all available index tuple versions (including historical versions
  * from undo chains) with update/delete flags and transaction oxid.
@@ -1694,13 +1661,11 @@ orioledb_index_rows_versions(PG_FUNCTION_ARGS)
 	{
 		bool		end;
 		BTreeLeafTuphdr *tupHdr;
+		BTreeLeafTuphdr verTupHdr;
 		OTuple		tuple;
-		OIndexRowVersion *versions;
-		int			versionCount = 0;
-		int			versionAllocated = 8;
-		BTreeLeafTuphdr curTupHdr;
-		OTuple		curTuple;
-		bool		curTupleAllocated = false;
+		OTuple		verTuple;
+		BTreeVersionIterator verIt;
+		int			version = 0;
 
 		tuple = btree_iterate_all(it, NULL, BTreeKeyNone, false, &end, NULL,
 								  &tupHdr);
@@ -1708,100 +1673,49 @@ orioledb_index_rows_versions(PG_FUNCTION_ARGS)
 		if (end)
 			break;
 
-		versions = palloc(sizeof(OIndexRowVersion) * versionAllocated);
-		curTupHdr = *tupHdr;
-		curTuple = tuple;
+		o_btree_version_iterator_init(&verIt, td, tupHdr, tuple);
 
-		for (;;)
+		while (o_btree_version_iterator_fetch(&verIt, &verTupHdr, &verTuple))
 		{
-			if (!XACT_INFO_IS_LOCK_ONLY(curTupHdr.xactInfo))
-				o_append_index_row_version(td, &versions, &versionCount,
-										   &versionAllocated, &curTupHdr,
-										   curTuple);
+			bool		isDeleted = verTupHdr.deleted != BTreeLeafTupleNonDeleted;
+			JsonbParseState *state = NULL;
+			Jsonb	   *res;
 
-			if (!UndoLocationIsValid(curTupHdr.undoLocation))
-				break;
-
-			if (XACT_INFO_IS_LOCK_ONLY(curTupHdr.xactInfo))
+			(void) pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+			jsonb_push_int8_key(&state, "version", version);
+			jsonb_push_int8_key(&state, "oxid", XACT_INFO_GET_OXID(verTupHdr.xactInfo));
+			jsonb_push_bool_key(&state, "is_deleted", isDeleted);
+			jsonb_push_bool_key(&state, "is_updated", version > 0 && !isDeleted);
+			jsonb_push_key(&state, "tupHdr");
+			(void) pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+			jsonb_push_int8_key(&state, "deleted", verTupHdr.deleted);
+			(void) pushJsonbValue(&state, WJB_END_OBJECT, NULL);
+			jsonb_push_key(&state, "key");
+			if (O_TUPLE_IS_NULL(verTuple))
 			{
-				get_prev_leaf_header_from_undo(td->undoType, &curTupHdr, false);
-			}
-			else if (curTupHdr.deleted == BTreeLeafTupleNonDeleted)
-			{
-				OTuple		prevTuple;
+				JsonbValue	nullVal;
 
-				if (curTupleAllocated)
-					pfree(curTuple.data);
-				get_prev_leaf_header_and_tuple_from_undo(td->undoType, &curTupHdr,
-														 &prevTuple, 0);
-				curTuple = prevTuple;
-				curTupleAllocated = true;
+				nullVal.type = jbvNull;
+				(void) pushJsonbValue(&state, WJB_VALUE, &nullVal);
 			}
 			else
 			{
-				if (curTupleAllocated)
-				{
-					pfree(curTuple.data);
-					curTupleAllocated = false;
-				}
-				get_prev_leaf_header_from_undo(td->undoType, &curTupHdr, false);
-				O_TUPLE_SET_NULL(curTuple);
+				bool		allocated;
+				OTuple		key;
+
+				key = o_btree_tuple_make_key(td, verTuple, NULL, true, &allocated);
+				(void) o_btree_key_to_jsonb(td, key, &state);
+				if (allocated)
+					pfree(key.data);
+				pfree(verTuple.data);
 			}
+			res = JsonbValueToJsonb(pushJsonbValue(&state, WJB_END_OBJECT, NULL));
+			values[0] = PointerGetDatum(res);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
+								 nulls);
+			version++;
 		}
-
-		if (curTupleAllocated)
-			pfree(curTuple.data);
-
-		{
-			int			outVersion = 0;
-
-			while (versionCount > 0)
-			{
-				OIndexRowVersion *version = &versions[versionCount - 1];
-				bool		isDeleted = version->tuphdr.deleted != BTreeLeafTupleNonDeleted;
-				JsonbParseState *state = NULL;
-				Jsonb	   *res;
-
-				(void) pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
-				jsonb_push_int8_key(&state, "version", outVersion);
-				jsonb_push_int8_key(&state, "oxid", XACT_INFO_GET_OXID(version->tuphdr.xactInfo));
-				jsonb_push_bool_key(&state, "is_deleted", isDeleted);
-				jsonb_push_bool_key(&state, "is_updated", outVersion > 0 && !isDeleted);
-				jsonb_push_key(&state, "tupHdr");
-				(void) pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
-				jsonb_push_int8_key(&state, "deleted", version->tuphdr.deleted);
-				(void) pushJsonbValue(&state, WJB_END_OBJECT, NULL);
-				jsonb_push_key(&state, "key");
-				if (O_TUPLE_IS_NULL(version->tuple))
-				{
-					JsonbValue	nullVal;
-
-					nullVal.type = jbvNull;
-					(void) pushJsonbValue(&state, WJB_VALUE, &nullVal);
-				}
-				else
-				{
-					bool		allocated;
-					OTuple		key;
-
-					key = o_btree_tuple_make_key(td, version->tuple, NULL, true, &allocated);
-					(void) o_btree_key_to_jsonb(td, key, &state);
-					if (allocated)
-						pfree(key.data);
-				}
-				res = JsonbValueToJsonb(pushJsonbValue(&state, WJB_END_OBJECT, NULL));
-				values[0] = PointerGetDatum(res);
-				tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
-									 nulls);
-
-				if (!O_TUPLE_IS_NULL(version->tuple))
-					pfree(version->tuple.data);
-				versionCount--;
-				outVersion++;
-			}
-		}
-
-		pfree(versions);
+		o_btree_version_iterator_free(&verIt);
 	} while (true);
 
 	btree_iterator_free(it);

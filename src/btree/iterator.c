@@ -1055,6 +1055,131 @@ btree_iterate_all(BTreeIterator *it, void *end, BTreeKeyType endKind,
 									  hint, false, tupHdr);
 }
 
+static void
+o_btree_version_iterator_add(BTreeVersionIterator *iterator,
+							 BTreeLeafTuphdr *tuphdr, OTuple tuple)
+{
+	BTreeVersionItem *item;
+
+	if (iterator->count >= iterator->allocated)
+	{
+		iterator->allocated *= 2;
+		iterator->items = repalloc(iterator->items,
+								   iterator->allocated * sizeof(BTreeVersionItem));
+	}
+
+	item = &iterator->items[iterator->count];
+	item->tuphdr = *tuphdr;
+	O_TUPLE_SET_NULL(item->tuple);
+	if (!O_TUPLE_IS_NULL(tuple))
+	{
+		int			size = o_btree_len(iterator->desc, tuple, OTupleLength);
+
+		item->tuple.data = palloc(size);
+		memcpy(item->tuple.data, tuple.data, size);
+		item->tuple.formatFlags = tuple.formatFlags;
+	}
+	iterator->count++;
+}
+
+void
+o_btree_version_iterator_init(BTreeVersionIterator *iterator,
+							  BTreeDescr *desc,
+							  BTreeLeafTuphdr *tuphdr,
+							  OTuple tuple)
+{
+	BTreeLeafTuphdr curTupHdr = *tuphdr;
+	OTuple		curTuple = tuple;
+	bool		curTupleAllocated = false;
+
+	iterator->desc = desc;
+	iterator->count = 0;
+	iterator->allocated = 8;
+	iterator->items = palloc(sizeof(BTreeVersionItem) * iterator->allocated);
+
+	for (;;)
+	{
+		if (!XACT_INFO_IS_LOCK_ONLY(curTupHdr.xactInfo))
+			o_btree_version_iterator_add(iterator, &curTupHdr, curTuple);
+
+		if (!UndoLocationIsValid(curTupHdr.undoLocation))
+			break;
+
+		if (XACT_INFO_IS_LOCK_ONLY(curTupHdr.xactInfo))
+		{
+			get_prev_leaf_header_from_undo(desc->undoType, &curTupHdr, false);
+		}
+		else if (curTupHdr.deleted == BTreeLeafTupleNonDeleted)
+		{
+			OTuple		prevTuple;
+
+			if (curTupleAllocated)
+				pfree(curTuple.data);
+			get_prev_leaf_header_and_tuple_from_undo(desc->undoType, &curTupHdr,
+													 &prevTuple, 0);
+			curTuple = prevTuple;
+			curTupleAllocated = true;
+		}
+		else
+		{
+			if (curTupleAllocated)
+			{
+				pfree(curTuple.data);
+				curTupleAllocated = false;
+			}
+			get_prev_leaf_header_from_undo(desc->undoType, &curTupHdr, false);
+			O_TUPLE_SET_NULL(curTuple);
+		}
+	}
+
+	if (curTupleAllocated)
+		pfree(curTuple.data);
+
+	if (iterator->count > 0)
+		iterator->next = iterator->count - 1;
+	else
+		iterator->next = -1;
+}
+
+bool
+o_btree_version_iterator_fetch(BTreeVersionIterator *iterator,
+							   BTreeLeafTuphdr *tuphdr,
+							   OTuple *tuple)
+{
+	BTreeVersionItem *item;
+
+	if (iterator->next < 0)
+	{
+		O_TUPLE_SET_NULL(*tuple);
+		return false;
+	}
+
+	item = &iterator->items[iterator->next];
+	*tuphdr = item->tuphdr;
+	*tuple = item->tuple;
+	O_TUPLE_SET_NULL(item->tuple);
+	iterator->next--;
+
+	return true;
+}
+
+void
+o_btree_version_iterator_free(BTreeVersionIterator *iterator)
+{
+	int			i;
+
+	for (i = 0; i < iterator->count; i++)
+	{
+		if (!O_TUPLE_IS_NULL(iterator->items[i].tuple))
+			pfree(iterator->items[i].tuple.data);
+	}
+	pfree(iterator->items);
+	iterator->items = NULL;
+	iterator->count = 0;
+	iterator->allocated = 0;
+	iterator->next = -1;
+}
+
 /*
  * Fills basic fields of undo iterator
  */

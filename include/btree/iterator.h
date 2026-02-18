@@ -66,6 +66,30 @@ extern OTuple btree_iterate_all(BTreeIterator *it, void *end,
 								BTreeLeafTuphdr **tupHdr);
 extern void btree_iterator_free(BTreeIterator *it);
 
+typedef struct
+{
+	BTreeLeafTuphdr tuphdr;
+	OTuple		tuple;
+} BTreeVersionItem;
+
+typedef struct
+{
+	BTreeDescr *desc;
+	BTreeVersionItem *items;
+	int			count;
+	int			allocated;
+	int			next;
+} BTreeVersionIterator;
+
+extern void o_btree_version_iterator_init(BTreeVersionIterator *iterator,
+										 BTreeDescr *desc,
+										 BTreeLeafTuphdr *tuphdr,
+										 OTuple tuple);
+extern bool o_btree_version_iterator_fetch(BTreeVersionIterator *iterator,
+										  BTreeLeafTuphdr *tuphdr,
+										  OTuple *tuple);
+extern void o_btree_version_iterator_free(BTreeVersionIterator *iterator);
+
 extern OTuple o_btree_find_tuple_by_key_cb(BTreeDescr *desc, void *key,
 										   BTreeKeyType kind,
 										   OSnapshot *read_o_snapshot,
