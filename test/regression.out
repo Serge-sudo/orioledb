@@ -1,3 +1,0 @@
-# initdb failed
-# Examine "/home/runner/work/orioledb/orioledb/test/log/initdb.log" for the reason.
-# Command was: "initdb" -D "/home/runner/work/orioledb/orioledb/test/tmp_check/data" --no-clean --no-sync --no-locale > "/home/runner/work/orioledb/orioledb/test/log/initdb.log" 2>&1Bail out!
