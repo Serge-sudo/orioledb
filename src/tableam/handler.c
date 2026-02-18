@@ -1606,30 +1606,23 @@ create_validate_iterator(OTableDescr *descr, OSnapshot *oSnapshot,
 static void
 wait_tuple_finished_for_everybody(BTreeLeafTuphdr *tupHdr)
 {
+	OXid		tupleOxid = XACT_INFO_GET_OXID(tupHdr->xactInfo);
+
 	while (true)
 	{
-		OTupleXactInfo xactInfo = tupHdr->xactInfo;
-
-		if (XACT_INFO_IS_FINISHED(xactInfo))
+		if (xid_is_finished(tupleOxid))
 			break;
 
 		CHECK_FOR_INTERRUPTS();
-		wait_for_oxid(XACT_INFO_GET_OXID(xactInfo), false);
+		wait_for_oxid(tupleOxid, false);
 	}
 
+	while (!xid_is_finished_for_everybody(tupleOxid))
 	{
-		const long	initial_wait_us = 1000;
-		const long	max_wait_us = 64000;
-		long		wait_us = initial_wait_us;
+		OXid		runXmin = pg_atomic_read_u64(&xid_meta->runXmin);
 
-		/* Back off while waiting for old undo readers to disappear. */
-		while (!XACT_INFO_FINISHED_FOR_EVERYBODY(tupHdr->xactInfo))
-		{
-			CHECK_FOR_INTERRUPTS();
-			pg_usleep(wait_us);
-			if (wait_us < max_wait_us)
-				wait_us *= 2;
-		}
+		CHECK_FOR_INTERRUPTS();
+		(void) wait_for_oxid(runXmin, true);
 	}
 }
 
