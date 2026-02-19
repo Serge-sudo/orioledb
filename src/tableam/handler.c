@@ -1686,6 +1686,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 	OInMemoryBlkno lastBlkno = OInvalidInMemoryBlkno;
 	bool		scanEnd;
 	BTreeLeafTuphdr *tupHdr = NULL;
+	OTupleXactInfo tupleXactInfo = 0;
 	bool		tupleDeleted;
 	bool		iteratorReset;
 	bool		pageLocked;
@@ -1744,11 +1745,23 @@ orioledb_index_validate_scan(Relation heapRelation,
 			   o_btree_len(&GET_PRIMARY(descr)->desc, tup, OTupleLength));
 		lookupTupleValid = true;
 
-		if (!XACT_INFO_FINISHED_FOR_EVERYBODY(tupHdr->xactInfo))
+		if (tupHdr == NULL)
+		{
+			if (pageLocked)
+			{
+				unlock_page(hint.blkno);
+				pageLocked = false;
+			}
+			goto check_boundary;
+		}
+		tupleXactInfo = tupHdr->xactInfo;
+
+		if (!XACT_INFO_FINISHED_FOR_EVERYBODY(tupleXactInfo))
 		{
 			unlock_page(hint.blkno);
 			pageLocked = false;
-			wait_tuple_finished_for_everybody(tupHdr->xactInfo);
+
+			wait_tuple_finished_for_everybody(tupleXactInfo);
 
 			btree_iterator_free(iterator);
 			iterator = create_validate_iterator(descr, &oSnapshot,
@@ -1759,18 +1772,19 @@ orioledb_index_validate_scan(Relation heapRelation,
 				goto check_boundary;
 			iteratorReset = true;
 			pageLocked = true;
+
+			if (tupHdr == NULL)
+				goto check_boundary;
+			tupleXactInfo = tupHdr->xactInfo;
 		}
 
+		tupleDeleted = (tupHdr->deleted != BTreeLeafTupleNonDeleted);
 		if (pageLocked)
 		{
 			unlock_page(hint.blkno);
 			pageLocked = false;
 		}
 
-		if (tupHdr == NULL)
-			goto check_boundary;
-
-		tupleDeleted = (tupHdr->deleted != BTreeLeafTupleNonDeleted);
 		if (tupleDeleted)
 			goto check_boundary;
 
@@ -1780,7 +1794,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 						tup.data, BTreeKeyLeafTuple) != 0)
 			goto check_boundary;
 
-		tupleCsn = XACT_INFO_MAP_CSN(tupHdr->xactInfo);
+		tupleCsn = XACT_INFO_MAP_CSN(tupleXactInfo);
 		heapTuple = tup;
 
 		tts_orioledb_store_tuple(primarySlot, heapTuple, descr, tupleCsn, PrimaryIndexNumber, true, &hint);
