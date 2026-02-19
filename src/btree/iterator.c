@@ -1194,7 +1194,6 @@ validate_iterator_fetch(BTreeIterator *it, bool *scanEnd,
 		BTreePageItemLocator *loc = &context->items[context->index].locator;
 		OInMemoryBlkno blkno = context->items[context->index].blkno;
 		Page		img = O_GET_IN_MEMORY_PAGE(blkno);
-		OFindPageResult findResult;
 
 		if (BTREE_PAGE_LOCATOR_IS_VALID(img, loc))
 		{
@@ -1217,16 +1216,34 @@ validate_iterator_fetch(BTreeIterator *it, bool *scanEnd,
 			return result;
 		}
 
-		copy_fixed_hikey(desc, &key_buf, img);
-		if (O_TUPLE_IS_NULL(key_buf.tuple))
 		{
-			*scanEnd = true;
-			O_TUPLE_SET_NULL(result);
-			return result;
+			uint64		rightlink = BTREE_PAGE_GET_RIGHTLINK(img);
+			OInMemoryBlkno nextBlkno = RIGHTLINK_GET_BLKNO(rightlink);
+			uint32		nextChangeCount = RIGHTLINK_GET_CHANGECOUNT(rightlink);
+
+			if (OInMemoryBlknoIsValid(nextBlkno))
+			{
+				Page		nextImg;
+
+				lock_page(nextBlkno);
+				nextImg = O_GET_IN_MEMORY_PAGE(nextBlkno);
+				if (O_PAGE_GET_CHANGE_COUNT(nextImg) == nextChangeCount)
+				{
+					context->items[context->index].blkno = nextBlkno;
+					context->items[context->index].pageChangeCount = nextChangeCount;
+					BTREE_PAGE_LOCATOR_FIRST(nextImg, loc);
+					unlock_page(blkno);
+					continue;
+				}
+				unlock_page(nextBlkno);
+			}
 		}
+
+		copy_fixed_hikey(desc, &key_buf, img);
 		unlock_page(blkno);
-		findResult = find_page(context, &key_buf, BTreeKeyNonLeafKey, 0);
-		if (findResult != OFindPageResultSuccess)
+
+		if (O_TUPLE_IS_NULL(key_buf.tuple) ||
+			find_page(context, &key_buf, BTreeKeyNonLeafKey, 0) != OFindPageResultSuccess)
 		{
 			/* Could not safely step to sibling page, stop validation scan. */
 			*scanEnd = true;
