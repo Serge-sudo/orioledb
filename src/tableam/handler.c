@@ -1604,9 +1604,13 @@ create_validate_iterator(OTableDescr *descr, OSnapshot *oSnapshot,
 }
 
 static void
-wait_tuple_finished_for_everybody(BTreeLeafTuphdr *tupHdr)
+wait_tuple_finished_for_everybody(OTupleXactInfo xactInfo)
 {
-	OXid		tupleOxid = XACT_INFO_GET_OXID(tupHdr->xactInfo);
+	/*
+	 * Use xactInfo snapshot value, so caller can safely release page lock
+	 * before this wait.
+	 */
+	OXid		tupleOxid = XACT_INFO_GET_OXID(xactInfo);
 
 	while (true)
 	{
@@ -1684,6 +1688,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 	BTreeLeafTuphdr *tupHdr = NULL;
 	bool		tupleDeleted;
 	bool		iteratorReset;
+	bool		pageLocked;
 	bool		lookupTupleValid = false;
 
 	Assert(state != NULL);
@@ -1723,6 +1728,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 		oslot = (OTableSlot *) primarySlot;
 		O_TUPLE_SET_NULL(heapTuple);
 		iteratorReset = false;
+		pageLocked = false;
 		lookupTupleValid = false;
 
 		/* Fetch next tuple from current page without undo chain traversal */
@@ -1730,6 +1736,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 
 		if (scanEnd)
 			break;
+		pageLocked = true;
 
 		lookupTuple.formatFlags = tup.formatFlags;
 		lookupTuple.data = palloc(o_btree_len(&GET_PRIMARY(descr)->desc, tup, OTupleLength));
@@ -1740,7 +1747,8 @@ orioledb_index_validate_scan(Relation heapRelation,
 		if (!XACT_INFO_FINISHED_FOR_EVERYBODY(tupHdr->xactInfo))
 		{
 			unlock_page(hint.blkno);
-			wait_tuple_finished_for_everybody(tupHdr);
+			pageLocked = false;
+			wait_tuple_finished_for_everybody(tupHdr->xactInfo);
 
 			btree_iterator_free(iterator);
 			iterator = create_validate_iterator(descr, &oSnapshot,
@@ -1750,6 +1758,13 @@ orioledb_index_validate_scan(Relation heapRelation,
 			if (scanEnd)
 				goto check_boundary;
 			iteratorReset = true;
+			pageLocked = true;
+		}
+
+		if (pageLocked)
+		{
+			unlock_page(hint.blkno);
+			pageLocked = false;
 		}
 
 		if (tupHdr == NULL)
