@@ -1691,6 +1691,8 @@ orioledb_index_validate_scan(Relation heapRelation,
 	bool		iteratorReset;
 	bool		pageLocked;
 	bool		lookupTupleValid = false;
+	bool		needIteratorReset = false;
+	TM_FailureData tmfd;
 
 	Assert(state != NULL);
 	Assert(state->tuplesort != NULL);
@@ -1731,6 +1733,18 @@ orioledb_index_validate_scan(Relation heapRelation,
 		iteratorReset = false;
 		pageLocked = false;
 		lookupTupleValid = false;
+
+		/*
+		 * If the previous iteration unlocked the page (e.g. for tuple lock +
+		 * index_insert), we must reset the iterator so it re-finds and locks
+		 * the current page before fetching the next tuple.
+		 */
+		if (needIteratorReset)
+		{
+			needIteratorReset = false;
+			btree_iterator_free(iterator);
+			iterator = create_validate_iterator(descr, &oSnapshot, NULL, BTreeKeyNone);
+		}
 
 		/* Fetch next tuple from current page without undo chain traversal */
 		tup = validate_iterator_fetch(iterator, &scanEnd, &hint, &tupHdr);
@@ -1779,20 +1793,40 @@ orioledb_index_validate_scan(Relation heapRelation,
 		}
 
 		tupleDeleted = (tupHdr->deleted != BTreeLeafTupleNonDeleted);
-		if (pageLocked)
-		{
-			unlock_page(hint.blkno);
-			pageLocked = false;
-		}
 
 		if (tupleDeleted)
+		{
+			if (pageLocked)
+			{
+				unlock_page(hint.blkno);
+				pageLocked = false;
+			}
 			goto check_boundary;
+		}
 
 		if (iteratorReset && lookupTupleValid &&
 			o_btree_cmp(&GET_PRIMARY(descr)->desc,
 						lookupTuple.data, BTreeKeyLeafTuple,
 						tup.data, BTreeKeyLeafTuple) != 0)
+		{
+			if (pageLocked)
+			{
+				unlock_page(hint.blkno);
+				pageLocked = false;
+			}
 			goto check_boundary;
+		}
+
+		/*
+		 * Unlock the page before storing tuple into slot and doing index work.
+		 * We snapshot xactInfo/deleted state above while page was locked.
+		 * For index_insert (cmp > 0) we will additionally lock the tuple first.
+		 */
+		if (pageLocked)
+		{
+			unlock_page(hint.blkno);
+			pageLocked = false;
+		}
 
 		tupleCsn = XACT_INFO_MAP_CSN(tupleXactInfo);
 		heapTuple = tup;
@@ -1840,12 +1874,30 @@ orioledb_index_validate_scan(Relation heapRelation,
 			if (indexDone)
 			{
 				/*
-				 * No more tuples in secondary index. 
-				 * Insert missing tuple into secondary index.
+				 * No more tuples in secondary index.
+				 * Lock the tuple, recheck, then insert into secondary index.
 				 */
-				if (index_insert(indexRelation, values, isnull, heapRowIdDatum,
-								 heapRelation, checkUnique, false, indexInfo))
-					state->tups_inserted++;
+				TM_Result	lockResult;
+
+				lockResult = orioledb_tuple_lock(heapRelation, heapRowIdDatum,
+												 SnapshotAny, primarySlot,
+												 GetCurrentCommandId(false),
+												 LockTupleNoKeyExclusive,
+												 LockWaitBlock, 0, &tmfd);
+
+				if (lockResult == TM_Ok)
+				{
+					slot_getallattrs(primarySlot);
+					FormIndexDatum(indexInfo, primarySlot, estate, values, isnull);
+					heapRowIdDatum = slot_getsysattr(primarySlot, RowIdAttributeNumber, &rowIdIsNull);
+					Assert(!rowIdIsNull);
+
+					if (index_insert(indexRelation, values, isnull, heapRowIdDatum,
+									 heapRelation, checkUnique, false, indexInfo))
+						state->tups_inserted++;
+				}
+
+				needIteratorReset = true;
 				break;
 			}
 
@@ -1959,11 +2011,37 @@ orioledb_index_validate_scan(Relation heapRelation,
 			{
 				/*
 				 * Heap has a tuple that secondary index doesn't have.
-				 * Insert the missing tuple into secondary index.
+				 * Lock the tuple before inserting into secondary index,
+				 * then recheck that the tuple hasn't changed.
 				 */
-				if (index_insert(indexRelation, values, isnull, heapRowIdDatum,
-								 heapRelation, checkUnique, false, indexInfo))
-					state->tups_inserted++;
+				TM_Result	lockResult;
+
+				lockResult = orioledb_tuple_lock(heapRelation, heapRowIdDatum,
+												 SnapshotAny, primarySlot,
+												 GetCurrentCommandId(false),
+												 LockTupleNoKeyExclusive,
+												 LockWaitBlock, 0, &tmfd);
+
+				if (lockResult == TM_Ok)
+				{
+					/*
+					 * Tuple locked successfully.  Recheck that the tuple is
+					 * still valid (not deleted/modified since we read it).
+					 */
+					slot_getallattrs(primarySlot);
+
+					/* Re-derive index values from the locked tuple */
+					FormIndexDatum(indexInfo, primarySlot, estate, values, isnull);
+					heapRowIdDatum = slot_getsysattr(primarySlot, RowIdAttributeNumber, &rowIdIsNull);
+					Assert(!rowIdIsNull);
+
+					if (index_insert(indexRelation, values, isnull, heapRowIdDatum,
+									 heapRelation, checkUnique, false, indexInfo))
+						state->tups_inserted++;
+				}
+				/* If lock failed (deleted/modified), skip this tuple */
+
+				needIteratorReset = true;
 			}
 			else
 			{
