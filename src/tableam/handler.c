@@ -1726,7 +1726,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 		lookupTupleValid = false;
 
 		/* Fetch next tuple from current page without undo chain traversal */
-		tup = btree_iterate_all(iterator, NULL, BTreeKeyNone, false, &scanEnd, &hint, &tupHdr);
+		tup = validate_iterator_fetch(iterator, &scanEnd, &hint, &tupHdr);
 
 		if (scanEnd)
 			break;
@@ -1746,7 +1746,7 @@ orioledb_index_validate_scan(Relation heapRelation,
 			iterator = create_validate_iterator(descr, &oSnapshot,
 												lookupTuple.data,
 												BTreeKeyLeafTuple);
-			tup = btree_iterate_all(iterator, NULL, BTreeKeyNone, false, &scanEnd, &hint, &tupHdr);
+			tup = validate_iterator_fetch(iterator, &scanEnd, &hint, &tupHdr);
 			if (scanEnd)
 				goto check_boundary;
 			iteratorReset = true;

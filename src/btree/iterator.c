@@ -1172,6 +1172,70 @@ btree_iterate_all(BTreeIterator *it, void *end, BTreeKeyType endKind,
 									  hint, false, tupHdr);
 }
 
+OTuple
+validate_iterator_fetch(BTreeIterator *it, bool *scanEnd,
+						BTreeLocationHint *hint, BTreeLeafTuphdr **tupHdr)
+{
+	OBTreeFindPageContext *context = &it->context;
+	BTreeDescr *desc = context->desc;
+	BTreeLeafTuphdr *localTupHdr;
+	OTuple		result;
+	OFixedKey	key_buf;
+
+	Assert(BTREE_PAGE_FIND_IS(context, MODIFY));
+	Assert(IT_IS_FORWARD(it));
+
+	if (!tupHdr)
+		tupHdr = &localTupHdr;
+
+	*scanEnd = false;
+	while (true)
+	{
+		BTreePageItemLocator *loc = &context->items[context->index].locator;
+		OInMemoryBlkno blkno = context->items[context->index].blkno;
+		Page		img = O_GET_IN_MEMORY_PAGE(blkno);
+		OFindPageResult findResult;
+
+		if (BTREE_PAGE_LOCATOR_IS_VALID(img, loc))
+		{
+			BTREE_PAGE_READ_LEAF_ITEM(*tupHdr, result, img, loc);
+			BTREE_PAGE_LOCATOR_NEXT(img, loc);
+
+			if (hint)
+			{
+				hint->blkno = blkno;
+				hint->pageChangeCount = context->items[context->index].pageChangeCount;
+			}
+			return result;
+		}
+
+		if (O_PAGE_IS(img, RIGHTMOST))
+		{
+			unlock_page(blkno);
+			*scanEnd = true;
+			O_TUPLE_SET_NULL(result);
+			return result;
+		}
+
+		copy_fixed_hikey(desc, &key_buf, img);
+		if (O_TUPLE_IS_NULL(key_buf.tuple))
+		{
+			*scanEnd = true;
+			O_TUPLE_SET_NULL(result);
+			return result;
+		}
+		unlock_page(blkno);
+		findResult = find_page(context, &key_buf, BTreeKeyNonLeafKey, 0);
+		if (findResult != OFindPageResultSuccess)
+		{
+			/* Could not safely step to sibling page, stop validation scan. */
+			*scanEnd = true;
+			O_TUPLE_SET_NULL(result);
+			return result;
+		}
+	}
+}
+
 /*
  * Fills basic fields of undo iterator
  */
