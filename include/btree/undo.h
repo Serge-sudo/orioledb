@@ -160,6 +160,11 @@ extern void lock_undo_callback(UndoLogType undoType, UndoLocation location,
 							   UndoStackItem *baseItem,
 							   OXid oxid, bool abort,
 							   bool changeCountsValid);
+extern void o_btree_release_row_lock(BTreeDescr *desc, OTuple key, OXid oxid);
+extern void clean_chain_has_locks_flag(UndoLogType undoType,
+									   UndoLocation location,
+									   BTreeLeafTuphdr *pageTuphdr,
+									   OInMemoryBlkno blkno);
 extern void secondary_index_undo_callback(UndoLogType undoType,
 										  UndoLocation location,
 										  UndoStackItem *baseItem,

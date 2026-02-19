@@ -1895,6 +1895,10 @@ orioledb_index_validate_scan(Relation heapRelation,
 					if (index_insert(indexRelation, values, isnull, heapRowIdDatum,
 									 heapRelation, checkUnique, false, indexInfo))
 						state->tups_inserted++;
+
+					/* Release the tuple lock */
+					o_btree_release_row_lock(&GET_PRIMARY(descr)->desc,
+											 heapTuple, get_current_oxid());
 				}
 
 				needIteratorReset = true;
@@ -2038,8 +2042,11 @@ orioledb_index_validate_scan(Relation heapRelation,
 					if (index_insert(indexRelation, values, isnull, heapRowIdDatum,
 									 heapRelation, checkUnique, false, indexInfo))
 						state->tups_inserted++;
+
+					/* Release the tuple lock */
+					o_btree_release_row_lock(&GET_PRIMARY(descr)->desc,
+											 heapTuple, get_current_oxid());
 				}
-				/* If lock failed (deleted/modified), skip this tuple */
 
 				needIteratorReset = true;
 			}

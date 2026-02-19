@@ -38,10 +38,7 @@
 #include "utils/inval.h"
 #include "utils/wait_event.h"
 
-static void clean_chain_has_locks_flag(UndoLogType undoType,
-									   UndoLocation location,
-									   BTreeLeafTuphdr *pageTuphdr,
-									   OInMemoryBlkno blkno);
+/* Forward declaration removed - now exported via header */
 
 /*
  * Add page image to the undo log.
@@ -908,6 +905,112 @@ lock_undo_callback(UndoLogType undoType, UndoLocation location,
 	unlock_page(blkno);
 }
 
+/*
+ * Release a row lock held by the current transaction on a tuple identified
+ * by key in the given btree.  This walks the tuple header undo chain and
+ * removes the most recent lock-only record for our oxid, mirroring what
+ * lock_undo_callback does on abort.
+ */
+void
+o_btree_release_row_lock(BTreeDescr *desc, OTuple key, OXid oxid)
+{
+	Page		p;
+	int			cmp;
+	OInMemoryBlkno blkno;
+	BTreeLeafTuphdr *page_tuphdr,
+				tuphdr;
+	BTreePageItemLocator *locptr;
+	OBTreeFindPageContext context;
+	UndoLocation tuphdrUndoLocation,
+				lastLockOnlyUndoLocation = InvalidUndoLocation;
+	OFindPageResult findResult;
+
+	o_btree_load_shmem(desc);
+	init_page_find_context(&context, desc, COMMITSEQNO_INPROGRESS, BTREE_PAGE_FIND_MODIFY);
+
+	findResult = refind_page(&context, (Pointer) &key,
+							 BTreeKeyNonLeafKey, 0, InvalidInMemoryBlkno,
+							 InvalidOPageChangeCount);
+
+	if (findResult != OFindPageResultSuccess)
+		return;
+
+	blkno = context.items[context.index].blkno;
+	p = O_GET_IN_MEMORY_PAGE(blkno);
+	locptr = &context.items[context.index].locator;
+
+	if (BTREE_PAGE_LOCATOR_GET_OFFSET(p, locptr) < BTREE_PAGE_ITEMS_COUNT(p))
+	{
+		OTuple		leafTup;
+
+		BTREE_PAGE_READ_TUPLE(leafTup, p, locptr);
+		cmp = o_btree_cmp(desc, &key, BTreeKeyNonLeafKey, &leafTup, BTreeKeyLeafTuple);
+	}
+	else
+		cmp = 1;
+
+	if (cmp != 0)
+	{
+		unlock_page(blkno);
+		return;
+	}
+
+	page_tuphdr = (BTreeLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(p, locptr);
+	tuphdr = *page_tuphdr;
+	tuphdrUndoLocation = InvalidUndoLocation;
+
+	while (!XACT_INFO_IS_FINISHED(tuphdr.xactInfo) || tuphdr.chainHasLocks)
+	{
+		bool		delete_record = false;
+		UndoLocation undoLocation = tuphdr.undoLocation;
+		BTreeLeafTuphdr prev_tuphdr = tuphdr;
+
+		if (!UndoLocationIsValid(undoLocation))
+			break;
+		if (!UNDO_REC_EXISTS(desc->undoType, undoLocation))
+			break;
+		get_prev_leaf_header_from_undo(desc->undoType, &prev_tuphdr, false);
+
+		if (XACT_INFO_IS_LOCK_ONLY(tuphdr.xactInfo) && XACT_INFO_GET_OXID(tuphdr.xactInfo) == oxid)
+			delete_record = true;
+
+		if (delete_record)
+		{
+			if (!tuphdr.chainHasLocks &&
+				XACT_INFO_IS_LOCK_ONLY(tuphdr.xactInfo))
+				clean_chain_has_locks_flag(desc->undoType,
+										   lastLockOnlyUndoLocation,
+										   page_tuphdr, blkno);
+
+			if (!UndoLocationIsValid(tuphdrUndoLocation))
+			{
+				page_block_reads(blkno);
+				page_tuphdr->xactInfo = prev_tuphdr.xactInfo;
+				page_tuphdr->undoLocation = prev_tuphdr.undoLocation;
+				page_tuphdr->chainHasLocks = prev_tuphdr.chainHasLocks;
+				MARK_DIRTY(desc, blkno);
+			}
+			else
+			{
+				tuphdr.xactInfo = prev_tuphdr.xactInfo;
+				tuphdr.undoLocation = prev_tuphdr.undoLocation;
+				tuphdr.chainHasLocks = prev_tuphdr.chainHasLocks;
+				update_leaf_header_in_undo(desc->undoType, &tuphdr,
+										   tuphdrUndoLocation);
+			}
+			unlock_page(blkno);
+			return;
+		}
+
+		if (XACT_INFO_IS_LOCK_ONLY(tuphdr.xactInfo))
+			lastLockOnlyUndoLocation = tuphdrUndoLocation;
+
+		tuphdr = prev_tuphdr;
+		tuphdrUndoLocation = undoLocation;
+	}
+	unlock_page(blkno);
+}
+
 #define PENDING_TRUNCATES_FILENAME (ORIOLEDB_DATA_DIR "/pending_truncates")
 
 static void
@@ -1423,7 +1526,7 @@ make_merge_undo_image(BTreeDescr *desc, Pointer left,
 /*
  * Clean `chainHasLocks` flag on given and previous undo locations.
  */
-static void
+void
 clean_chain_has_locks_flag(UndoLogType undoType, UndoLocation location,
 						   BTreeLeafTuphdr *pageTuphdr, OInMemoryBlkno blkno)
 {
