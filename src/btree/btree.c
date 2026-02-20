@@ -671,7 +671,12 @@ btree_pk_bound_satisfies_validation_boundary(BTreeDescr *desc, void *key,
 	boundary.data = boundaryData;
 	boundary.formatFlags = 0;
 
-	/* Compare PK with boundary */
+	/*
+	 * Compare PK with boundary.  The boundary is always stored in
+	 * BTreeKeyNonLeafKey format (set from a primary index tuple), while the
+	 * input key can be of any supported type.  The comparator handles
+	 * cross-type comparisons (e.g. BTreeKeyBound vs BTreeKeyNonLeafKey).
+	 */
 	cmp = o_btree_cmp(desc, key, keyType,
 					  boundary.data, BTreeKeyNonLeafKey);
 

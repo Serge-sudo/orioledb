@@ -1271,8 +1271,14 @@ o_btree_insert_unique(BTreeDescr *desc, OTuple tuple, BTreeKeyType tupleType,
 	 * index anyway (handled in o_btree_modify_insert_update).  So skip the
 	 * unique check entirely and report success.  The validation process will
 	 * detect any violations later.
+	 *
+	 * o_get_last_pk_satisfies_boundary() returns the cached result from the
+	 * primary index modification that was just performed for this same table.
+	 * We additionally verify that a validation boundary exists for this
+	 * specific primary index to avoid acting on stale global state.
 	 */
 	if (primaryDesc != NULL && desc->type != oIndexPrimary &&
+		btree_has_validation_boundary(primaryDesc) &&
 		!o_get_last_pk_satisfies_boundary())
 		return OBTreeModifyResultInserted;
 
