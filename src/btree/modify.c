@@ -18,6 +18,7 @@
 #include "btree/find.h"
 #include "btree/insert.h"
 #include "btree/io.h"
+#include "btree/iterator.h"
 #include "btree/merge.h"
 #include "btree/modify.h"
 #include "btree/page_chunks.h"
@@ -25,6 +26,8 @@
 #include "catalog/o_tables.h"
 #include "recovery/recovery.h"
 #include "recovery/wal.h"
+#include "tableam/descr.h"
+#include "tableam/tree.h"
 #include "transam/undo.h"
 #include "transam/oxid.h"
 #include "utils/page_pool.h"
@@ -1242,7 +1245,8 @@ o_btree_insert_unique(BTreeDescr *desc, OTuple tuple, BTreeKeyType tupleType,
 					  Pointer key, BTreeKeyType keyType,
 					  OXid opOxid, CommitSeqNo opCsn,
 					  RowLockMode lockMode, BTreeLocationHint *hint,
-					  BTreeModifyCallbackInfo *callbackInfo)
+					  BTreeModifyCallbackInfo *callbackInfo,
+					  BTreeDescr *primaryDesc)
 {
 	OBTreeFindPageContext pageFindContext;
 	int			pageReserveKind;
@@ -1260,6 +1264,23 @@ o_btree_insert_unique(BTreeDescr *desc, OTuple tuple, BTreeKeyType tupleType,
 	STOPEVENT(STOPEVENT_MODIFY_START, params);
 
 	Assert(key != NULL && keyType == BTreeKeyBound);
+
+	/*
+	 * For secondary indexes during concurrent index build, if our PK is after
+	 * the validation boundary, we are not going to insert into the secondary
+	 * index anyway (handled in o_btree_modify_insert_update).  So skip the
+	 * unique check entirely and report success.  The validation process will
+	 * detect any violations later.
+	 *
+	 * o_get_last_pk_satisfies_boundary() returns the cached result from the
+	 * primary index modification that was just performed for this same table.
+	 * We additionally verify that a validation boundary exists for this
+	 * specific primary index to avoid acting on stale global state.
+	 */
+	if (primaryDesc != NULL && desc->type != oIndexPrimary &&
+		btree_has_validation_boundary(primaryDesc) &&
+		!o_get_last_pk_satisfies_boundary())
+		return OBTreeModifyResultInserted;
 
 	reserve_undo_for_modification(desc->undoType);
 
@@ -1341,6 +1362,58 @@ retry:
 			{
 				OBTreeModifyCallbackAction cbAction PG_USED_FOR_ASSERTS_ONLY;
 
+				/*
+				 * During concurrent index build on a secondary index, check
+				 * the existing duplicate's PK against the validation boundary.
+				 */
+				if (primaryDesc != NULL && desc->type != oIndexPrimary &&
+					!XACT_INFO_OXID_EQ(xactInfo, opOxid) &&
+					btree_has_validation_boundary(primaryDesc))
+				{
+					OBTreeKeyBound pkBound;
+
+					o_fill_pindex_tuple_key_bound(desc, curTuple, &pkBound);
+
+					if (!btree_pk_bound_satisfies_validation_boundary(
+							primaryDesc, (void *) &pkBound, BTreeKeyBound))
+					{
+						/*
+						 * Existing duplicate's PK is after the validation
+						 * boundary.  We cannot rely on the validation process
+						 * as the boundary may have already moved.  Perform a
+						 * manual check by looking up the PK in the primary
+						 * index.
+						 */
+						OTuple		pkTuple;
+
+						unlock_page(blkno);
+						LWLockRelease(uniqueLock);
+
+						o_btree_load_shmem(primaryDesc);
+						pkTuple = o_btree_find_tuple_by_key(primaryDesc,
+															(Pointer) &pkBound,
+															BTreeKeyBound,
+															&o_in_progress_snapshot,
+															NULL,
+															CurrentMemoryContext,
+															NULL);
+
+						if (O_TUPLE_IS_NULL(pkTuple))
+						{
+							/* PK tuple not found, not a real violation */
+							findResult = refind_page(&pageFindContext, key,
+													 BTreeKeyUniqueLowerBound, 0,
+													 blkno, pageChangeCount);
+							Assert(findResult == OFindPageResultSuccess);
+							goto retry;
+						}
+
+						pfree(pkTuple.data);
+						return OBTreeModifyResultFound;
+					}
+					/* PK is before boundary - definitely a violation */
+				}
+
 				if (callbackInfo->modifyCallback)
 				{
 					cbAction = callbackInfo->modifyCallback(desc,
@@ -1420,6 +1493,56 @@ retry:
 			if (XACT_INFO_OXID_EQ(xactInfo, opOxid) || XACT_INFO_IS_FINISHED(xactInfo))
 			{
 				OBTreeModifyCallbackAction cbAction PG_USED_FOR_ASSERTS_ONLY;
+
+				/*
+				 * During concurrent index build on a secondary index, check
+				 * the existing duplicate's PK against the validation boundary.
+				 */
+				if (primaryDesc != NULL && desc->type != oIndexPrimary &&
+					!XACT_INFO_OXID_EQ(xactInfo, opOxid) &&
+					btree_has_validation_boundary(primaryDesc))
+				{
+					OBTreeKeyBound pkBound;
+
+					o_fill_pindex_tuple_key_bound(desc, curTuple, &pkBound);
+
+					if (!btree_pk_bound_satisfies_validation_boundary(
+							primaryDesc, (void *) &pkBound, BTreeKeyBound))
+					{
+						/*
+						 * Existing duplicate's PK is after the validation
+						 * boundary.  Perform manual check by looking up the
+						 * PK in the primary index.
+						 */
+						OTuple		pkTuple;
+
+						LWLockRelease(uniqueLock);
+
+						o_btree_load_shmem(primaryDesc);
+						pkTuple = o_btree_find_tuple_by_key(primaryDesc,
+															(Pointer) &pkBound,
+															BTreeKeyBound,
+															&o_in_progress_snapshot,
+															NULL,
+															CurrentMemoryContext,
+															NULL);
+
+						if (O_TUPLE_IS_NULL(pkTuple))
+						{
+							/* PK tuple not found, not a real violation */
+							BTREE_PAGE_FIND_SET(&pageFindContext, MODIFY);
+							findResult = refind_page(&pageFindContext, key,
+													 BTreeKeyUniqueLowerBound, 0,
+													 blkno, pageChangeCount);
+							Assert(findResult == OFindPageResultSuccess);
+							goto retry;
+						}
+
+						pfree(pkTuple.data);
+						return OBTreeModifyResultFound;
+					}
+					/* PK is before boundary - definitely a violation */
+				}
 
 				if (callbackInfo->modifyCallback)
 				{

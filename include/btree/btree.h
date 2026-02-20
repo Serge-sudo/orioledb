@@ -390,6 +390,8 @@ extern void btree_set_validation_boundary(BTreeDescr *desc, OTuple boundary);
 extern bool btree_get_validation_boundary(BTreeDescr *desc, OTuple *boundary);
 extern void btree_clear_validation_boundary(BTreeDescr *desc);
 extern bool btree_pk_satisfies_validation_boundary(BTreeDescr *desc, OTuple pk);
+extern bool btree_pk_bound_satisfies_validation_boundary(BTreeDescr *desc, void *key, BTreeKeyType keyType);
+extern bool btree_has_validation_boundary(BTreeDescr *desc);
 extern bool btree_index_is_ready_not_valid(Relation indexRel);
 
 #endif							/* __BTREE_H__ */

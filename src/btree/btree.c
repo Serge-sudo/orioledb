@@ -623,6 +623,96 @@ btree_pk_satisfies_validation_boundary(BTreeDescr *desc, OTuple pk)
 }
 
 /*
+ * Check if a primary key bound satisfies the validation boundary.
+ * Similar to btree_pk_satisfies_validation_boundary, but accepts
+ * a key of any BTreeKeyType instead of an OTuple.
+ * Returns true if:
+ * - No validation is in progress (boundary not set), OR
+ * - The PK is less than or equal to the boundary
+ * Returns false if PK is greater than the boundary.
+ */
+bool
+btree_pk_bound_satisfies_validation_boundary(BTreeDescr *desc, void *key,
+											 BTreeKeyType keyType)
+{
+	ValidationBoundaryEntry *entry;
+	OTuple		boundary;
+	char		boundaryData[O_BTREE_MAX_KEY_SIZE];
+	uint16		boundaryLen;
+	int			cmp;
+
+	Assert(desc != NULL);
+	Assert(key != NULL);
+	Assert(validation_boundary_htab != NULL);
+	Assert(validation_boundary_lock != NULL);
+
+	/* Acquire single global lock */
+	LWLockAcquire(validation_boundary_lock, LW_SHARED);
+
+	/* Look up entry in hash table */
+	entry = (ValidationBoundaryEntry *) hash_search(validation_boundary_htab,
+													&desc->oids,
+													HASH_FIND,
+													NULL);
+
+	if (entry == NULL)
+	{
+		/* No validation in progress */
+		LWLockRelease(validation_boundary_lock);
+		return true;
+	}
+
+	/* Copy boundary to local buffer to minimize lock hold time */
+	boundaryLen = entry->tupleLen;
+	memcpy(boundaryData, entry->tupleData, boundaryLen);
+
+	LWLockRelease(validation_boundary_lock);
+
+	boundary.data = boundaryData;
+	boundary.formatFlags = 0;
+
+	/*
+	 * Compare PK with boundary.  The boundary is always stored in
+	 * BTreeKeyNonLeafKey format (set from a primary index tuple), while the
+	 * input key can be of any supported type.  The comparator handles
+	 * cross-type comparisons (e.g. BTreeKeyBound vs BTreeKeyNonLeafKey).
+	 */
+	cmp = o_btree_cmp(desc, key, keyType,
+					  boundary.data, BTreeKeyNonLeafKey);
+
+	/* Return true if PK <= boundary */
+	return (cmp <= 0);
+}
+
+/*
+ * Check if a validation boundary is set for the given primary index.
+ * Returns true if a boundary is currently set, false otherwise.
+ */
+bool
+btree_has_validation_boundary(BTreeDescr *desc)
+{
+	ValidationBoundaryEntry *entry;
+	bool		result;
+
+	Assert(desc != NULL);
+	Assert(validation_boundary_htab != NULL);
+	Assert(validation_boundary_lock != NULL);
+
+	LWLockAcquire(validation_boundary_lock, LW_SHARED);
+
+	entry = (ValidationBoundaryEntry *) hash_search(validation_boundary_htab,
+													&desc->oids,
+													HASH_FIND,
+													NULL);
+
+	result = (entry != NULL);
+
+	LWLockRelease(validation_boundary_lock);
+
+	return result;
+}
+
+/*
  * Check if an index is "ready but not valid" by querying pg_index.
  * This indicates the index is being built concurrently.
  *
