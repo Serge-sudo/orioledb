@@ -1106,7 +1106,8 @@ o_update_secondary_index(OIndexDescr *id,
 			res.success = o_btree_insert_unique(&id->desc, new_ix_tup, BTreeKeyLeafTuple,
 												(Pointer) &new_key, BTreeKeyBound,
 												oxid, csn, RowLockUpdate,
-												NULL, &callbackInfo) == OBTreeModifyResultInserted;
+												NULL, &callbackInfo,
+												NULL) == OBTreeModifyResultInserted;
 
 		if (!res.success)
 			res.action = BTreeOperationInsert;
@@ -1485,7 +1486,8 @@ o_tbl_index_insert(OTableDescr *descr,
 		result = o_btree_insert_unique(bd, tup, BTreeKeyLeafTuple,
 									   (Pointer) &knew, BTreeKeyBound,
 									   oxid, csn, RowLockUpdate,
-									   NULL, callbackInfo);
+									   NULL, callbackInfo,
+									   &GET_PRIMARY(descr)->desc);
 
 	((OTableSlot *) slot)->version = o_tuple_get_version(tup);
 
