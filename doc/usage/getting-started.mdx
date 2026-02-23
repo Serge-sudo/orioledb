@@ -242,11 +242,11 @@ OrioleDB is currently in the development stage. Therefore it has the following t
 5.  OrioleDB supports bitmap scan only for int4, int8 and ctid primary keys.
 6.  Row-level concurrency in OrioleDB has some [differences](../architecture/row-level-concurrency.mdx).
 7.  OrioleDB doesn't support `CLUSTER` and `VACUUM FULL` commands yet, because we don't implement rewrite of the tables for these commands. And also `CLUSTER` doesn't really makes much sense for index-organized tables.
-8.  `REINDEX CONCURRENTLY` now is not supported.
+8.  `CREATE INDEX CONCURRENTLY` is not supported. `REINDEX CONCURRENTLY` is not supported (falls back to regular `REINDEX` with a warning, or raises an error when `orioledb.strict_mode` is `on`). See [concurrent index creation](concurrent-index.mdx) for details.
 9.  OrioleDB tables don't support `Sample Scans` yet.
 10. OrioleDB tables don't support SERIALIZABLE isolation level.
 11. Backward fetches from a cursor is supported only when the cursor is declared with `SCROLL`.
 
 ## Links
 
-See [description of OrioleDB's settings](configuration.mdx), [experimental decoupled storage and compute mode](decoupled-storage.mdx), and [experimental undo-based rewind](rewind.mdx)
+See [description of OrioleDB's settings](configuration.mdx), [concurrent index creation](concurrent-index.mdx), [experimental decoupled storage and compute mode](decoupled-storage.mdx), and [experimental undo-based rewind](rewind.mdx)

@@ -1,0 +1,133 @@
+---
+id: concurrent-index
+sidebar_label: Concurrent Index Creation
+---
+
+# Concurrent Index Creation in OrioleDB
+
+## Overview
+
+In standard PostgreSQL, `CREATE INDEX CONCURRENTLY` allows building an index without holding a lock that prevents concurrent inserts, updates, or deletes on the table. This is achieved by performing the index build in multiple passes: the table is scanned multiple times while the database continues accepting writes, and the index is made visible to queries only after it is fully consistent.
+
+OrioleDB is an index-organized storage engine — all data is stored directly inside the primary B-tree, and secondary indexes contain references into that tree. This architecture requires tight coordination between the table's data structures and its indexes during any structural change. As a result, several concurrent DDL operations work differently in OrioleDB compared to standard PostgreSQL `heap` tables.
+
+## Current Limitations
+
+### `CREATE INDEX CONCURRENTLY`
+
+`CREATE INDEX CONCURRENTLY` is **not supported** for OrioleDB tables. Attempting to use it raises an error:
+
+```sql
+CREATE TABLE blog_post (
+    id int8 NOT NULL,
+    title text NOT NULL,
+    PRIMARY KEY(id)
+) USING orioledb;
+
+CREATE INDEX CONCURRENTLY blog_post_title_idx ON blog_post(title);
+```
+
+```
+ERROR:  concurrent index creation is not supported for orioledb tables yet
+```
+
+Use the regular non-concurrent `CREATE INDEX` instead. This will take a lock on the table for the duration of the index build, which prevents concurrent writes:
+
+```sql
+-- This works and is the recommended approach currently
+CREATE INDEX blog_post_title_idx ON blog_post(title);
+```
+
+### `REINDEX CONCURRENTLY`
+
+`REINDEX CONCURRENTLY` is **not supported** for OrioleDB tables.
+
+- When `orioledb.strict_mode` is `off` (the default): a `WARNING` is issued and the command automatically falls back to a regular (non-concurrent) `REINDEX`.
+- When `orioledb.strict_mode` is `on`: an `ERROR` is raised and the command is aborted.
+
+**Default behavior (strict_mode = off):**
+
+```sql
+REINDEX INDEX CONCURRENTLY blog_post_title_idx;
+```
+
+```
+WARNING:  REINDEX CONCURRENTLY is not supported for orioledb tables yet, using a plain REINDEX instead
+REINDEX
+```
+
+**Strict mode behavior (strict_mode = on):**
+
+```sql
+-- With orioledb.strict_mode = on
+REINDEX INDEX CONCURRENTLY blog_post_title_idx;
+```
+
+```
+ERROR:  REINDEX CONCURRENTLY is not supported for orioledb tables yet
+```
+
+The standard non-concurrent `REINDEX` works without restrictions:
+
+```sql
+REINDEX INDEX blog_post_title_idx;
+REINDEX TABLE blog_post;
+```
+
+### `REFRESH MATERIALIZED VIEW CONCURRENTLY`
+
+`REFRESH MATERIALIZED VIEW CONCURRENTLY` is **not supported** for materialized views backed by OrioleDB tables.
+
+- When `orioledb.strict_mode` is `off` (the default): a `WARNING` is issued and the command falls back to a regular `REFRESH MATERIALIZED VIEW`.
+- When `orioledb.strict_mode` is `on`: an `ERROR` is raised.
+
+```sql
+REFRESH MATERIALIZED VIEW CONCURRENTLY my_matview;
+-- WARNING: REFRESH MATERIALIZED VIEW CONCURRENTLY is not supported for orioledb tables yet,
+--          using a plain REFRESH MATERIALIZED VIEW instead
+```
+
+## Why These Operations Are Not Yet Supported
+
+OrioleDB maintains its own internal metadata ("system trees") that must stay in sync with PostgreSQL's system catalogs (`pg_index`, `pg_class`). Concurrent DDL operations span multiple transactions and involve temporary intermediate index states (`indislive`, `indisready`, `indisvalid` flags). Correctly synchronizing OrioleDB's system trees across all these states while allowing concurrent writes requires significant additional engineering work that is not yet complete.
+
+Additionally, since OrioleDB tables are index-organized, every secondary index change must be carefully coordinated with the primary B-tree. This introduces constraints that do not exist for `heap` tables.
+
+## Workarounds
+
+Until concurrent index creation is supported, the recommended approach is to schedule index builds during low-traffic maintenance windows:
+
+```sql
+-- Build the index without CONCURRENTLY; this locks the table for writes
+CREATE INDEX blog_post_title_idx ON blog_post(title);
+```
+
+If downtime is not acceptable, consider using partitioned tables. Creating an index on a partition or attaching a new partition with a pre-built index can limit the lock scope to a single partition at a time.
+
+## `orioledb.strict_mode` Setting
+
+The `orioledb.strict_mode` GUC parameter controls how OrioleDB handles unsupported concurrent operations:
+
+| Value | Behavior |
+| ----- | -------- |
+| `off` (default) | Issues a `WARNING` and silently downgrades `REINDEX CONCURRENTLY` and `REFRESH MATERIALIZED VIEW CONCURRENTLY` to their non-concurrent equivalents. |
+| `on` | Raises an `ERROR` for any unsupported concurrent DDL operation, making the failure explicit. |
+
+`CREATE INDEX CONCURRENTLY` always raises an `ERROR` regardless of `strict_mode`, because there is no safe non-concurrent fallback that could be transparently substituted.
+
+To enable strict mode, add to `postgresql.conf` (requires a server restart):
+
+```
+orioledb.strict_mode = on
+```
+
+## Summary Table
+
+| Operation | OrioleDB tables | Notes |
+| --------- | --------------- | ----- |
+| `CREATE INDEX` | ✅ Supported | Locks table for writes during build |
+| `CREATE INDEX CONCURRENTLY` | ❌ Not supported | Always raises `ERROR` |
+| `REINDEX` | ✅ Supported | Works normally |
+| `REINDEX CONCURRENTLY` | ⚠️ Not supported | `WARNING` + fallback in default mode; `ERROR` in strict mode |
+| `REFRESH MATERIALIZED VIEW` | ✅ Supported | Works normally |
+| `REFRESH MATERIALIZED VIEW CONCURRENTLY` | ⚠️ Not supported | `WARNING` + fallback in default mode; `ERROR` in strict mode |
