@@ -874,6 +874,64 @@ ReindexPartitions(Oid relid, bool concurrently)
 }
 
 static void
+orioledb_vacuum_full_rel(Relation tbl, OTable *o_table)
+{
+	OSnapshot	oSnapshot;
+	OXid		oxid;
+	OTable	   *old_o_table;
+	OTableDescr *descr;
+	OTableDescr *old_descr;
+	int			ix_num;
+
+	old_o_table = o_table;
+	o_table = o_tables_get(o_table->oids);
+	assign_new_oids(o_table, tbl, false);
+
+	fill_current_oxid_osnapshot(&oxid, &oSnapshot);
+
+	o_tables_table_meta_lock(NULL);
+	old_descr = o_fetch_table_descr(old_o_table->oids);
+	recreate_o_table(old_o_table, o_table);
+	descr = o_fetch_table_descr(o_table->oids);
+	o_tablespace_cache_add_table(o_table);
+	rebuild_indices_insert_placeholders(descr);
+	o_tables_table_meta_unlock(NULL, InvalidOid);
+
+	rebuild_indices(old_o_table, old_descr, o_table, descr, false, NULL);
+
+	o_tables_rel_meta_lock(tbl);
+	for (ix_num = 0; ix_num < o_table->nindices; ix_num++)
+	{
+		int			ctid_idx_off;
+		OTableIndex *index;
+
+		ctid_idx_off = o_table->has_primary ? 0 : 1;
+		index = &o_table->indices[ix_num];
+
+		o_indices_update(o_table, ix_num + ctid_idx_off, oxid, oSnapshot.csn);
+		o_invalidate_oids(index->oids);
+		o_add_invalidate_undo_item(index->oids, O_INVALIDATE_OIDS_ON_ABORT);
+	}
+	o_tables_update(o_table, oxid, oSnapshot.csn);
+	o_tables_rel_meta_unlock(tbl, InvalidOid);
+	if (ORelOidsIsValid(old_o_table->bridge_oids))
+	{
+		o_invalidate_oids(old_o_table->bridge_oids);
+		o_add_invalidate_undo_item(old_o_table->bridge_oids, O_INVALIDATE_OIDS_ON_ABORT);
+	}
+	if (ORelOidsIsValid(o_table->bridge_oids))
+	{
+		o_invalidate_oids(o_table->bridge_oids);
+		o_add_invalidate_undo_item(o_table->bridge_oids, O_INVALIDATE_OIDS_ON_ABORT);
+	}
+	o_invalidate_oids(o_table->oids);
+	o_add_invalidate_undo_item(o_table->oids, O_INVALIDATE_OIDS_ON_ABORT);
+
+	o_table_free(old_o_table);
+	o_table_free(o_table);
+}
+
+static void
 orioledb_utility_command(PlannedStmt *pstmt,
 						 const char *queryString,
 						 bool readOnlyTree,
@@ -1117,6 +1175,8 @@ orioledb_utility_command(PlannedStmt *pstmt,
 		if (full)
 		{
 			List	   *relations = vacstmt->rels;
+			List	   *non_orioledb_rels = NIL;
+			bool		has_orioledb = false;
 
 			if (relations != NIL)
 			{
@@ -1154,12 +1214,47 @@ orioledb_utility_command(PlannedStmt *pstmt,
 
 				orioledb = is_orioledb_rel(rel);
 				if (orioledb)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("orioledb table \"%s\" does not support VACUUM FULL",
-									RelationGetRelationName(rel))),
-							errdetail("VACUUM FULL is not supported for OrioleDB tables yet."));
-				relation_close(rel, AccessShareLock);
+				{
+					ORelOids	oids;
+					OTable	   *o_table;
+
+					has_orioledb = true;
+					relation_close(rel, AccessShareLock);
+
+					if (options & VACOPT_SKIP_LOCKED)
+					{
+						if (!ConditionalLockRelationOid(vrel->oid,
+														AccessExclusiveLock))
+							continue;
+						rel = relation_open(vrel->oid, NoLock);
+					}
+					else
+					{
+						rel = relation_open(vrel->oid, AccessExclusiveLock);
+					}
+
+					ORelOidsSetFromRel(oids, rel);
+					o_table = o_tables_get(oids);
+					Assert(o_table != NULL);
+
+					orioledb_vacuum_full_rel(rel, o_table);
+					relation_close(rel,
+								   (options & VACOPT_SKIP_LOCKED) ?
+								   NoLock : AccessExclusiveLock);
+				}
+				else
+				{
+					non_orioledb_rels = lappend(non_orioledb_rels, vrel);
+					relation_close(rel, AccessShareLock);
+				}
+			}
+
+			if (has_orioledb)
+			{
+				if (non_orioledb_rels == NIL)
+					call_next = false;
+				else
+					vacstmt->rels = non_orioledb_rels;
 			}
 		}
 	}
