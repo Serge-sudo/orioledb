@@ -123,8 +123,6 @@ typedef struct LocalPagePool
 	uint32		clock_hand;		/* clock sweep hand position (bounded mode) */
 	uint8	   *usage_counts;	/* per-slot usage count array (NULL if
 								 * unbounded) */
-	File		spill_file;		/* temp file for evicted pages (-1 if
-								 * unbounded or not yet created) */
 } LocalPagePool;
 
 /* Returns true if the pool has a fixed max size with eviction support */

@@ -19,6 +19,7 @@
 #include "btree/io.h"
 #include "btree/page_contents.h"
 #include "btree/undo.h"
+#include "catalog/o_sys_cache.h"
 #include "catalog/sys_trees.h"
 #include "checkpoint/checkpoint.h"
 #include "transam/undo.h"
@@ -528,28 +529,21 @@ local_ppool_init(LocalPagePool *pool, int32 max_size)
 	pool->base.ops = &local_ppool_ops;
 
 	if (LOCAL_PPOOL_IS_BOUNDED(pool))
-	{
 		pool->usage_counts = (uint8 *) palloc0(init_size * sizeof(uint8));
-		pool->spill_file = OpenTemporaryFile(false);
-		if (pool->spill_file < 0)
-			ereport(ERROR, errmsg("Failed to create spill file for local page pool"));
-	}
 	else
-	{
 		pool->usage_counts = NULL;
-		pool->spill_file = -1;
-	}
 }
 
 /*
  * Try to evict page at slot 'slot' from the bounded local pool.
  *
- * Finds the parent's downlink in the btree, writes the page to the spill
- * file, updates the parent's downlink to MAKE_LOCAL_EVICTED_DOWNLINK, and
- * frees the in-memory slot.
+ * Finds the parent's downlink in the btree, writes the page to the BTree's
+ * own smgr file (orioledb_data/{datoid}/{relnode}), updates the parent's
+ * downlink to MAKE_LOCAL_EVICTED_DOWNLINK, and frees the in-memory slot.
  *
  * Returns true if eviction succeeded, false if the page cannot be evicted
- * (e.g. it is the root/meta page, or the btree descriptor is unavailable).
+ * (e.g. it is a non-leaf page, the root/meta page, or the btree descriptor
+ * is unavailable).
  */
 static bool
 local_ppool_evict_page(LocalPagePool *local_pool, uint32 slot)
@@ -562,6 +556,8 @@ local_ppool_evict_page(LocalPagePool *local_pool, uint32 slot)
 	OFindPageResult findResult;
 	Page		parent_page;
 	BTreeNonLeafTuphdr *int_hdr;
+	FileExtent	extent;
+	uint64		disk_downlink;
 
 	/* Skip uninitialized slots */
 	if (p == NULL || !ORelOidsIsValid(page_desc->oids))
@@ -632,18 +628,51 @@ local_ppool_evict_page(LocalPagePool *local_pool, uint32 slot)
 		return false;
 
 	/*
-	 * Write the page content to the spill file at offset slot *
-	 * ORIOLEDB_BLCKSZ.
+	 * Ensure the BTree's smgr file infrastructure is set up.  For
+	 * BTreeStorageInMemory trees this is normally never done, but we need it
+	 * to write evicted pages to orioledb_data/{datoid}/{relnode}.
+	 *
+	 * In S3 mode, btree_open_smgr() initializes smgr.hash; in non-S3 mode
+	 * it initializes smgr.array.files.  Use the non-S3 null-check to detect
+	 * whether smgr has been initialized yet.  When S3 mode is enabled, the
+	 * hash table is always initialized by btree_open_smgr, so re-calling is
+	 * harmless (the function is idempotent for the array case).
 	 */
-	if (FileWrite(local_pool->spill_file, (char *) p, ORIOLEDB_BLCKSZ,
-				  (off_t) slot * ORIOLEDB_BLCKSZ,
-				  WAIT_EVENT_DATA_FILE_WRITE) != ORIOLEDB_BLCKSZ)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not write page to local page pool spill file: %m")));
+	if (!orioledb_s3_mode && desc->smgr.array.files == NULL)
+	{
+		char	   *prefix;
+		char	   *db_prefix;
 
-	/* Update parent's downlink to indicate this page is now on spill file */
-	int_hdr->downlink = MAKE_LOCAL_EVICTED_DOWNLINK(slot);
+		/*
+		 * Make sure the database directory exists before opening the file.
+		 */
+		o_get_prefixes_for_relnode(desc->oids.datoid, desc->oids.relnode,
+								   &prefix, &db_prefix);
+		o_verify_dir_exists_or_create(prefix, NULL, NULL);
+		o_verify_dir_exists_or_create(db_prefix, NULL, NULL);
+		pfree(db_prefix);
+
+		btree_open_smgr(desc);
+	}
+
+	/*
+	 * Write the page to the BTree's own smgr file.  We use
+	 * perform_page_io_autonomous() which atomically allocates a file offset
+	 * from datafileLength[0] and writes the page image.  This uses the same
+	 * file as the BTree would use for regular eviction, so the file is
+	 * properly cleaned up when the temp table is dropped.
+	 */
+	disk_downlink = perform_page_io_autonomous(desc, 0, p, &extent);
+	if (disk_downlink == InvalidDiskDownlink)
+		return false;
+
+	/*
+	 * Store the file offset in a DOWNLINK_IS_LOCAL_EVICTED downlink so that
+	 * find.c can distinguish it from a regular on-disk downlink (which uses
+	 * the shared-pool IO machinery) and call local_load_page() instead of
+	 * load_page().
+	 */
+	int_hdr->downlink = MAKE_LOCAL_EVICTED_DOWNLINK(extent.off);
 
 	/* Free the in-memory page slot and reset usage count */
 	pfree(local_ppool_pages[slot]);
@@ -909,25 +938,25 @@ local_ppool_free_build_page(PagePool *pool, Page img, uint64 handle)
  *
  * Called from find.c when a DOWNLINK_IS_LOCAL_EVICTED downlink is
  * encountered.  Allocates a new local pool slot, reads the page content from
- * the spill file, copies descriptor info from the parent, and updates the
- * parent's downlink to the new in-memory blkno.  After this call the
- * find-page traversal can continue as if the downlink had been in-memory all
- * along.
+ * the BTree's own smgr file (orioledb_data/{datoid}/{relnode}), copies
+ * descriptor info from the parent, and updates the parent's downlink to the
+ * new in-memory blkno.  After this call the find-page traversal can continue
+ * as if the downlink had been in-memory all along.
  */
 void
 local_load_page(OBTreeFindPageContext *context)
 {
-	LocalPagePool *local_pool = (LocalPagePool *) &local_ppool;
 	BTreeDescr *desc = context->desc;
 	int			context_index = context->index;
 	OInMemoryBlkno parent_blkno = context->items[context_index].blkno;
 	BTreePageItemLocator *parent_loc = &context->items[context_index].locator;
 	Page		parent_page = O_GET_IN_MEMORY_PAGE(parent_blkno);
 	BTreeNonLeafTuphdr *int_hdr;
-	uint64		downlink;
-	uint32		slot;
+	uint64		evicted_downlink;
+	uint64		file_off;
+	uint64		disk_downlink;
+	FileExtent	extent;
 	OInMemoryBlkno new_blkno;
-	Page		new_page;
 	OrioleDBPageDesc *parent_page_desc,
 			   *new_page_desc;
 
@@ -935,11 +964,16 @@ local_load_page(OBTreeFindPageContext *context)
 		BTREE_PAGE_LOCATOR_GET_ITEM(parent_page, parent_loc);
 	Assert(DOWNLINK_IS_LOCAL_EVICTED(int_hdr->downlink));
 
-	downlink = int_hdr->downlink;
-	slot = DOWNLINK_GET_LOCAL_EVICTED_SLOT(downlink);
+	evicted_downlink = int_hdr->downlink;
+	file_off = DOWNLINK_GET_LOCAL_EVICTED_OFF(evicted_downlink);
 
-	Assert(local_pool->spill_file >= 0);
-	Assert(slot < local_pool->size);
+	/*
+	 * Reconstruct a regular on-disk downlink from the stored file offset.
+	 * The page was written uncompressed (len=1) via perform_page_io_autonomous.
+	 */
+	extent.off = file_off;
+	extent.len = 1;
+	disk_downlink = MAKE_ON_DISK_DOWNLINK(extent);
 
 	/*
 	 * Allocate a new slot in the local pool for the reloaded page.  This may
@@ -947,24 +981,24 @@ local_load_page(OBTreeFindPageContext *context)
 	 * we're not trying to evict the page we're about to load.
 	 */
 	new_blkno = (*desc->ppool->ops->alloc_page) (desc->ppool, PPOOL_RESERVE_FIND);
-	new_page = O_GET_IN_MEMORY_PAGE(new_blkno);
 
-	/* Read the page from the spill file */
-	if (FileRead(local_pool->spill_file, (char *) new_page, ORIOLEDB_BLCKSZ,
-				 (off_t) slot * ORIOLEDB_BLCKSZ,
-				 WAIT_EVENT_DATA_FILE_READ) != ORIOLEDB_BLCKSZ)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not read page from local page pool spill file: %m")));
-
-	/* Set up the new page's descriptor from the parent's descriptor */
+	/* Set up the descriptor before reading so read_page_from_disk can use it */
 	parent_page_desc = O_GET_IN_MEMORY_PAGEDESC(parent_blkno);
 	new_page_desc = O_GET_IN_MEMORY_PAGEDESC(new_blkno);
 	new_page_desc->type = parent_page_desc->type;
 	new_page_desc->oids = parent_page_desc->oids;
 	new_page_desc->flags = 0;
-	new_page_desc->fileExtent.off = InvalidFileExtentOff;
-	new_page_desc->fileExtent.len = InvalidFileExtentLen;
+	new_page_desc->fileExtent = extent;
+
+	/*
+	 * Read the page from the BTree's own smgr file.  The file was written via
+	 * perform_page_io_autonomous so read_page_from_disk can read it back.
+	 */
+	if (!read_page_from_disk(desc, O_GET_IN_MEMORY_PAGE(new_blkno), disk_downlink,
+							 &new_page_desc->fileExtent))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read evicted local page from BTree file: %m")));
 
 	/*
 	 * Update the parent's downlink to point to the new in-memory blkno.

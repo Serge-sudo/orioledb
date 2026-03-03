@@ -310,10 +310,10 @@ typedef struct
 									   !DOWNLINK_IS_LOCAL_EVICTED(downlink))
 #define MAKE_IO_DOWNLINK(locknum) ((uint64)(locknum) | DOWNLINK_IO_BUF_MASK)
 #define DOWNLINK_GET_IO_LOCKNUM(downlink) ((uint32) ((downlink) & UINT64CONST(0xFFFFFFFF)))
-#define MAKE_LOCAL_EVICTED_DOWNLINK(slot) \
-	(DOWNLINK_DISK_BIT | DOWNLINK_LOCAL_EVICTED_BIT | (uint64)(uint32)(slot))
-#define DOWNLINK_GET_LOCAL_EVICTED_SLOT(downlink) \
-	((uint32) ((downlink) & UINT64CONST(0xFFFFFFFF)))
+#define MAKE_LOCAL_EVICTED_DOWNLINK(extent_off) \
+	(DOWNLINK_DISK_BIT | DOWNLINK_LOCAL_EVICTED_BIT | (uint64)(extent_off))
+#define DOWNLINK_GET_LOCAL_EVICTED_OFF(downlink) \
+	((uint64)((downlink) & UINT64CONST(0xFFFFFFFFFFFF)))
 
 #define MAKE_ON_DISK_DOWNLINK(extent) (((uint64)((extent).len) << 48) | (uint64)((extent).off) | DOWNLINK_DISK_BIT)
 #define DOWNLINK_GET_DISK_OFF(downlink) ((uint64) ((downlink) & UINT64CONST(0xFFFFFFFFFFFF)))
