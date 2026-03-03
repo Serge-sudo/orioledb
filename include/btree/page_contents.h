@@ -295,6 +295,12 @@ typedef struct
 #define MAKE_IN_MEMORY_DOWNLINK(blkno, changeCount) ((uint64) (blkno) | ((uint64) (changeCount) << 32))
 #define DOWNLINK_IS_IN_MEMORY(downlink) (((downlink) & DOWNLINK_DISK_BIT) == (uint64) 0)
 #define DOWNLINK_IS_IN_IO(downlink) (((downlink) & DOWNLINK_IO_BUF_MASK) == DOWNLINK_IO_BUF_MASK)
+/*
+ * An IO-in-progress downlink has ALL bits 32-63 set (DOWNLINK_IO_BUF_MASK),
+ * which includes both DOWNLINK_DISK_BIT (bit 63) and DOWNLINK_LOCAL_EVICTED_BIT
+ * (bit 62).  Without the !DOWNLINK_IS_IN_IO() guard, IO downlinks would be
+ * mistakenly identified as local-evicted.  The guard is therefore required.
+ */
 #define DOWNLINK_IS_LOCAL_EVICTED(downlink) \
 	(((downlink) & (DOWNLINK_DISK_BIT | DOWNLINK_LOCAL_EVICTED_BIT)) == \
 	 (DOWNLINK_DISK_BIT | DOWNLINK_LOCAL_EVICTED_BIT) && \

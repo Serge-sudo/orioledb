@@ -640,7 +640,7 @@ local_ppool_evict_page(LocalPagePool *local_pool, uint32 slot)
 				  WAIT_EVENT_DATA_FILE_WRITE) != ORIOLEDB_BLCKSZ)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not write local page pool spill file: %m")));
+				 errmsg("could not write page to local page pool spill file: %m")));
 
 	/* Update parent's downlink to indicate this page is now on spill file */
 	int_hdr->downlink = MAKE_LOCAL_EVICTED_DOWNLINK(slot);
@@ -779,9 +779,12 @@ local_ppool_alloc_page(PagePool *pool, int kind)
 		}
 
 		ereport(ERROR,
-				errmsg("local page pool is full: could not evict any page"),
-				errhint("Increase orioledb.local_page_pool_size or reduce "
-						"the size of temporary tables."));
+				(errmsg("local page pool is full: could not evict any page"),
+				 errdetail("All %u pages in the bounded local pool are "
+						   "pinned (high usage count) or are non-leaf pages "
+						   "that cannot be evicted.", (unsigned) size),
+				 errhint("Increase orioledb.local_page_pool_size or reduce "
+						 "the size of temporary tables.")));
 		return OInvalidInMemoryBlkno; /* unreachable */
 	}
 }
@@ -952,7 +955,7 @@ local_load_page(OBTreeFindPageContext *context)
 				 WAIT_EVENT_DATA_FILE_READ) != ORIOLEDB_BLCKSZ)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not read local page pool spill file: %m")));
+				 errmsg("could not read page from local page pool spill file: %m")));
 
 	/* Set up the new page's descriptor from the parent's descriptor */
 	parent_page_desc = O_GET_IN_MEMORY_PAGEDESC(parent_blkno);
