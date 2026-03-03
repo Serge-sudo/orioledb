@@ -657,9 +657,12 @@ try_lock_page(OInMemoryBlkno blkno)
 	Page		p = O_GET_IN_MEMORY_PAGE(blkno);
 	uint64		state;
 
-	/* Local pages do not need locking */
+	/* Local pages do not need locking, but do track usage for bounded pool */
 	if (O_PAGE_IS_LOCAL(blkno))
+	{
+		(*ppool->ops->ucm_inc_usage) (ppool, blkno);
 		return true;
+	}
 
 	state = pg_atomic_fetch_or_u64(&(O_PAGE_HEADER(p)->state),
 								   PAGE_STATE_LOCKED_FLAG);

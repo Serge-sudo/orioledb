@@ -133,6 +133,7 @@ REGRESSCHECKS = btree_sys_check \
 				tablespace \
 				temp \
 				temp_local_ppool \
+				temp_local_ppool_bounded \
 				toast \
 				trigger \
 				truncate \

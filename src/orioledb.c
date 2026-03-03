@@ -154,6 +154,7 @@ int			rewind_max_transactions = 0;
 int			logical_xid_buffers_guc = 64;
 bool		orioledb_strict_mode = false;
 bool		enable_local_page_pool_guc = false;
+int			local_page_pool_size_guc = -1;
 
 /* Previous values of hooks to chain call them */
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -1015,6 +1016,22 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomIntVariable("orioledb.local_page_pool_size",
+							"Sets the maximum size of the local page pool for temporary tables.",
+							"When set to a positive value, the local page pool uses a fixed size "
+							"with clock sweep eviction to disk. Set to -1 (default) to use the "
+							"old unbounded growing behavior. Value is the number of orioledb "
+							"pages (" CppAsString2(ORIOLEDB_BLCKSZ) " bytes each).",
+							&local_page_pool_size_guc,
+							-1,
+							-1,
+							INT_MAX,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
 	if (orioledb_s3_mode)
 	{
 		if (!s3_host || !s3_region || !s3_accesskey || !s3_secretkey)
@@ -1078,7 +1095,7 @@ _PG_init(void)
 	for (i = 0; i < OPagePoolTypesCount; i++)
 		page_pools_size[i] = CACHELINEALIGN(page_pools_size[i]);
 
-	local_ppool_init(&local_ppool);
+	local_ppool_init(&local_ppool, local_page_pool_size_guc);
 
 	if (device_filename)
 	{

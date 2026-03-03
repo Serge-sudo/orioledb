@@ -288,15 +288,26 @@ typedef struct
 #define BTreeLeafTuphdrSize MAXALIGN(sizeof(BTreeLeafTuphdr))
 
 #define DOWNLINK_DISK_BIT				(UINT64CONST(1)<<63)
+#define DOWNLINK_LOCAL_EVICTED_BIT		(UINT64CONST(1)<<62)
 #define DOWNLINK_IO_BUF_MASK			(UINT64CONST(0xFFFFFFFF00000000))
 #define DOWNLINK_GET_IN_MEMORY_BLKNO(downlink) ((uint32) (downlink))
 #define DOWNLINK_GET_IN_MEMORY_CHANGECOUNT(downlink) (((uint32) ((downlink) >> 32)) & 0x7FFFFFFF)
 #define MAKE_IN_MEMORY_DOWNLINK(blkno, changeCount) ((uint64) (blkno) | ((uint64) (changeCount) << 32))
 #define DOWNLINK_IS_IN_MEMORY(downlink) (((downlink) & DOWNLINK_DISK_BIT) == (uint64) 0)
 #define DOWNLINK_IS_IN_IO(downlink) (((downlink) & DOWNLINK_IO_BUF_MASK) == DOWNLINK_IO_BUF_MASK)
-#define DOWNLINK_IS_ON_DISK(downlink) (!DOWNLINK_IS_IN_MEMORY(downlink) && !DOWNLINK_IS_IN_IO(downlink))
+#define DOWNLINK_IS_LOCAL_EVICTED(downlink) \
+	(((downlink) & (DOWNLINK_DISK_BIT | DOWNLINK_LOCAL_EVICTED_BIT)) == \
+	 (DOWNLINK_DISK_BIT | DOWNLINK_LOCAL_EVICTED_BIT) && \
+	 !DOWNLINK_IS_IN_IO(downlink))
+#define DOWNLINK_IS_ON_DISK(downlink) (!DOWNLINK_IS_IN_MEMORY(downlink) && \
+									   !DOWNLINK_IS_IN_IO(downlink) && \
+									   !DOWNLINK_IS_LOCAL_EVICTED(downlink))
 #define MAKE_IO_DOWNLINK(locknum) ((uint64)(locknum) | DOWNLINK_IO_BUF_MASK)
 #define DOWNLINK_GET_IO_LOCKNUM(downlink) ((uint32) ((downlink) & UINT64CONST(0xFFFFFFFF)))
+#define MAKE_LOCAL_EVICTED_DOWNLINK(slot) \
+	(DOWNLINK_DISK_BIT | DOWNLINK_LOCAL_EVICTED_BIT | (uint64)(uint32)(slot))
+#define DOWNLINK_GET_LOCAL_EVICTED_SLOT(downlink) \
+	((uint32) ((downlink) & UINT64CONST(0xFFFFFFFF)))
 
 #define MAKE_ON_DISK_DOWNLINK(extent) (((uint64)((extent).len) << 48) | (uint64)((extent).off) | DOWNLINK_DISK_BIT)
 #define DOWNLINK_GET_DISK_OFF(downlink) ((uint64) ((downlink) & UINT64CONST(0xFFFFFFFFFFFF)))

@@ -15,9 +15,11 @@
 
 #include "orioledb.h"
 
+#include "btree/find.h"
 #include "btree/io.h"
 #include "btree/page_contents.h"
 #include "btree/undo.h"
+#include "catalog/sys_trees.h"
 #include "checkpoint/checkpoint.h"
 #include "transam/undo.h"
 #include "utils/page_pool.h"
@@ -495,22 +497,160 @@ o_ppool_free_build_page(PagePool *pool, Page img, uint64 handle)
 }
 
 void
-local_ppool_init(LocalPagePool *pool)
+local_ppool_init(LocalPagePool *pool, int32 max_size)
 {
-	local_ppool_pages = calloc(LOCAL_PPOOL_INIT_SIZE, sizeof(Page));
-	local_ppool_page_descs = calloc(LOCAL_PPOOL_INIT_SIZE, sizeof(OrioleDBPageDesc));
+	int			init_size;
+
+	/*
+	 * Treat max_size=0 the same as -1 (unbounded) since a pool with 0 pages
+	 * is not useful.
+	 */
+	if (max_size == 0)
+		max_size = -1;
+
+	init_size = (max_size >= 0) ? max_size : LOCAL_PPOOL_INIT_SIZE;
+
+	local_ppool_pages = calloc(init_size, sizeof(Page));
+	local_ppool_page_descs = calloc(init_size, sizeof(OrioleDBPageDesc));
 	if (!local_ppool_pages || !local_ppool_page_descs)
 		ereport(ERROR, errmsg("Failed to allocate memory for local page pool"));
 
-	for (int i = 0; i < LOCAL_PPOOL_INIT_SIZE; i++)
+	for (int i = 0; i < init_size; i++)
 		o_page_desc_init(&local_ppool_page_descs[i]);
 
-	pool->size = LOCAL_PPOOL_INIT_SIZE;
+	pool->size = init_size;
+	pool->max_size = max_size;
 	pool->current_slot = 0;
+	pool->clock_hand = 0;
 	pool->slab_context = SlabContextCreate(TopMemoryContext, "oriole local page pool", ORIOLEDB_BLCKSZ * 16, ORIOLEDB_BLCKSZ);
 	/* This might lead to PANIC on allocation failure in critical section */
 	MemoryContextAllowInCriticalSection(pool->slab_context, true);
 	pool->base.ops = &local_ppool_ops;
+
+	if (LOCAL_PPOOL_IS_BOUNDED(pool))
+	{
+		pool->usage_counts = (uint8 *) palloc0(init_size * sizeof(uint8));
+		pool->spill_file = OpenTemporaryFile(false);
+		if (pool->spill_file < 0)
+			ereport(ERROR, errmsg("Failed to create spill file for local page pool"));
+	}
+	else
+	{
+		pool->usage_counts = NULL;
+		pool->spill_file = -1;
+	}
+}
+
+/*
+ * Try to evict page at slot 'slot' from the bounded local pool.
+ *
+ * Finds the parent's downlink in the btree, writes the page to the spill
+ * file, updates the parent's downlink to MAKE_LOCAL_EVICTED_DOWNLINK, and
+ * frees the in-memory slot.
+ *
+ * Returns true if eviction succeeded, false if the page cannot be evicted
+ * (e.g. it is the root/meta page, or the btree descriptor is unavailable).
+ */
+static bool
+local_ppool_evict_page(LocalPagePool *local_pool, uint32 slot)
+{
+	OInMemoryBlkno local_blkno = slot | 0x80000000;
+	OrioleDBPageDesc *page_desc = &local_ppool_page_descs[slot];
+	Page		p = local_ppool_pages[slot];
+	BTreeDescr *desc;
+	OBTreeFindPageContext context;
+	OFindPageResult findResult;
+	Page		parent_page;
+	BTreeNonLeafTuphdr *int_hdr;
+
+	/* Skip uninitialized slots */
+	if (p == NULL || !ORelOidsIsValid(page_desc->oids))
+		return false;
+
+	/* Skip system in-memory trees (they use local pages too) */
+	if (IS_SYS_TREE_OIDS(page_desc->oids))
+		return false;
+
+	/*
+	 * Only evict leaf pages.  Non-leaf pages contain in-memory downlinks to
+	 * children; evicting them would require tracking and updating all child
+	 * descriptors, which is complex.  In practice, leaf pages make up the
+	 * vast majority of a btree, so this restriction is acceptable.
+	 */
+	if (!O_PAGE_IS(p, LEAF))
+		return false;
+
+	/* Get the btree descriptor for this page */
+	desc = index_oids_get_btree_descr(page_desc->oids, page_desc->type);
+	if (desc == NULL)
+		return false;
+
+	/* Never evict the root or meta page of a tree */
+	if (desc->rootInfo.rootPageBlkno == local_blkno ||
+		desc->rootInfo.metaPageBlkno == local_blkno)
+		return false;
+
+	/*
+	 * Find the parent page that holds the downlink to our page.  We use
+	 * find_page() with BTREE_PAGE_FIND_DOWNLINK_LOCATION to locate the
+	 * parent entry.  For local (single-session) pages, locking is a no-op,
+	 * so this traversal is safe.
+	 */
+	init_page_find_context(&context, desc, COMMITSEQNO_INPROGRESS,
+						   BTREE_PAGE_FIND_MODIFY
+						   | BTREE_PAGE_FIND_TRY_LOCK
+						   | BTREE_PAGE_FIND_DOWNLINK_LOCATION
+						   | BTREE_PAGE_FIND_NO_FIX_SPLIT);
+
+	if (O_PAGE_IS(p, RIGHTMOST))
+		findResult = find_page(&context, NULL, BTreeKeyRightmost,
+							   PAGE_GET_LEVEL(p) + 1);
+	else
+	{
+		OTuple		hikey;
+
+		BTREE_PAGE_GET_HIKEY(hikey, p);
+		findResult = find_page(&context, &hikey, BTreeKeyPageHiKey,
+							   PAGE_GET_LEVEL(p) + 1);
+	}
+
+	if (findResult != OFindPageResultSuccess)
+		return false;
+
+	/*
+	 * Verify that the downlink in the parent actually points to our page.
+	 * It might not if a split moved the page (though for single-session
+	 * local pages this shouldn't happen).
+	 */
+	parent_page = O_GET_IN_MEMORY_PAGE(context.items[context.index].blkno);
+	int_hdr = (BTreeNonLeafTuphdr *)
+		BTREE_PAGE_LOCATOR_GET_ITEM(parent_page,
+									&context.items[context.index].locator);
+
+	if (!DOWNLINK_IS_IN_MEMORY(int_hdr->downlink) ||
+		DOWNLINK_GET_IN_MEMORY_BLKNO(int_hdr->downlink) != local_blkno)
+		return false;
+
+	/*
+	 * Write the page content to the spill file at offset slot *
+	 * ORIOLEDB_BLCKSZ.
+	 */
+	if (FileWrite(local_pool->spill_file, (char *) p, ORIOLEDB_BLCKSZ,
+				  (off_t) slot * ORIOLEDB_BLCKSZ,
+				  WAIT_EVENT_DATA_FILE_WRITE) != ORIOLEDB_BLCKSZ)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write local page pool spill file: %m")));
+
+	/* Update parent's downlink to indicate this page is now on spill file */
+	int_hdr->downlink = MAKE_LOCAL_EVICTED_DOWNLINK(slot);
+
+	/* Free the in-memory page slot and reset usage count */
+	pfree(local_ppool_pages[slot]);
+	local_ppool_pages[slot] = NULL;
+	local_pool->usage_counts[slot] = 0;
+
+	return true;
 }
 
 OInMemoryBlkno
@@ -518,56 +658,132 @@ local_ppool_alloc_page(PagePool *pool, int kind)
 {
 	LocalPagePool *local_pool = (LocalPagePool *) pool;
 
-	int			start = local_pool->current_slot;
-	int			i = start;
-	int			old_size = local_pool->size;
-	int			new_size;
-	Page	   *new_pages;
-	OrioleDBPageDesc *new_page_descs;
-
-	/* Iterate through local_pool->pages to find a free slot */
-	do
-	{
-		i++;
-		if (i >= local_pool->size)
-			i = 0;
-		if (local_ppool_pages[i] == NULL)
-		{
-			local_ppool_pages[i] = (Page) MemoryContextAllocZero(local_pool->slab_context, ORIOLEDB_BLCKSZ);
-			local_pool->current_slot = i;
-			/* Set the local page bit */
-			return i | 0x80000000;
-		}
-	} while (i != start);
-
-	/* Failed to find a free slot - increase pages array size */
-
-	new_size = local_pool->size * 2;
-	new_pages = realloc(local_ppool_pages, new_size * sizeof(Page));
-	new_page_descs = realloc(local_ppool_page_descs, new_size * sizeof(OrioleDBPageDesc));
-
-	if (!new_pages || !new_page_descs)
+	if (!LOCAL_PPOOL_IS_BOUNDED(local_pool))
 	{
 		/*
-		 * Original pointers remain valid if their realloc failed, keeping
-		 * state consistent.
+		 * Unbounded mode: original growing repalloc logic.
 		 */
-		ereport(ERROR, errmsg("Failed to allocate memory for local page pool"));
+		int			start = local_pool->current_slot;
+		int			i = start;
+		int			old_size = local_pool->size;
+		int			new_size;
+		Page	   *new_pages;
+		OrioleDBPageDesc *new_page_descs;
+
+		/* Iterate through local_pool->pages to find a free slot */
+		do
+		{
+			i++;
+			if (i >= (int) local_pool->size)
+				i = 0;
+			if (local_ppool_pages[i] == NULL)
+			{
+				local_ppool_pages[i] = (Page) MemoryContextAllocZero(local_pool->slab_context, ORIOLEDB_BLCKSZ);
+				local_pool->current_slot = i;
+				/* Set the local page bit */
+				return i | 0x80000000;
+			}
+		} while (i != start);
+
+		/* Failed to find a free slot - increase pages array size */
+
+		new_size = local_pool->size * 2;
+		new_pages = realloc(local_ppool_pages, new_size * sizeof(Page));
+		new_page_descs = realloc(local_ppool_page_descs, new_size * sizeof(OrioleDBPageDesc));
+
+		if (!new_pages || !new_page_descs)
+		{
+			/*
+			 * Original pointers remain valid if their realloc failed, keeping
+			 * state consistent.
+			 */
+			ereport(ERROR, errmsg("Failed to allocate memory for local page pool"));
+		}
+
+		local_ppool_pages = new_pages;
+		local_ppool_page_descs = new_page_descs;
+		local_pool->size = new_size;
+		memset(local_ppool_pages + old_size, 0, old_size * sizeof(Page));
+
+		for (int j = old_size; j < new_size; j++)
+			o_page_desc_init(&local_ppool_page_descs[j]);
+
+		local_pool->current_slot = old_size;
+		local_ppool_pages[old_size] = (Page) MemoryContextAllocZero(local_pool->slab_context, ORIOLEDB_BLCKSZ);
+
+		/* Set the local page bit */
+		return old_size | 0x80000000;
 	}
+	else
+	{
+		/*
+		 * Bounded mode: fixed-size pool with clock sweep eviction.
+		 *
+		 * First, scan from current_slot for a free (NULL) slot.  If found,
+		 * use it directly.  If all slots are occupied, run the clock sweep to
+		 * find and evict a page with usage_count == 0.
+		 */
+		uint32		size = local_pool->size;
+		uint32		i;
+		uint32		start;
+		uint32		tries;
 
-	local_ppool_pages = new_pages;
-	local_ppool_page_descs = new_page_descs;
-	local_pool->size = new_size;
-	memset(local_ppool_pages + old_size, 0, old_size * sizeof(Page));
+		/* Quick scan for a free slot starting at current_slot */
+		start = local_pool->current_slot;
+		i = start;
+		do
+		{
+			if (local_ppool_pages[i] == NULL)
+			{
+				local_ppool_pages[i] = (Page) MemoryContextAllocZero(local_pool->slab_context, ORIOLEDB_BLCKSZ);
+				local_pool->current_slot = (i + 1) % size;
+				return i | 0x80000000;
+			}
+			i = (i + 1) % size;
+		} while (i != start);
 
-	for (int j = old_size; j < new_size; j++)
-		o_page_desc_init(&local_ppool_page_descs[j]);
+		/*
+		 * Pool is full: use clock sweep to find an evictable page.
+		 *
+		 * We limit iterations to 2 * size to avoid infinite loops when all
+		 * pages are pinned (high usage count or unevictable).
+		 */
+		for (tries = 0; tries < 2 * size; tries++)
+		{
+			i = local_pool->clock_hand;
+			local_pool->clock_hand = (i + 1) % size;
 
-	local_pool->current_slot = old_size;
-	local_ppool_pages[old_size] = (Page) MemoryContextAllocZero(local_pool->slab_context, ORIOLEDB_BLCKSZ);
+			if (local_ppool_pages[i] == NULL)
+			{
+				/* Slot is free (was just evicted by a nested call) */
+				local_ppool_pages[i] = (Page) MemoryContextAllocZero(local_pool->slab_context, ORIOLEDB_BLCKSZ);
+				local_pool->current_slot = (i + 1) % size;
+				return i | 0x80000000;
+			}
 
-	/* Set the local page bit */
-	return old_size | 0x80000000;
+			if (local_pool->usage_counts[i] > 0)
+			{
+				/* Decrement usage count and skip */
+				local_pool->usage_counts[i]--;
+				continue;
+			}
+
+			/* Try to evict this page */
+			if (local_ppool_evict_page(local_pool, i))
+			{
+				/* Slot i is now free, allocate it */
+				local_ppool_pages[i] = (Page) MemoryContextAllocZero(local_pool->slab_context, ORIOLEDB_BLCKSZ);
+				local_pool->current_slot = (i + 1) % size;
+				return i | 0x80000000;
+			}
+		}
+
+		ereport(ERROR,
+				errmsg("local page pool is full: could not evict any page"),
+				errhint("Increase orioledb.local_page_pool_size or reduce "
+						"the size of temporary tables."));
+		return OInvalidInMemoryBlkno; /* unreachable */
+	}
 }
 
 OInMemoryBlkno
@@ -580,10 +796,15 @@ local_ppool_alloc_metapage(PagePool *pool)
 void
 local_ppool_free_page(PagePool *pool, OInMemoryBlkno blkno, bool haveLock)
 {
+	LocalPagePool *local_pool = (LocalPagePool *) pool;
 	int			i = blkno & O_BLKNO_MASK;
 
 	pfree(local_ppool_pages[i]);
 	local_ppool_pages[i] = NULL;
+
+	/* Reset usage count when page is freed */
+	if (LOCAL_PPOOL_IS_BOUNDED(local_pool))
+		local_pool->usage_counts[i] = 0;
 }
 
 void
@@ -627,7 +848,15 @@ local_ppool_size(PagePool *pool)
 void
 local_ucm_inc_usage(PagePool *pool, OInMemoryBlkno blkno)
 {
-	/* Stub: do nothing */
+	LocalPagePool *local_pool = (LocalPagePool *) pool;
+
+	if (LOCAL_PPOOL_IS_BOUNDED(local_pool))
+	{
+		uint32		slot = blkno & O_BLKNO_MASK;
+
+		if (slot < local_pool->size && local_pool->usage_counts[slot] < UINT8_MAX)
+			local_pool->usage_counts[slot]++;
+	}
 }
 
 void
@@ -670,4 +899,75 @@ void
 local_ppool_free_build_page(PagePool *pool, Page img, uint64 handle)
 {
 	local_ppool_free_page(pool, (OInMemoryBlkno) handle, false);
+}
+
+/*
+ * Load a previously evicted local page back into the local page pool.
+ *
+ * Called from find.c when a DOWNLINK_IS_LOCAL_EVICTED downlink is
+ * encountered.  Allocates a new local pool slot, reads the page content from
+ * the spill file, copies descriptor info from the parent, and updates the
+ * parent's downlink to the new in-memory blkno.  After this call the
+ * find-page traversal can continue as if the downlink had been in-memory all
+ * along.
+ */
+void
+local_load_page(OBTreeFindPageContext *context)
+{
+	LocalPagePool *local_pool = (LocalPagePool *) &local_ppool;
+	BTreeDescr *desc = context->desc;
+	int			context_index = context->index;
+	OInMemoryBlkno parent_blkno = context->items[context_index].blkno;
+	BTreePageItemLocator *parent_loc = &context->items[context_index].locator;
+	Page		parent_page = O_GET_IN_MEMORY_PAGE(parent_blkno);
+	BTreeNonLeafTuphdr *int_hdr;
+	uint64		downlink;
+	uint32		slot;
+	OInMemoryBlkno new_blkno;
+	Page		new_page;
+	OrioleDBPageDesc *parent_page_desc,
+			   *new_page_desc;
+
+	int_hdr = (BTreeNonLeafTuphdr *)
+		BTREE_PAGE_LOCATOR_GET_ITEM(parent_page, parent_loc);
+	Assert(DOWNLINK_IS_LOCAL_EVICTED(int_hdr->downlink));
+
+	downlink = int_hdr->downlink;
+	slot = DOWNLINK_GET_LOCAL_EVICTED_SLOT(downlink);
+
+	Assert(local_pool->spill_file >= 0);
+	Assert(slot < local_pool->size);
+
+	/*
+	 * Allocate a new slot in the local pool for the reloaded page.  This may
+	 * itself trigger eviction of another page, but that's fine as long as
+	 * we're not trying to evict the page we're about to load.
+	 */
+	new_blkno = (*desc->ppool->ops->alloc_page) (desc->ppool, PPOOL_RESERVE_FIND);
+	new_page = O_GET_IN_MEMORY_PAGE(new_blkno);
+
+	/* Read the page from the spill file */
+	if (FileRead(local_pool->spill_file, (char *) new_page, ORIOLEDB_BLCKSZ,
+				 (off_t) slot * ORIOLEDB_BLCKSZ,
+				 WAIT_EVENT_DATA_FILE_READ) != ORIOLEDB_BLCKSZ)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read local page pool spill file: %m")));
+
+	/* Set up the new page's descriptor from the parent's descriptor */
+	parent_page_desc = O_GET_IN_MEMORY_PAGEDESC(parent_blkno);
+	new_page_desc = O_GET_IN_MEMORY_PAGEDESC(new_blkno);
+	new_page_desc->type = parent_page_desc->type;
+	new_page_desc->oids = parent_page_desc->oids;
+	new_page_desc->flags = 0;
+	new_page_desc->fileExtent.off = InvalidFileExtentOff;
+	new_page_desc->fileExtent.len = InvalidFileExtentLen;
+
+	/*
+	 * Update the parent's downlink to point to the new in-memory blkno.
+	 * After this, the find-page loop in find.c will see an in-memory downlink
+	 * and proceed normally.
+	 */
+	int_hdr->downlink = MAKE_IN_MEMORY_DOWNLINK(new_blkno,
+												O_GET_IN_MEMORY_PAGE_CHANGE_COUNT(new_blkno));
 }

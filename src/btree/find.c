@@ -744,6 +744,35 @@ find_page(OBTreeFindPageContext *context, void *key, BTreeKeyType keyType,
 		{
 			Assert(false);		/* make clang static analyzer happy */
 		}
+		else if (DOWNLINK_IS_LOCAL_EVICTED(nonLeafHdr->downlink))
+		{
+			/*
+			 * Page was evicted from the bounded local pool to the spill
+			 * file.  Reload it and update the parent downlink.  For local
+			 * (single-session) pages locking is a no-op, so we can do this
+			 * inline.
+			 */
+			if (intCxt.haveLock)
+			{
+				local_load_page(context);
+				intCxt.blkno = context->items[context->index].blkno;
+				loc = context->items[context->index].locator;
+				intCxt.pagePtr = p = O_GET_IN_MEMORY_PAGE(intCxt.blkno);
+				nonLeafHdr = (BTreeNonLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(intCxt.pagePtr, &loc);
+
+				if (level != PAGE_GET_LEVEL(p))
+				{
+					unlock_page(intCxt.blkno);
+					intCxt.haveLock = false;
+					continue;
+				}
+			}
+			else
+			{
+				needLock = true;
+				continue;
+			}
+		}
 		else if (DOWNLINK_IS_ON_DISK(nonLeafHdr->downlink))
 		{
 			if (tryFlag)

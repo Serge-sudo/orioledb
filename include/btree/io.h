@@ -55,6 +55,7 @@ extern void btree_smgr_punch_hole(BTreeDescr *desc, uint32 chkpNum,
 extern void init_btree_io_lwlocks(void);
 extern bool read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink, FileExtent *extent);
 extern void load_page(OBTreeFindPageContext *context);
+extern void local_load_page(OBTreeFindPageContext *context);
 extern uint64 perform_page_io(BTreeDescr *desc, OInMemoryBlkno blkno,
 							  Page img, uint32 checkpoint_number,
 							  bool copy_blkno, bool *dirty_parent);
