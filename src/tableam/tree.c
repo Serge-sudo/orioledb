@@ -120,9 +120,6 @@ index_btree_desc_init(BTreeDescr *desc, OCompress compress, int fillfactor,
 	{
 		if (enable_local_page_pool_guc)
 		{
-			/* Initialize the local pool lazily on first use */
-			if (local_ppool.base.ops == NULL)
-				local_ppool_init(&local_ppool, local_page_pool_size_guc);
 			desc->ppool = (PagePool *) &local_ppool;
 			desc->storageType = BTreeStorageInMemory;
 		}

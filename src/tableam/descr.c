@@ -272,6 +272,22 @@ o_btree_ensure_initialized_internal(BTreeDescr *desc, bool checkpoint)
 	if (ORootPageIsValid(desc) && OMetaPageIsValid(desc))
 		return true;
 
+	/*
+	 * Lazily initialize the local page pool on first actual tree use.  This
+	 * must happen here (not in index_btree_desc_init) because descriptor
+	 * re-creation can be triggered from within a critical section (e.g. via
+	 * invalidation callbacks fired during unlock_page under CHECK_PAGE_STATS).
+	 * SlabContextCreate() allocates from TopMemoryContext which doesn't allow
+	 * allocation in critical sections.
+	 */
+	if (desc->storageType == BTreeStorageInMemory)
+	{
+		LocalPagePool *lpool = (LocalPagePool *) desc->ppool;
+
+		if (lpool->base.ops == NULL)
+			local_ppool_init(lpool, local_page_pool_size_guc);
+	}
+
 	memset(&key, 0, sizeof(SharedRootInfoKey));
 	key.datoid = desc->oids.datoid;
 	key.relnode = desc->oids.relnode;
