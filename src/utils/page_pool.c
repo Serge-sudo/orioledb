@@ -523,6 +523,7 @@ local_ppool_init(LocalPagePool *pool, int32 max_size)
 	pool->max_size = max_size;
 	pool->current_slot = 0;
 	pool->clock_hand = 0;
+	memset(pool->numReserved, 0, sizeof(pool->numReserved));
 	pool->slab_context = SlabContextCreate(TopMemoryContext, "oriole local page pool", ORIOLEDB_BLCKSZ * 16, ORIOLEDB_BLCKSZ);
 	/* This might lead to PANIC on allocation failure in critical section */
 	MemoryContextAllowInCriticalSection(pool->slab_context, true);
@@ -745,18 +746,22 @@ local_ppool_alloc_page(PagePool *pool, int kind)
 	else
 	{
 		/*
-		 * Bounded mode: fixed-size pool with clock sweep eviction.
-		 *
-		 * First, scan from current_slot for a free (NULL) slot.  If found,
-		 * use it directly.  If all slots are occupied, run the clock sweep to
-		 * find and evict a page with usage_count == 0.
+		 * Bounded mode: reserve_pages() is responsible for pre-evicting pages
+		 * before a critical section.  alloc_page() only needs to find a free
+		 * slot; it must not perform any palloc-heavy eviction itself.
 		 */
 		uint32		size = local_pool->size;
 		uint32		i;
 		uint32		start;
-		uint32		tries;
 
-		/* Quick scan for a free slot starting at current_slot */
+		/*
+		 * Consume one pre-reserved slot for this kind, if available.
+		 */
+		if (kind >= 0 && kind < PPOOL_RESERVE_COUNT &&
+			local_pool->numReserved[kind] > 0)
+			local_pool->numReserved[kind]--;
+
+		/* Scan for a free slot starting at current_slot */
 		start = local_pool->current_slot;
 		i = start;
 		do
@@ -770,47 +775,9 @@ local_ppool_alloc_page(PagePool *pool, int kind)
 			i = (i + 1) % size;
 		} while (i != start);
 
-		/*
-		 * Pool is full: use clock sweep to find an evictable page.
-		 *
-		 * We limit iterations to 2 * size to avoid infinite loops when all
-		 * pages are pinned (high usage count or unevictable).
-		 */
-		for (tries = 0; tries < 2 * size; tries++)
-		{
-			i = local_pool->clock_hand;
-			local_pool->clock_hand = (i + 1) % size;
-
-			if (local_ppool_pages[i] == NULL)
-			{
-				/* Slot is free (was just evicted by a nested call) */
-				local_ppool_pages[i] = (Page) MemoryContextAllocZero(local_pool->slab_context, ORIOLEDB_BLCKSZ);
-				local_pool->current_slot = (i + 1) % size;
-				return i | 0x80000000;
-			}
-
-			if (local_pool->usage_counts[i] > 0)
-			{
-				/* Decrement usage count and skip */
-				local_pool->usage_counts[i]--;
-				continue;
-			}
-
-			/* Try to evict this page */
-			if (local_ppool_evict_page(local_pool, i))
-			{
-				/* Slot i is now free, allocate it */
-				local_ppool_pages[i] = (Page) MemoryContextAllocZero(local_pool->slab_context, ORIOLEDB_BLCKSZ);
-				local_pool->current_slot = (i + 1) % size;
-				return i | 0x80000000;
-			}
-		}
-
 		ereport(ERROR,
-				(errmsg("local page pool is full: could not evict any page"),
-				 errdetail("All %u pages in the bounded local pool are "
-						   "pinned (high usage count) or are non-leaf pages "
-						   "that cannot be evicted.", (unsigned) size),
+				(errmsg("local page pool is full: could not allocate a page"),
+				 errdetail("All %u pages in the bounded local pool are in use.", (unsigned) size),
 				 errhint("Increase orioledb.local_page_pool_size or reduce "
 						 "the size of temporary tables.")));
 		return OInvalidInMemoryBlkno; /* unreachable */
@@ -842,10 +809,11 @@ void
 local_ppool_reserve_pages(PagePool *pool, int kind, int count)
 {
 	LocalPagePool *local_pool = (LocalPagePool *) pool;
+	int			need;
 	uint32		size;
-	uint32		free_count;
-	uint32		tries;
 	uint32		i;
+	uint32		free_slots;
+	uint32		tries;
 
 	/*
 	 * For bounded pools we must pre-evict pages here, outside any critical
@@ -859,50 +827,50 @@ local_ppool_reserve_pages(PagePool *pool, int kind, int count)
 	if (!LOCAL_PPOOL_IS_BOUNDED(local_pool))
 		return;
 
+	Assert(kind >= 0 && kind < PPOOL_RESERVE_COUNT);
+
+	/* How many additional free slots do we still need? */
+	need = count - (int) local_pool->numReserved[kind];
+	if (need <= 0)
+		return;
+
 	size = local_pool->size;
 
-	/* Count already-free slots */
-	free_count = 0;
-	for (i = 0; i < size; i++)
-	{
-		if (local_ppool_pages[i] == NULL)
-		{
-			free_count++;
-			if (free_count >= (uint32) count)
-				return;		/* already enough free slots */
-		}
-	}
-
 	/*
-	 * Not enough free slots; run the clock sweep to evict pages until we have
-	 * at least 'count' free slots.
+	 * Run the clock sweep (via run_maintenance) until we have at least 'need'
+	 * free slots available.  We recount after each maintenance call; the
+	 * count is bounded by size, so this is O(size * tries).
 	 */
-	for (tries = 0; tries < 2 * size && free_count < (uint32) count; tries++)
+	for (tries = 0; tries < 2 * size; tries++)
 	{
-		i = local_pool->clock_hand;
-		local_pool->clock_hand = (i + 1) % size;
+		free_slots = 0;
+		for (i = 0; i < size; i++)
+			if (local_ppool_pages[i] == NULL)
+				free_slots++;
 
-		if (local_ppool_pages[i] == NULL)
-		{
-			free_count++;
-			continue;
-		}
+		if (free_slots >= (uint32) need)
+			break;
 
-		if (local_pool->usage_counts[i] > 0)
-		{
-			local_pool->usage_counts[i]--;
-			continue;
-		}
-
-		if (local_ppool_evict_page(local_pool, i))
-			free_count++;
+		local_ppool_run_maintenance(pool, true, NULL);
 	}
+
+	local_pool->numReserved[kind] += need;
 }
 
 void
 local_ppool_release_reserved(PagePool *pool, uint32 mask)
 {
-	/* Stub: do nothing */
+	LocalPagePool *local_pool = (LocalPagePool *) pool;
+	int			kind;
+
+	if (!LOCAL_PPOOL_IS_BOUNDED(local_pool))
+		return;
+
+	for (kind = 0; kind < PPOOL_RESERVE_COUNT; kind++)
+	{
+		if (mask & (1 << kind))
+			local_pool->numReserved[kind] = 0;
+	}
 }
 
 OInMemoryBlkno
@@ -920,7 +888,39 @@ local_ppool_dirty_pages_count(PagePool *pool)
 void
 local_ppool_run_maintenance(PagePool *pool, bool evict, volatile sig_atomic_t *shutdown_requested)
 {
-	/* Stub: do nothing */
+	LocalPagePool *local_pool = (LocalPagePool *) pool;
+	uint32		size;
+	uint32		i;
+	uint32		tries;
+
+	if (!LOCAL_PPOOL_IS_BOUNDED(local_pool))
+		return;
+
+	size = local_pool->size;
+
+	/*
+	 * Run the clock sweep: advance clock_hand, decrement usage counts, and
+	 * evict a page when usage_count reaches 0.  Stop as soon as a slot is
+	 * freed (either already free or successfully evicted) or after one full
+	 * cycle (all pages unevictable).
+	 */
+	for (tries = 0; tries < size; tries++)
+	{
+		i = local_pool->clock_hand;
+		local_pool->clock_hand = (i + 1) % size;
+
+		if (local_ppool_pages[i] == NULL)
+			return;				/* slot already free */
+
+		if (local_pool->usage_counts[i] > 0)
+		{
+			local_pool->usage_counts[i]--;
+			continue;			/* give this page another chance next round */
+		}
+
+		if (local_ppool_evict_page(local_pool, i))
+			return;				/* freed one slot */
+	}
 }
 
 OInMemoryBlkno
