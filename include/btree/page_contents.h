@@ -288,7 +288,6 @@ typedef struct
 #define BTreeLeafTuphdrSize MAXALIGN(sizeof(BTreeLeafTuphdr))
 
 #define DOWNLINK_DISK_BIT				(UINT64CONST(1)<<63)
-#define DOWNLINK_LOCAL_EVICTED_BIT		(UINT64CONST(1)<<62)
 #define DOWNLINK_IO_BUF_MASK			(UINT64CONST(0xFFFFFFFF00000000))
 #define DOWNLINK_GET_IN_MEMORY_BLKNO(downlink) ((uint32) (downlink))
 #define DOWNLINK_GET_IN_MEMORY_CHANGECOUNT(downlink) (((uint32) ((downlink) >> 32)) & 0x7FFFFFFF)
@@ -296,24 +295,14 @@ typedef struct
 #define DOWNLINK_IS_IN_MEMORY(downlink) (((downlink) & DOWNLINK_DISK_BIT) == (uint64) 0)
 #define DOWNLINK_IS_IN_IO(downlink) (((downlink) & DOWNLINK_IO_BUF_MASK) == DOWNLINK_IO_BUF_MASK)
 /*
- * An IO-in-progress downlink has ALL bits 32-63 set (DOWNLINK_IO_BUF_MASK),
- * which includes both DOWNLINK_DISK_BIT (bit 63) and DOWNLINK_LOCAL_EVICTED_BIT
- * (bit 62).  Without the !DOWNLINK_IS_IN_IO() guard, IO downlinks would be
- * mistakenly identified as local-evicted.  The guard is therefore required.
+ * Local pool downlinks are either in-memory or on-disk only; they never
+ * transition through the IO-in-progress state because local pool pages are
+ * single-session and no other backend can load them.
  */
-#define DOWNLINK_IS_LOCAL_EVICTED(downlink) \
-	(((downlink) & (DOWNLINK_DISK_BIT | DOWNLINK_LOCAL_EVICTED_BIT)) == \
-	 (DOWNLINK_DISK_BIT | DOWNLINK_LOCAL_EVICTED_BIT) && \
-	 !DOWNLINK_IS_IN_IO(downlink))
 #define DOWNLINK_IS_ON_DISK(downlink) (!DOWNLINK_IS_IN_MEMORY(downlink) && \
-									   !DOWNLINK_IS_IN_IO(downlink) && \
-									   !DOWNLINK_IS_LOCAL_EVICTED(downlink))
+									   !DOWNLINK_IS_IN_IO(downlink))
 #define MAKE_IO_DOWNLINK(locknum) ((uint64)(locknum) | DOWNLINK_IO_BUF_MASK)
 #define DOWNLINK_GET_IO_LOCKNUM(downlink) ((uint32) ((downlink) & UINT64CONST(0xFFFFFFFF)))
-#define MAKE_LOCAL_EVICTED_DOWNLINK(extent_off) \
-	(DOWNLINK_DISK_BIT | DOWNLINK_LOCAL_EVICTED_BIT | (uint64)(extent_off))
-#define DOWNLINK_GET_LOCAL_EVICTED_OFF(downlink) \
-	((uint64)((downlink) & UINT64CONST(0xFFFFFFFFFFFF)))
 
 #define MAKE_ON_DISK_DOWNLINK(extent) (((uint64)((extent).len) << 48) | (uint64)((extent).off) | DOWNLINK_DISK_BIT)
 #define DOWNLINK_GET_DISK_OFF(downlink) ((uint64) ((downlink) & UINT64CONST(0xFFFFFFFFFFFF)))

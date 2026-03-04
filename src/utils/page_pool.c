@@ -539,7 +539,7 @@ local_ppool_init(LocalPagePool *pool, int32 max_size)
  *
  * Finds the parent's downlink in the btree, writes the page to the BTree's
  * own smgr file (orioledb_data/{datoid}/{relnode}), updates the parent's
- * downlink to MAKE_LOCAL_EVICTED_DOWNLINK, and frees the in-memory slot.
+ * downlink to a regular on-disk downlink, and frees the in-memory slot.
  *
  * Returns true if eviction succeeded, false if the page cannot be evicted
  * (e.g. it is a non-leaf page, the root/meta page, or the btree descriptor
@@ -667,12 +667,11 @@ local_ppool_evict_page(LocalPagePool *local_pool, uint32 slot)
 		return false;
 
 	/*
-	 * Store the file offset in a DOWNLINK_IS_LOCAL_EVICTED downlink so that
-	 * find.c can distinguish it from a regular on-disk downlink (which uses
-	 * the shared-pool IO machinery) and call local_load_page() instead of
-	 * load_page().
+	 * Store as a regular on-disk downlink.  Local pool downlinks are either
+	 * in-memory or on-disk — never IO-in-progress.  find.c distinguishes
+	 * local vs. shared pool on-disk downlinks by checking O_PAGE_IS_LOCAL().
 	 */
-	int_hdr->downlink = MAKE_LOCAL_EVICTED_DOWNLINK(extent.off);
+	int_hdr->downlink = disk_downlink;
 
 	/* Free the in-memory page slot and reset usage count */
 	pfree(local_ppool_pages[slot]);
@@ -936,8 +935,8 @@ local_ppool_free_build_page(PagePool *pool, Page img, uint64 handle)
 /*
  * Load a previously evicted local page back into the local page pool.
  *
- * Called from find.c when a DOWNLINK_IS_LOCAL_EVICTED downlink is
- * encountered.  Allocates a new local pool slot, reads the page content from
+ * Called from find.c when a parent page in a local pool tree has an on-disk
+ * downlink.  Allocates a new local pool slot, reads the page content from
  * the BTree's own smgr file (orioledb_data/{datoid}/{relnode}), copies
  * descriptor info from the parent, and updates the parent's downlink to the
  * new in-memory blkno.  After this call the find-page traversal can continue
@@ -952,8 +951,6 @@ local_load_page(OBTreeFindPageContext *context)
 	BTreePageItemLocator *parent_loc = &context->items[context_index].locator;
 	Page		parent_page = O_GET_IN_MEMORY_PAGE(parent_blkno);
 	BTreeNonLeafTuphdr *int_hdr;
-	uint64		evicted_downlink;
-	uint64		file_off;
 	uint64		disk_downlink;
 	FileExtent	extent;
 	OInMemoryBlkno new_blkno;
@@ -962,18 +959,11 @@ local_load_page(OBTreeFindPageContext *context)
 
 	int_hdr = (BTreeNonLeafTuphdr *)
 		BTREE_PAGE_LOCATOR_GET_ITEM(parent_page, parent_loc);
-	Assert(DOWNLINK_IS_LOCAL_EVICTED(int_hdr->downlink));
+	Assert(DOWNLINK_IS_ON_DISK(int_hdr->downlink));
 
-	evicted_downlink = int_hdr->downlink;
-	file_off = DOWNLINK_GET_LOCAL_EVICTED_OFF(evicted_downlink);
-
-	/*
-	 * Reconstruct a regular on-disk downlink from the stored file offset.
-	 * The page was written uncompressed (len=1) via perform_page_io_autonomous.
-	 */
-	extent.off = file_off;
-	extent.len = 1;
-	disk_downlink = MAKE_ON_DISK_DOWNLINK(extent);
+	disk_downlink = int_hdr->downlink;
+	extent.off = DOWNLINK_GET_DISK_OFF(disk_downlink);
+	extent.len = DOWNLINK_GET_DISK_LEN(disk_downlink);
 
 	/*
 	 * Allocate a new slot in the local pool for the reloaded page.  This may
