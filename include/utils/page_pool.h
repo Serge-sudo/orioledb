@@ -138,15 +138,24 @@ extern void local_ppool_init(LocalPagePool *pool, int32 max_size);
 											 * detect changes concurrent to
 											 * write operatorions */
 #define PAGE_DESC_FLAG_BOTH_DIRTY		(PAGE_DESC_FLAG_DIRTY | PAGE_DESC_FLAG_CONCURRENT_DIRTY)
-#define IS_DIRTY(blkno) ((O_GET_IN_MEMORY_PAGEDESC(blkno)->flags & PAGE_DESC_FLAG_DIRTY) && !O_PAGE_IS_LOCAL(blkno))
-#define IS_DIRTY_CONCURRENT(blkno) ((O_GET_IN_MEMORY_PAGEDESC(blkno)->flags & PAGE_DESC_FLAG_CONCURRENT_DIRTY) && !O_PAGE_IS_LOCAL(blkno))
+#define IS_DIRTY(blkno) (O_GET_IN_MEMORY_PAGEDESC(blkno)->flags & PAGE_DESC_FLAG_DIRTY)
+#define IS_DIRTY_CONCURRENT(blkno) (O_GET_IN_MEMORY_PAGEDESC(blkno)->flags & PAGE_DESC_FLAG_CONCURRENT_DIRTY)
 #define CLEAN_DIRTY_CONCURRENT(blkno) (O_GET_IN_MEMORY_PAGEDESC(blkno)->flags &= ~PAGE_DESC_FLAG_CONCURRENT_DIRTY)
 
-/*  Local page can never be dirty as it's never synced with disk */
+/*
+ * Local pages track their dirty state but have no shared dirtyPagesCount.
+ * Non-local pages also update the meta page's dirty flags.
+ */
 #define MARK_DIRTY_EXTENDED(desc, blkno, skipMeta) \
 	do \
 	{ \
-	    if (O_PAGE_IS_LOCAL(blkno)) break; \
+	    if (O_PAGE_IS_LOCAL(blkno)) { \
+	        if (!IS_DIRTY(blkno)) \
+	            O_GET_IN_MEMORY_PAGEDESC(blkno)->flags |= PAGE_DESC_FLAG_BOTH_DIRTY; \
+	        else if (!IS_DIRTY_CONCURRENT(blkno)) \
+	            O_GET_IN_MEMORY_PAGEDESC(blkno)->flags |= PAGE_DESC_FLAG_CONCURRENT_DIRTY; \
+	        break; \
+	    } \
 		if (!(skipMeta)) \
 		{ \
 			BTREE_GET_META(desc)->dirtyFlag1 = true; \
@@ -166,11 +175,12 @@ extern void local_ppool_init(LocalPagePool *pool, int32 max_size);
 #define MARK_DIRTY(desc, blkno) \
 	MARK_DIRTY_EXTENDED(desc, blkno, false)
 
-/*  Local page can never be dirty as it's never synced with disk */
+/* Local pages have no shared dirtyPagesCount; only clear the flag. */
 #define CLEAN_DIRTY(pool, blkno) \
 	if (IS_DIRTY(blkno)) { \
 		O_GET_IN_MEMORY_PAGEDESC(blkno)->flags &= ~PAGE_DESC_FLAG_BOTH_DIRTY; \
-		pg_atomic_fetch_sub_u32(((OPagePool*)(pool))->dirtyPagesCount, 1); \
+		if (!O_PAGE_IS_LOCAL(blkno)) \
+			pg_atomic_fetch_sub_u32(((OPagePool*)(pool))->dirtyPagesCount, 1); \
 	}
 
 #define FREE_PAGE_IF_VALID(pool, blkno) \

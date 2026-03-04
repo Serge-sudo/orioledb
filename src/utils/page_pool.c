@@ -535,153 +535,6 @@ local_ppool_init(LocalPagePool *pool, int32 max_size)
 		pool->usage_counts = NULL;
 }
 
-/*
- * Try to evict page at slot 'slot' from the bounded local pool.
- *
- * Finds the parent's downlink in the btree, writes the page to the BTree's
- * own smgr file (orioledb_data/{datoid}/{relnode}), updates the parent's
- * downlink to a regular on-disk downlink, and frees the in-memory slot.
- *
- * Returns true if eviction succeeded, false if the page cannot be evicted
- * (e.g. it is a non-leaf page, the root/meta page, or the btree descriptor
- * is unavailable).
- */
-static bool
-local_ppool_evict_page(LocalPagePool *local_pool, uint32 slot)
-{
-	OInMemoryBlkno local_blkno = slot | 0x80000000;
-	OrioleDBPageDesc *page_desc = &local_ppool_page_descs[slot];
-	Page		p = local_ppool_pages[slot];
-	BTreeDescr *desc;
-	OBTreeFindPageContext context;
-	OFindPageResult findResult;
-	Page		parent_page;
-	BTreeNonLeafTuphdr *int_hdr;
-	FileExtent	extent;
-	uint64		disk_downlink;
-
-	/* Skip uninitialized slots */
-	if (p == NULL || !ORelOidsIsValid(page_desc->oids))
-		return false;
-
-	/* Skip system in-memory trees (they use local pages too) */
-	if (IS_SYS_TREE_OIDS(page_desc->oids))
-		return false;
-
-	/*
-	 * Only evict leaf pages.  Non-leaf pages contain in-memory downlinks to
-	 * children; evicting them would require tracking and updating all child
-	 * descriptors, which is complex.  In practice, leaf pages make up the
-	 * vast majority of a btree, so this restriction is acceptable.
-	 */
-	if (!O_PAGE_IS(p, LEAF))
-		return false;
-
-	/* Get the btree descriptor for this page */
-	desc = index_oids_get_btree_descr(page_desc->oids, page_desc->type);
-	if (desc == NULL)
-		return false;
-
-	/* Never evict the root or meta page of a tree */
-	if (desc->rootInfo.rootPageBlkno == local_blkno ||
-		desc->rootInfo.metaPageBlkno == local_blkno)
-		return false;
-
-	/*
-	 * Find the parent page that holds the downlink to our page.  We use
-	 * find_page() with BTREE_PAGE_FIND_DOWNLINK_LOCATION to locate the
-	 * parent entry.  For local (single-session) pages, locking is a no-op,
-	 * so this traversal is safe.
-	 */
-	init_page_find_context(&context, desc, COMMITSEQNO_INPROGRESS,
-						   BTREE_PAGE_FIND_MODIFY
-						   | BTREE_PAGE_FIND_TRY_LOCK
-						   | BTREE_PAGE_FIND_DOWNLINK_LOCATION
-						   | BTREE_PAGE_FIND_NO_FIX_SPLIT);
-
-	if (O_PAGE_IS(p, RIGHTMOST))
-		findResult = find_page(&context, NULL, BTreeKeyRightmost,
-							   PAGE_GET_LEVEL(p) + 1);
-	else
-	{
-		OTuple		hikey;
-
-		BTREE_PAGE_GET_HIKEY(hikey, p);
-		findResult = find_page(&context, &hikey, BTreeKeyPageHiKey,
-							   PAGE_GET_LEVEL(p) + 1);
-	}
-
-	if (findResult != OFindPageResultSuccess)
-		return false;
-
-	/*
-	 * Verify that the downlink in the parent actually points to our page.
-	 * It might not if a split moved the page (though for single-session
-	 * local pages this shouldn't happen).
-	 */
-	parent_page = O_GET_IN_MEMORY_PAGE(context.items[context.index].blkno);
-	int_hdr = (BTreeNonLeafTuphdr *)
-		BTREE_PAGE_LOCATOR_GET_ITEM(parent_page,
-									&context.items[context.index].locator);
-
-	if (!DOWNLINK_IS_IN_MEMORY(int_hdr->downlink) ||
-		DOWNLINK_GET_IN_MEMORY_BLKNO(int_hdr->downlink) != local_blkno)
-		return false;
-
-	/*
-	 * Ensure the BTree's smgr file infrastructure is set up.  For
-	 * BTreeStorageInMemory trees this is normally never done, but we need it
-	 * to write evicted pages to orioledb_data/{datoid}/{relnode}.
-	 *
-	 * In S3 mode, btree_open_smgr() initializes smgr.hash; in non-S3 mode
-	 * it initializes smgr.array.files.  Use the non-S3 null-check to detect
-	 * whether smgr has been initialized yet.  When S3 mode is enabled, the
-	 * hash table is always initialized by btree_open_smgr, so re-calling is
-	 * harmless (the function is idempotent for the array case).
-	 */
-	if (!orioledb_s3_mode && desc->smgr.array.files == NULL)
-	{
-		char	   *prefix;
-		char	   *db_prefix;
-
-		/*
-		 * Make sure the database directory exists before opening the file.
-		 */
-		o_get_prefixes_for_relnode(desc->oids.datoid, desc->oids.relnode,
-								   &prefix, &db_prefix);
-		o_verify_dir_exists_or_create(prefix, NULL, NULL);
-		o_verify_dir_exists_or_create(db_prefix, NULL, NULL);
-		pfree(db_prefix);
-
-		btree_open_smgr(desc);
-	}
-
-	/*
-	 * Write the page to the BTree's own smgr file.  We use
-	 * perform_page_io_autonomous() which atomically allocates a file offset
-	 * from datafileLength[0] and writes the page image.  This uses the same
-	 * file as the BTree would use for regular eviction, so the file is
-	 * properly cleaned up when the temp table is dropped.
-	 */
-	disk_downlink = perform_page_io_autonomous(desc, 0, p, &extent);
-	if (disk_downlink == InvalidDiskDownlink)
-		return false;
-
-	/*
-	 * Store as a regular on-disk downlink.  Local pool downlinks are either
-	 * in-memory or on-disk — never IO-in-progress.  find.c distinguishes
-	 * local vs. shared pool on-disk downlinks by checking O_PAGE_IS_LOCAL().
-	 */
-	int_hdr->downlink = disk_downlink;
-
-	/* Free the in-memory page slot and reset usage count */
-	pfree(local_ppool_pages[slot]);
-	local_ppool_pages[slot] = NULL;
-	local_pool->usage_counts[slot] = 0;
-
-	return true;
-}
-
 OInMemoryBlkno
 local_ppool_alloc_page(PagePool *pool, int kind)
 {
@@ -768,9 +621,13 @@ local_ppool_alloc_page(PagePool *pool, int kind)
 		{
 			if (local_ppool_pages[i] == NULL)
 			{
+				OInMemoryBlkno local_blkno = i | 0x80000000;
+
 				local_ppool_pages[i] = (Page) MemoryContextAllocZero(local_pool->slab_context, ORIOLEDB_BLCKSZ);
+				/* Mark as dirty so walk_page takes the write path on eviction */
+				local_ppool_page_descs[i].flags |= PAGE_DESC_FLAG_DIRTY;
 				local_pool->current_slot = (i + 1) % size;
-				return i | 0x80000000;
+				return local_blkno;
 			}
 			i = (i + 1) % size;
 		} while (i != start);
@@ -892,6 +749,7 @@ local_ppool_run_maintenance(PagePool *pool, bool evict, volatile sig_atomic_t *s
 	uint32		size;
 	uint32		i;
 	uint32		tries;
+	OInMemoryBlkno local_blkno;
 
 	if (!LOCAL_PPOOL_IS_BOUNDED(local_pool))
 		return;
@@ -900,17 +758,27 @@ local_ppool_run_maintenance(PagePool *pool, bool evict, volatile sig_atomic_t *s
 
 	/*
 	 * Run the clock sweep: advance clock_hand, decrement usage counts, and
-	 * evict a page when usage_count reaches 0.  Stop as soon as a slot is
-	 * freed (either already free or successfully evicted) or after one full
-	 * cycle (all pages unevictable).
+	 * evict a page via walk_page when usage_count reaches 0.  Stop as soon
+	 * as a slot is freed (already free or successfully evicted) or after one
+	 * full cycle (all pages unevictable).
+	 *
+	 * We reserve undo space around walk_page because page merges (attempted
+	 * on sparse pages) may write undo records.
 	 */
+	reserve_undo_size(UndoLogRegularPageLevel, 2 * O_MERGE_UNDO_IMAGE_SIZE);
+	reserve_undo_size(UndoLogSystem, 2 * O_MERGE_UNDO_IMAGE_SIZE);
+
 	for (tries = 0; tries < size; tries++)
 	{
 		i = local_pool->clock_hand;
 		local_pool->clock_hand = (i + 1) % size;
 
 		if (local_ppool_pages[i] == NULL)
+		{
+			release_undo_size(UndoLogRegularPageLevel);
+			release_undo_size(UndoLogSystem);
 			return;				/* slot already free */
+		}
 
 		if (local_pool->usage_counts[i] > 0)
 		{
@@ -918,9 +786,52 @@ local_ppool_run_maintenance(PagePool *pool, bool evict, volatile sig_atomic_t *s
 			continue;			/* give this page another chance next round */
 		}
 
-		if (local_ppool_evict_page(local_pool, i))
+		local_blkno = i | 0x80000000;
+
+		/*
+		 * Ensure the BTree's smgr is open before walk_page tries to write the
+		 * page to disk.  For BTreeStorageInMemory trees (local pool temp
+		 * tables), the smgr is not opened during normal tree creation.
+		 */
+		{
+			OrioleDBPageDesc *pd = &local_ppool_page_descs[i];
+			BTreeDescr *desc;
+
+			if (!ORelOidsIsValid(pd->oids) || IS_SYS_TREE_OIDS(pd->oids))
+				continue;
+
+			desc = index_oids_get_btree_descr(pd->oids, pd->type);
+			if (desc != NULL && !orioledb_s3_mode &&
+				desc->smgr.array.files == NULL)
+			{
+				char	   *prefix;
+				char	   *db_prefix;
+
+				o_get_prefixes_for_relnode(desc->oids.datoid,
+										   desc->oids.relnode,
+										   &prefix, &db_prefix);
+				o_verify_dir_exists_or_create(prefix, NULL, NULL);
+				o_verify_dir_exists_or_create(db_prefix, NULL, NULL);
+				pfree(db_prefix);
+				btree_open_smgr(desc);
+			}
+		}
+
+		/*
+		 * Any result other than OWalkPageSkipped means the page was written
+		 * to disk (OWalkPageEvicted) or merged (OWalkPageMerged), freeing at
+		 * least one slot.
+		 */
+		if (walk_page(local_blkno, true) != OWalkPageSkipped)
+		{
+			release_undo_size(UndoLogRegularPageLevel);
+			release_undo_size(UndoLogSystem);
 			return;				/* freed one slot */
+		}
 	}
+
+	release_undo_size(UndoLogRegularPageLevel);
+	release_undo_size(UndoLogSystem);
 }
 
 OInMemoryBlkno
@@ -1032,18 +943,28 @@ local_load_page(OBTreeFindPageContext *context)
 	new_page_desc = O_GET_IN_MEMORY_PAGEDESC(new_blkno);
 	new_page_desc->type = parent_page_desc->type;
 	new_page_desc->oids = parent_page_desc->oids;
-	new_page_desc->flags = 0;
+	new_page_desc->flags = PAGE_DESC_FLAG_DIRTY;	/* mark dirty for future eviction */
 	new_page_desc->fileExtent = extent;
 
 	/*
 	 * Read the page from the BTree's own smgr file.  The file was written via
-	 * perform_page_io_autonomous so read_page_from_disk can read it back.
+	 * perform_page_io so read_page_from_disk can read it back.
 	 */
 	if (!read_page_from_disk(desc, O_GET_IN_MEMORY_PAGE(new_blkno), disk_downlink,
 							 &new_page_desc->fileExtent))
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not read evicted local page from BTree file: %m")));
+
+	/*
+	 * Reset fileExtent to invalid after the read.  On the next eviction,
+	 * perform_page_io will take the "fresh allocation" path (less_num=true,
+	 * !FileExtentIsValid), which avoids accessing tmpBuf.shared that is not
+	 * set up for BTreeStorageInMemory trees.  The old disk slot is leaked but
+	 * that is acceptable since the whole file is dropped at session end.
+	 */
+	new_page_desc->fileExtent.len = InvalidFileExtentLen;
+	new_page_desc->fileExtent.off = InvalidFileExtentOff;
 
 	/*
 	 * Update the parent's downlink to point to the new in-memory blkno.
