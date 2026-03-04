@@ -379,6 +379,26 @@ btree_open_smgr(BTreeDescr *descr)
 	}
 }
 
+/*
+ * Ensure that all smgr segment files 0..segno are opened (and created if
+ * necessary).  This must be called before writing to segment N to guarantee
+ * that segment files 0..N-1 exist on disk; some tooling and recovery logic
+ * assume segments appear in order (0, 1, 2, ...) with no gaps.
+ *
+ * In S3 mode the hash-based smgr handles sparse opens, so this is a no-op.
+ */
+void
+btree_smgr_ensure_segments_up_to(BTreeDescr *desc, uint32 segno)
+{
+	uint32		i;
+
+	if (orioledb_s3_mode || !desc->smgr.array.files)
+		return;
+
+	for (i = 0; i <= segno; i++)
+		(void) btree_open_smgr_file(desc, i, 0, 0);
+}
+
 void
 btree_close_smgr(BTreeDescr *descr)
 {

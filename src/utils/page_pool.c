@@ -657,6 +657,30 @@ local_ppool_evict_page(LocalPagePool *local_pool, uint32 slot)
 	}
 
 	/*
+	 * Before writing to disk, determine which segment the next free offset
+	 * falls in, and ensure all preceding segment files (0..N-1) exist.  File
+	 * segments are expected to be created in order (0, 1, 2, ...).  If
+	 * local_page_pool_size exceeds one segment's worth of pages (131072 for
+	 * 8 KiB pages / 1 GiB segment), the pool can accumulate evictions that
+	 * reach segment N without the OS files for 0..N-1 having been explicitly
+	 * created.  btree_smgr_ensure_segments_up_to() opens/creates each
+	 * missing file so no segment is skipped.
+	 *
+	 * Single-backend pool: no other process modifies datafileLength[0], so
+	 * peeking at it before the atomic increment is safe.
+	 */
+	if (!orioledb_s3_mode)
+	{
+		BTreeMetaPage *metaPage = BTREE_GET_META(desc);
+		uint64		next_off = pg_atomic_read_u64(&metaPage->datafileLength[0]);
+		uint64		target_segno = (next_off * ORIOLEDB_BLCKSZ) /
+								   ORIOLEDB_SEGMENT_SIZE;
+
+		if (target_segno > 0)
+			btree_smgr_ensure_segments_up_to(desc, (uint32) (target_segno - 1));
+	}
+
+	/*
 	 * Write the page to the BTree's own smgr file.  We use
 	 * perform_page_io_autonomous() which atomically allocates a file offset
 	 * from datafileLength[0] and writes the page image.  This uses the same
