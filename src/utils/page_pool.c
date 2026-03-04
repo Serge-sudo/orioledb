@@ -841,7 +841,62 @@ local_ppool_free_page(PagePool *pool, OInMemoryBlkno blkno, bool haveLock)
 void
 local_ppool_reserve_pages(PagePool *pool, int kind, int count)
 {
-	/* Stub: do nothing */
+	LocalPagePool *local_pool = (LocalPagePool *) pool;
+	uint32		size;
+	uint32		free_count;
+	uint32		tries;
+	uint32		i;
+
+	/*
+	 * For bounded pools we must pre-evict pages here, outside any critical
+	 * section, so that the subsequent alloc_page calls (which may run inside
+	 * START_CRIT_SECTION) only need to grab a pre-freed slot from the pool.
+	 * Those grabs use the slab context (allowInCritSection=true) and are safe.
+	 *
+	 * For unbounded pools the array grows with realloc() (not palloc) and the
+	 * slot is filled from the slab context, so no pre-eviction is needed.
+	 */
+	if (!LOCAL_PPOOL_IS_BOUNDED(local_pool))
+		return;
+
+	size = local_pool->size;
+
+	/* Count already-free slots */
+	free_count = 0;
+	for (i = 0; i < size; i++)
+	{
+		if (local_ppool_pages[i] == NULL)
+		{
+			free_count++;
+			if (free_count >= (uint32) count)
+				return;		/* already enough free slots */
+		}
+	}
+
+	/*
+	 * Not enough free slots; run the clock sweep to evict pages until we have
+	 * at least 'count' free slots.
+	 */
+	for (tries = 0; tries < 2 * size && free_count < (uint32) count; tries++)
+	{
+		i = local_pool->clock_hand;
+		local_pool->clock_hand = (i + 1) % size;
+
+		if (local_ppool_pages[i] == NULL)
+		{
+			free_count++;
+			continue;
+		}
+
+		if (local_pool->usage_counts[i] > 0)
+		{
+			local_pool->usage_counts[i]--;
+			continue;
+		}
+
+		if (local_ppool_evict_page(local_pool, i))
+			free_count++;
+	}
 }
 
 void
