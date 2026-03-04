@@ -2078,7 +2078,7 @@ write_page(OBTreeFindPageContext *context, OInMemoryBlkno blkno, Page img,
 	/* rootPageBlkno can not be evicted here */
 	Assert(!evict || !is_root);
 	Assert(OInMemoryBlknoIsValid(desc->rootInfo.rootPageBlkno));
-	Assert(page_is_locked(blkno) || O_PAGE_IS_LOCAL(blkno));
+	Assert(page_is_locked(blkno));
 	EA_EVICT_INC(blkno);
 
 	if (!is_root)
