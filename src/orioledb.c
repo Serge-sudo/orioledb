@@ -1095,8 +1095,6 @@ _PG_init(void)
 	for (i = 0; i < OPagePoolTypesCount; i++)
 		page_pools_size[i] = CACHELINEALIGN(page_pools_size[i]);
 
-	local_ppool_init(&local_ppool, local_page_pool_size_guc);
-
 	if (device_filename)
 	{
 		device_fd = BasicOpenFile(device_filename, O_RDWR);
