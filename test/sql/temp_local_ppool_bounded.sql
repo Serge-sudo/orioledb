@@ -7,7 +7,7 @@ CREATE EXTENSION orioledb;
 SET orioledb.enable_local_page_pool = on;
 
 -- Set a small bounded pool size to force eviction
-SET orioledb.local_page_pool_size = 10;
+SET orioledb.local_page_pool_size = '80kB';
 
 -- Basic test: create a temp table and insert rows that exceed the pool size
 CREATE TEMP TABLE o_test_bounded (
@@ -34,7 +34,7 @@ SELECT count(*) FROM o_test_bounded;
 SELECT * FROM o_test_bounded WHERE id = 75;
 
 -- Test with larger pool size (no eviction needed)
-SET orioledb.local_page_pool_size = 1000;
+SET orioledb.local_page_pool_size = '8MB';
 
 CREATE TEMP TABLE o_test_bounded_large (
 	id int,

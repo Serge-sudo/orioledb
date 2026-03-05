@@ -1020,14 +1020,14 @@ _PG_init(void)
 							"Sets the maximum size of the local page pool for temporary tables.",
 							"When set to a positive value, the local page pool uses a fixed size "
 							"with clock sweep eviction to disk. Set to -1 (default) to use the "
-							"old unbounded growing behavior. Value is the number of orioledb "
-							"pages (" CppAsString2(ORIOLEDB_BLCKSZ) " bytes each).",
+							"old unbounded growing behavior. Value is a memory size (e.g. '64MB'); "
+							"plain integers are in units of 8 kB blocks.",
 							&local_page_pool_size_guc,
 							-1,
 							-1,
 							INT_MAX,
 							PGC_USERSET,
-							0,
+							GUC_UNIT_BLOCKS,
 							NULL,
 							NULL,
 							NULL);
