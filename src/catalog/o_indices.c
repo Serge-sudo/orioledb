@@ -20,6 +20,7 @@
 #include "catalog/o_indices.h"
 #include "catalog/o_sys_cache.h"
 #include "catalog/o_tables.h"
+#include "catalog/sys_trees.h"
 #include "checkpoint/checkpoint.h"
 #include "commands/defrem.h"
 #include "recovery/recovery.h"
@@ -47,6 +48,10 @@ PG_FUNCTION_INFO_V1(orioledb_index_rows);
 static uint32 increment_or_reset_o_index_version(uint32 version, OIndexVersionMode ixVerMode);
 
 static OIndex *make_ctid_o_index(OTable *table, OIndexVersionMode ixVerMode);
+
+static void o_indices_foreach_oids_in_tree(BTreeDescr *desc,
+										   OIndexOidsCallback callback,
+										   void *arg);
 
 static BTreeDescr *
 oIndicesGetBTreeDesc(void *arg)
@@ -1410,6 +1415,7 @@ o_indices_add(OTable *table, OIndexNumber ixNum, OXid oxid, CommitSeqNo csn)
 	Pointer		data;
 	int			len;
 	BTreeDescr *sys_tree;
+	bool		is_temp = (table->persistence == RELPERSISTENCE_TEMP);
 
 	oIndex = make_o_index(table, ixNum, OIndexVersionReset);
 
@@ -1429,10 +1435,14 @@ o_indices_add(OTable *table, OIndexNumber ixNum, OXid oxid, CommitSeqNo csn)
 	data = serialize_o_index(oIndex, &len);
 	free_o_index(oIndex);
 
-	sys_tree = get_sys_tree(SYS_TREES_O_INDICES);
+	if (is_temp && enable_local_page_pool_guc)
+		sys_tree = get_local_sys_tree_o_indices();
+	else
+		sys_tree = get_sys_tree(SYS_TREES_O_INDICES);
+
 	result = generic_toast_insert_optional_wal(&oIndicesToastAPI,
 											   (Pointer) &key, data, len, oxid,
-											   csn, sys_tree, table->persistence != RELPERSISTENCE_TEMP);
+											   csn, sys_tree, !is_temp);
 	pfree(data);
 	return result;
 }
@@ -1444,6 +1454,7 @@ o_indices_del(OTable *table, OIndexNumber ixNum, OXid oxid, CommitSeqNo csn)
 	bool		result;
 	OIndex	   *oIndex;
 	BTreeDescr *sys_tree;
+	bool		is_temp = (table->persistence == RELPERSISTENCE_TEMP);
 
 	oIndex = make_o_index(table, ixNum, OIndexVersionPass);
 	key.oids = oIndex->indexOids;
@@ -1459,10 +1470,14 @@ o_indices_del(OTable *table, OIndexNumber ixNum, OXid oxid, CommitSeqNo csn)
 
 	free_o_index(oIndex);
 
-	sys_tree = get_sys_tree(SYS_TREES_O_INDICES);
+	if (is_temp && enable_local_page_pool_guc)
+		sys_tree = get_local_sys_tree_o_indices();
+	else
+		sys_tree = get_sys_tree(SYS_TREES_O_INDICES);
+
 	result = generic_toast_delete_optional_wal(&oIndicesToastAPI,
 											   (Pointer) &key, oxid, csn,
-											   sys_tree, table->persistence != RELPERSISTENCE_TEMP);
+											   sys_tree, !is_temp);
 	return result;
 }
 
@@ -1481,6 +1496,7 @@ OIndex *
 o_indices_get_extended(ORelOids oids, OIndexType type, OTableFetchContext ctx)
 {
 	OIndexChunkKey key;
+	BTreeDescr *sys_tree;
 	int			retry;
 
 	key.type = type;
@@ -1493,6 +1509,15 @@ o_indices_get_extended(ORelOids oids, OIndexType type, OTableFetchContext ctx)
 		 key.type,
 		 key.chunknum,
 		 key.version);
+
+	/*
+	 * If this relnode is registered in the local temp set, look it up in the
+	 * per-backend local tree instead of the shared persistent tree.
+	 */
+	if (enable_local_page_pool_guc && is_local_temp_relnode(oids.relnode))
+		sys_tree = get_local_sys_tree_o_indices();
+	else
+		sys_tree = get_sys_tree(SYS_TREES_O_INDICES);
 
 	for (retry = 0;; retry++)
 	{
@@ -1509,7 +1534,7 @@ o_indices_get_extended(ORelOids oids, OIndexType type, OTableFetchContext ctx)
 												(Pointer) &key,
 												&dataLength,
 												ctx.snapshot,
-												get_sys_tree(SYS_TREES_O_INDICES),
+												sys_tree,
 												(Pointer *) &found_key);
 
 		if (result == NULL)
@@ -1571,7 +1596,12 @@ o_indices_update(OTable *table, OIndexNumber ixNum, OXid oxid, CommitSeqNo csn)
 
 	free_o_index(oIndex);
 	systrees_modify_start();
-	sys_tree = get_sys_tree(SYS_TREES_O_INDICES);
+
+	if (table->persistence == RELPERSISTENCE_TEMP && enable_local_page_pool_guc)
+		sys_tree = get_local_sys_tree_o_indices();
+	else
+		sys_tree = get_sys_tree(SYS_TREES_O_INDICES);
+
 	result = generic_toast_update_optional_wal(&oIndicesToastAPI,
 											   (Pointer) &key, data, len, oxid,
 											   csn, sys_tree, table->persistence != RELPERSISTENCE_TEMP);
@@ -1598,6 +1628,21 @@ o_indices_find_table_oids(ORelOids indexOids, OIndexType type,
 	key.chunknum = 0;
 	key.version = O_TABLE_INVALID_VERSION;
 
+	/* Check the local tree first if the relnode is known to be local */
+	if (enable_local_page_pool_guc && is_local_temp_relnode(indexOids.relnode))
+	{
+		data = generic_toast_get_any(&oIndicesToastAPI, (Pointer) &key,
+									 &dataSize, oSnapshot,
+									 get_local_sys_tree_o_indices());
+		if (data)
+		{
+			memcpy(tableOids, data, sizeof(ORelOids));
+			pfree(data);
+			return true;
+		}
+		return false;
+	}
+
 	data = generic_toast_get_any(&oIndicesToastAPI, (Pointer) &key, &dataSize,
 								 oSnapshot, get_sys_tree(SYS_TREES_O_INDICES));
 	if (data)
@@ -1609,8 +1654,9 @@ o_indices_find_table_oids(ORelOids indexOids, OIndexType type,
 	return false;
 }
 
-void
-o_indices_foreach_oids(OIndexOidsCallback callback, void *arg)
+static void
+o_indices_foreach_oids_in_tree(BTreeDescr *desc, OIndexOidsCallback callback,
+							   void *arg)
 {
 	OIndexChunkKey chunkKey;
 	ORelOids	oids = {0, 0, 0},
@@ -1618,7 +1664,6 @@ o_indices_foreach_oids(OIndexOidsCallback callback, void *arg)
 	OIndexType	type = oIndexInvalid;
 	BTreeIterator *it;
 	OTuple		tuple;
-	BTreeDescr *desc = get_sys_tree(SYS_TREES_O_INDICES);
 
 	chunkKey.type = type;
 	chunkKey.oids = oids;
@@ -1667,6 +1712,22 @@ o_indices_foreach_oids(OIndexOidsCallback callback, void *arg)
 		tuple = o_btree_iterator_fetch(it, NULL, NULL,
 									   BTreeKeyNone, false, NULL);
 	}
+	btree_iterator_free(it);
+}
+
+void
+o_indices_foreach_oids(OIndexOidsCallback callback, void *arg)
+{
+	/* Iterate the shared persistent tree */
+	o_indices_foreach_oids_in_tree(get_sys_tree(SYS_TREES_O_INDICES),
+								   callback, arg);
+
+	/*
+	 * Also iterate the per-backend local tree if there are local temp tables.
+	 */
+	if (enable_local_page_pool_guc && local_sys_trees_have_temp_tables())
+		o_indices_foreach_oids_in_tree(get_local_sys_tree_o_indices(),
+									   callback, arg);
 }
 
 static const char *

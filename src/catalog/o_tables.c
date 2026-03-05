@@ -21,6 +21,7 @@
 #include "catalog/o_indices.h"
 #include "catalog/o_tables.h"
 #include "catalog/o_sys_cache.h"
+#include "catalog/sys_trees.h"
 #include "recovery/recovery.h"
 #include "recovery/wal.h"
 #include "tableam/operations.h"
@@ -109,6 +110,10 @@ static void o_tables_truncate_unlogged_callback(OTable *o_table, void *arg);
 static void o_table_oids_array_callback(ORelOids oids, void *arg);
 static void o_tables_num_callback(ORelOids oids, void *arg);
 static inline void o_tables_rel_fill_locktag(LOCKTAG *tag, ORelOids *oids, int lockmode, bool checkpoint);
+static void o_tables_foreach_oids_in_tree(BTreeDescr *desc,
+										  OTablesOidsCallback callback,
+										  OSnapshot *oSnapshot,
+										  void *arg);
 
 static BTreeDescr *
 oTablesGetBTreeDesc(void *arg)
@@ -269,17 +274,21 @@ ToastAPI	oTablesToastAPI = {
 	.fetchCallback = oTablesFetchCallback
 };
 
-void
-o_tables_foreach_oids(OTablesOidsCallback callback,
-					  OSnapshot *oSnapshot,
-					  void *arg)
+/*
+ * Helper that iterates a single O_TABLES B-tree (either the shared persistent
+ * one or the per-backend local one) and invokes `callback` for each table.
+ */
+static void
+o_tables_foreach_oids_in_tree(BTreeDescr *desc,
+							  OTablesOidsCallback callback,
+							  OSnapshot *oSnapshot,
+							  void *arg)
 {
 	OTableChunkKey chunk_key;
 	ORelOids	oids = {0, 0, 0},
 				old_oids PG_USED_FOR_ASSERTS_ONLY;
 	BTreeIterator *it;
 	OTuple		tuple;
-	BTreeDescr *desc = get_sys_tree(SYS_TREES_O_TABLES);
 
 	chunk_key.oids = oids;
 	chunk_key.chunknum = 0;
@@ -313,6 +322,26 @@ o_tables_foreach_oids(OTablesOidsCallback callback,
 		tuple = o_btree_iterator_fetch(it, NULL, NULL,
 									   BTreeKeyNone, false, NULL);
 	}
+	btree_iterator_free(it);
+}
+
+void
+o_tables_foreach_oids(OTablesOidsCallback callback,
+					  OSnapshot *oSnapshot,
+					  void *arg)
+{
+	/* Iterate the shared persistent tree */
+	o_tables_foreach_oids_in_tree(get_sys_tree(SYS_TREES_O_TABLES),
+								  callback, oSnapshot, arg);
+
+	/*
+	 * Also iterate the per-backend local tree if it has been initialised.
+	 * Local trees contain temp-table metadata that was not written to the
+	 * shared tree.
+	 */
+	if (enable_local_page_pool_guc && local_sys_trees_have_temp_tables())
+		o_tables_foreach_oids_in_tree(get_local_sys_tree_o_tables(),
+									  callback, oSnapshot, arg);
 }
 
 /*
@@ -1066,6 +1095,7 @@ o_tables_drop_by_oids(ORelOids oids, OXid oxid, CommitSeqNo csn)
 	bool		result = false,
 				any_wal = false;
 	BTreeDescr *sys_tree = NULL;
+	bool		is_local_temp;
 
 	key.oids = oids;
 	key.chunknum = 0;
@@ -1075,12 +1105,22 @@ o_tables_drop_by_oids(ORelOids oids, OXid oxid, CommitSeqNo csn)
 	Assert(table);
 	if (table)
 	{
+		bool		is_temp = (table->persistence == RELPERSISTENCE_TEMP);
+
+		is_local_temp = is_temp && enable_local_page_pool_guc;
 		o_tables_oids_indexes(table, NULL, oxid, csn);
-		sys_tree = get_sys_tree(SYS_TREES_O_TABLES);
-		any_wal = table->persistence != RELPERSISTENCE_TEMP;
+
+		if (is_local_temp)
+			sys_tree = get_local_sys_tree_o_tables();
+		else
+			sys_tree = get_sys_tree(SYS_TREES_O_TABLES);
+
+		any_wal = !is_temp;
 		result = generic_toast_delete_optional_wal(&oTablesToastAPI,
 												   (Pointer) &key, oxid, csn,
 												   sys_tree, any_wal);
+		if (result && is_local_temp)
+			unmark_local_temp_relnode(oids.relnode);
 	}
 	else
 	{
@@ -1139,6 +1179,7 @@ o_tables_add(OTable *table, OXid oxid, CommitSeqNo csn)
 	Pointer		data;
 	int			len;
 	BTreeDescr *sys_tree;
+	bool		is_temp = (table->persistence == RELPERSISTENCE_TEMP);
 
 	key.oids = table->oids;
 	key.chunknum = 0;
@@ -1146,12 +1187,27 @@ o_tables_add(OTable *table, OXid oxid, CommitSeqNo csn)
 
 	systrees_modify_start();
 	o_tables_oids_indexes(NULL, table, oxid, csn);
-	sys_tree = get_sys_tree(SYS_TREES_O_TABLES);
-	data = serialize_o_table(table, &len);
-	result = generic_toast_insert_optional_wal(&oTablesToastAPI,
-											   (Pointer) &key, data, len, oxid,
-											   csn, sys_tree, table->persistence != RELPERSISTENCE_TEMP);
-	systrees_modify_end(table->persistence != RELPERSISTENCE_TEMP);
+
+	if (is_temp && enable_local_page_pool_guc)
+	{
+		sys_tree = get_local_sys_tree_o_tables();
+		data = serialize_o_table(table, &len);
+		result = generic_toast_insert_optional_wal(&oTablesToastAPI,
+												   (Pointer) &key, data, len,
+												   oxid, csn, sys_tree, false);
+		if (result)
+			mark_local_temp_relnode(table->oids.relnode);
+	}
+	else
+	{
+		sys_tree = get_sys_tree(SYS_TREES_O_TABLES);
+		data = serialize_o_table(table, &len);
+		result = generic_toast_insert_optional_wal(&oTablesToastAPI,
+												   (Pointer) &key, data, len,
+												   oxid, csn, sys_tree,
+												   !is_temp);
+	}
+	systrees_modify_end(!is_temp);
 	pfree(data);
 
 	return result;
@@ -1169,10 +1225,20 @@ o_tables_get_extended(ORelOids oids, OTableFetchContext ctx)
 {
 	OTableChunkKey key;
 	int			retry;
+	BTreeDescr *sys_tree;
 
 	key.oids = oids;
 	key.chunknum = 0;
 	key.version = ctx.version;
+
+	/*
+	 * If this relnode is registered in the local temp set, look it up in the
+	 * per-backend local tree instead of the shared persistent tree.
+	 */
+	if (enable_local_page_pool_guc && is_local_temp_relnode(oids.relnode))
+		sys_tree = get_local_sys_tree_o_tables();
+	else
+		sys_tree = get_sys_tree(SYS_TREES_O_TABLES);
 
 	for (retry = 0;; retry++)
 	{
@@ -1189,7 +1255,7 @@ o_tables_get_extended(ORelOids oids, OTableFetchContext ctx)
 												(Pointer) &key,
 												&dataLength,
 												ctx.snapshot,
-												get_sys_tree(SYS_TREES_O_TABLES),
+												sys_tree,
 												(Pointer *) &found_key);
 
 		if (result == NULL)
@@ -1287,6 +1353,7 @@ o_tables_update(OTable *table, OXid oxid, CommitSeqNo csn)
 	Pointer		data;
 	int			len;
 	BTreeDescr *sys_tree;
+	bool		is_temp = (table->persistence == RELPERSISTENCE_TEMP);
 
 	key.oids = table->oids;
 	key.chunknum = 0;
@@ -1295,12 +1362,17 @@ o_tables_update(OTable *table, OXid oxid, CommitSeqNo csn)
 	systrees_modify_start();
 	old_table = o_tables_get(table->oids);
 	o_tables_oids_indexes(old_table, table, oxid, csn);
-	sys_tree = get_sys_tree(SYS_TREES_O_TABLES);
+
+	if (is_temp && enable_local_page_pool_guc)
+		sys_tree = get_local_sys_tree_o_tables();
+	else
+		sys_tree = get_sys_tree(SYS_TREES_O_TABLES);
+
 	data = serialize_o_table(table, &len);
 	result = generic_toast_update_optional_wal(&oTablesToastAPI,
 											   (Pointer) &key, data, len, oxid,
-											   csn, sys_tree, table->persistence != RELPERSISTENCE_TEMP);
-	systrees_modify_end(table->persistence != RELPERSISTENCE_TEMP);
+											   csn, sys_tree, !is_temp);
+	systrees_modify_end(!is_temp);
 
 	pfree(data);
 	o_table_free(old_table);
