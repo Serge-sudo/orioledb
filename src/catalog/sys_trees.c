@@ -445,6 +445,7 @@ static SysTreeDescr sysTreesDescrs[SYS_TREES_NUM];
 PG_FUNCTION_INFO_V1(orioledb_sys_tree_structure);
 PG_FUNCTION_INFO_V1(orioledb_sys_tree_check);
 PG_FUNCTION_INFO_V1(orioledb_sys_tree_rows);
+PG_FUNCTION_INFO_V1(orioledb_local_sys_tree_rows);
 
 /*
  * Returns size of the shared memory needed for enum tree header.
@@ -846,6 +847,113 @@ orioledb_sys_tree_rows(PG_FUNCTION_ARGS)
 
 	td = get_sys_tree(num);
 	o_btree_ensure_initialized(get_sys_tree(num));
+
+	it = o_btree_iterator_create(td, NULL, BTreeKeyNone,
+								 &o_in_progress_snapshot, ForwardScanDirection);
+
+	do
+	{
+		bool		end;
+		OTuple		key;
+		bool		allocated;
+		JsonbParseState *state = NULL;
+		Jsonb	   *res;
+		BTreeLeafTuphdr *tupHdr;
+		OTuple		tup;
+
+		tup = btree_iterate_all(it, NULL, BTreeKeyNone, false, &end, NULL,
+								&tupHdr);
+
+		if (O_TUPLE_IS_NULL(tup))
+			break;
+
+		(void) pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+		key = o_btree_tuple_make_key(td, tup, NULL, true, &allocated);
+		jsonb_push_key(&state, "tupHdr");
+		(void) o_tuphdr_to_jsonb(tupHdr, &state);
+		jsonb_push_key(&state, "key");
+		(void) o_btree_key_to_jsonb(td, key, &state);
+		res = JsonbValueToJsonb(pushJsonbValue(&state, WJB_END_OBJECT, NULL));
+		if (allocated)
+			pfree(key.data);
+
+		values[0] = PointerGetDatum(res);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
+							 nulls);
+	} while (true);
+
+	btree_iterator_free(it);
+
+	return (Datum) 0;
+}
+
+/*
+ * Validate local sys tree index (1-based, matching the SQL interface).
+ */
+static void
+check_local_tree_num_input(int num)
+{
+	if (!(num >= 1 && num <= LOCAL_SYS_TREES_COUNT))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Value num must be in the range from 1 to %d",
+						LOCAL_SYS_TREES_COUNT)));
+}
+
+/*
+ * Get the local sys tree descriptor for a 1-based index.
+ * Initializes the descriptor lazily if needed.
+ */
+static BTreeDescr *
+get_local_sys_tree(int num)
+{
+	int			idx = num - 1;
+
+	if (!localSysTreesDescrs[idx].initialized)
+		local_sys_tree_init(idx);
+	return &localSysTreesDescrs[idx].descr;
+}
+
+/*
+ * Returns content of a local (per-backend) sys tree as a SETOF jsonb.
+ * Mirrors orioledb_sys_tree_rows() for the local trees.
+ */
+Datum
+orioledb_local_sys_tree_rows(PG_FUNCTION_ARGS)
+{
+	int			num = PG_GETARG_INT32(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	BTreeIterator *it;
+	BTreeDescr *td;
+	Datum		values[1];
+	bool		nulls[1] = {false};
+	Oid			funcrettype;
+
+	check_local_tree_num_input(num);
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, &funcrettype, NULL) != TYPEFUNC_SCALAR)
+		elog(ERROR, "return type must be a scalar type");
+
+	/* Base data type, i.e. scalar */
+	tupdesc = CreateTemplateTupleDesc(1);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 1, NULL, funcrettype, -1, 0);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	td = get_local_sys_tree(num);
+	o_btree_ensure_initialized(td);
 
 	it = o_btree_iterator_create(td, NULL, BTreeKeyNone,
 								 &o_in_progress_snapshot, ForwardScanDirection);

@@ -90,6 +90,11 @@ RETURNS SETOF jsonb
 AS 'MODULE_PATHNAME'
 VOLATILE LANGUAGE C;
 
+CREATE FUNCTION orioledb_local_sys_tree_rows(num integer)
+RETURNS SETOF jsonb
+AS 'MODULE_PATHNAME'
+VOLATILE LANGUAGE C;
+
 CREATE FUNCTION orioledb_index_rows(relid oid, OUT total int, OUT dead int)
 RETURNS record
 AS 'MODULE_PATHNAME'
