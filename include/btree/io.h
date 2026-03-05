@@ -42,6 +42,7 @@ extern int	OFileWrite(File file, char *buffer, int amount, off_t offset,
 extern void btree_init_smgr(BTreeDescr *descr);
 extern void btree_open_smgr(BTreeDescr *descr);
 extern void btree_close_smgr(BTreeDescr *descr);
+extern void btree_smgr_ensure_segments_up_to(BTreeDescr *desc, uint32 segno);
 extern char *btree_filename(Oid datoid, Oid relnode, int segno, uint32 chkpNum);
 extern char *btree_smgr_filename(BTreeDescr *desc, off_t offset,
 								 uint32 chkpNum);
@@ -55,6 +56,7 @@ extern void btree_smgr_punch_hole(BTreeDescr *desc, uint32 chkpNum,
 extern void init_btree_io_lwlocks(void);
 extern bool read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink, FileExtent *extent);
 extern void load_page(OBTreeFindPageContext *context);
+extern void local_load_page(OBTreeFindPageContext *context);
 extern uint64 perform_page_io(BTreeDescr *desc, OInMemoryBlkno blkno,
 							  Page img, uint32 checkpoint_number,
 							  bool copy_blkno, bool *dirty_parent);

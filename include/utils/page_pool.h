@@ -115,12 +115,22 @@ typedef struct LocalPagePool
 {
 	PagePool	base;
 	MemoryContext slab_context;
-	uint32		size;
-	uint32		current_slot;
+	uint32		size;			/* current allocated slots (unbounded) or max
+								 * size (bounded) */
+	int32		max_size;		/* -1 = unbounded (grows with repalloc), >= 0 =
+								 * fixed max size with eviction */
+	uint32		current_slot;	/* hint for next free slot search */
+	uint32		clock_hand;		/* clock sweep hand position (bounded mode) */
+	uint8	   *usage_counts;	/* per-slot usage count array (NULL if
+								 * unbounded) */
+	uint32		numReserved[PPOOL_RESERVE_COUNT];	/* pre-reserved slot counts
+													 * per kind (bounded mode) */
 } LocalPagePool;
 
+/* Returns true if the pool has a fixed max size with eviction support */
+#define LOCAL_PPOOL_IS_BOUNDED(pool) ((pool)->max_size >= 0)
 
-extern void local_ppool_init(LocalPagePool *pool);
+extern void local_ppool_init(LocalPagePool *pool, int32 max_size);
 
 #define PAGE_DESC_FLAG_DIRTY			1	/* Modified since the the last
 											 * time being written out */

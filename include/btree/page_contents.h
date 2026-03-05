@@ -294,7 +294,13 @@ typedef struct
 #define MAKE_IN_MEMORY_DOWNLINK(blkno, changeCount) ((uint64) (blkno) | ((uint64) (changeCount) << 32))
 #define DOWNLINK_IS_IN_MEMORY(downlink) (((downlink) & DOWNLINK_DISK_BIT) == (uint64) 0)
 #define DOWNLINK_IS_IN_IO(downlink) (((downlink) & DOWNLINK_IO_BUF_MASK) == DOWNLINK_IO_BUF_MASK)
-#define DOWNLINK_IS_ON_DISK(downlink) (!DOWNLINK_IS_IN_MEMORY(downlink) && !DOWNLINK_IS_IN_IO(downlink))
+/*
+ * Local pool downlinks are either in-memory or on-disk only; they never
+ * transition through the IO-in-progress state because local pool pages are
+ * single-session and no other backend can load them.
+ */
+#define DOWNLINK_IS_ON_DISK(downlink) (!DOWNLINK_IS_IN_MEMORY(downlink) && \
+									   !DOWNLINK_IS_IN_IO(downlink))
 #define MAKE_IO_DOWNLINK(locknum) ((uint64)(locknum) | DOWNLINK_IO_BUF_MASK)
 #define DOWNLINK_GET_IO_LOCKNUM(downlink) ((uint32) ((downlink) & UINT64CONST(0xFFFFFFFF)))
 

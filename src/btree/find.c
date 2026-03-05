@@ -746,62 +746,96 @@ find_page(OBTreeFindPageContext *context, void *key, BTreeKeyType keyType,
 		}
 		else if (DOWNLINK_IS_ON_DISK(nonLeafHdr->downlink))
 		{
-			if (tryFlag)
+			if (O_PAGE_IS_LOCAL(intCxt.blkno))
 			{
 				/*
-				 * Don't try to load page from write_page()
+				 * Local pool downlinks are either in-memory or on-disk.
+				 * They never go through IO-in-progress state because local
+				 * pool pages are single-session.  Reload the page and update
+				 * the parent downlink; locking is a no-op for local pages.
 				 */
 				if (intCxt.haveLock)
-					unlock_page(intCxt.blkno);
-				return OFindPageResultFailure;
-			}
-
-			if (intCxt.haveLock)
-			{
-				load_page(context);
-				intCxt.blkno = context->items[context->index].blkno;
-				loc = context->items[context->index].locator;
-				intCxt.pagePtr = p = O_GET_IN_MEMORY_PAGE(intCxt.blkno);
-				nonLeafHdr = (BTreeNonLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(intCxt.pagePtr, &loc);
-
-				if (level != PAGE_GET_LEVEL(p))
 				{
-					unlock_page(intCxt.blkno);
-					intCxt.haveLock = false;
-					continue;
+					local_load_page(context);
+					intCxt.blkno = context->items[context->index].blkno;
+					loc = context->items[context->index].locator;
+					intCxt.pagePtr = p = O_GET_IN_MEMORY_PAGE(intCxt.blkno);
+					nonLeafHdr = (BTreeNonLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(intCxt.pagePtr, &loc);
+
+					if (level != PAGE_GET_LEVEL(p))
+					{
+						unlock_page(intCxt.blkno);
+						intCxt.haveLock = false;
+						continue;
+					}
 				}
-
-				if (imageFlag && level == targetLevel + 1)
+				else
 				{
-					/*
-					 * Especial case, we load a leaf for image search. Now we
-					 * need to save tuples for the iterators code from the
-					 * parent.
-					 */
-					BTreePageHeader *hdr = (BTreePageHeader *) context->parentImg;
-					OffsetNumber chunkIdx = loc.chunkOffset;
-
-					memcpy(context->parentImg, intCxt.pagePtr, ORIOLEDB_BLCKSZ);
-					context->partial.isPartial = false;
-
-					/*
-					 * We need to ensure that chunk in locator points to
-					 * context memory instead of "in memory" block
-					 */
-					context->items[context->index].locator.chunk =
-						(BTreePageChunk *) (context->parentImg + SHORT_GET_LOCATION(hdr->chunkDesc[chunkIdx].shortLocation));
-
+					needLock = true;
+					continue;
 				}
 			}
 			else
 			{
-				needLock = true;
-				continue;
+				if (tryFlag)
+				{
+					/*
+					 * Don't try to load page from write_page()
+					 */
+					if (intCxt.haveLock)
+						unlock_page(intCxt.blkno);
+					return OFindPageResultFailure;
+				}
+
+				if (intCxt.haveLock)
+				{
+					load_page(context);
+					intCxt.blkno = context->items[context->index].blkno;
+					loc = context->items[context->index].locator;
+					intCxt.pagePtr = p = O_GET_IN_MEMORY_PAGE(intCxt.blkno);
+					nonLeafHdr = (BTreeNonLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(intCxt.pagePtr, &loc);
+
+					if (level != PAGE_GET_LEVEL(p))
+					{
+						unlock_page(intCxt.blkno);
+						intCxt.haveLock = false;
+						continue;
+					}
+
+					if (imageFlag && level == targetLevel + 1)
+					{
+						/*
+						 * Especial case, we load a leaf for image search. Now we
+						 * need to save tuples for the iterators code from the
+						 * parent.
+						 */
+						BTreePageHeader *hdr = (BTreePageHeader *) context->parentImg;
+						OffsetNumber chunkIdx = loc.chunkOffset;
+
+						memcpy(context->parentImg, intCxt.pagePtr, ORIOLEDB_BLCKSZ);
+						context->partial.isPartial = false;
+
+						/*
+						 * We need to ensure that chunk in locator points to
+						 * context memory instead of "in memory" block
+						 */
+						context->items[context->index].locator.chunk =
+							(BTreePageChunk *) (context->parentImg + SHORT_GET_LOCATION(hdr->chunkDesc[chunkIdx].shortLocation));
+
+					}
+				}
+				else
+				{
+					needLock = true;
+					continue;
+				}
 			}
 		}
 		else if (DOWNLINK_IS_IN_IO(nonLeafHdr->downlink))
 		{
 			int			ionum = DOWNLINK_GET_IO_LOCKNUM(nonLeafHdr->downlink);
+
+			Assert(!O_PAGE_IS_LOCAL(intCxt.blkno));
 
 			if (intCxt.haveLock)
 			{

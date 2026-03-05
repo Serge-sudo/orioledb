@@ -27,6 +27,7 @@
 #include "tableam/tree.h"
 #include "tuple/toast.h"
 #include "utils/stopevent.h"
+#include "utils/page_pool.h"
 
 #include "access/nbtree.h"
 #include "catalog/pg_type.h"

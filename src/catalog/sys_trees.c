@@ -17,7 +17,10 @@
 #include "orioledb.h"
 
 #include "btree/check.h"
+#include "btree/io.h"
 #include "btree/iterator.h"
+#include "btree/page_chunks.h"
+#include "btree/page_contents.h"
 #include "catalog/sys_trees.h"
 #include "catalog/o_sys_cache.h"
 #include "checkpoint/checkpoint.h"
@@ -31,6 +34,8 @@
 #include "funcapi.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
+#include "utils/hsearch.h"
+#include "utils/memutils.h"
 
 typedef struct
 {
@@ -440,6 +445,7 @@ static SysTreeDescr sysTreesDescrs[SYS_TREES_NUM];
 PG_FUNCTION_INFO_V1(orioledb_sys_tree_structure);
 PG_FUNCTION_INFO_V1(orioledb_sys_tree_check);
 PG_FUNCTION_INFO_V1(orioledb_sys_tree_rows);
+PG_FUNCTION_INFO_V1(orioledb_local_sys_tree_rows);
 
 /*
  * Returns size of the shared memory needed for enum tree header.
@@ -502,6 +508,210 @@ get_sys_tree_no_init(int tree_num)
 		return NULL;
 
 	return &sysTreesDescrs[tree_num - 1].descr;
+}
+
+/*
+ * Per-backend local sys trees for temp table metadata.
+ *
+ * localSysTreesDescrs[0] mirrors SYS_TREES_O_TABLES  (index 1 in sysTreesMeta)
+ * localSysTreesDescrs[1] mirrors SYS_TREES_O_INDICES (index 2 in sysTreesMeta)
+ *
+ * They use BTreeStorageInMemory with the local page pool so that temp-table
+ * catalog entries never reach the shared persistent trees and never generate WAL.
+ */
+#define LOCAL_SYS_TREE_O_TABLES_IDX  0	/* mirrors SYS_TREES_O_TABLES  */
+#define LOCAL_SYS_TREE_O_INDICES_IDX 1	/* mirrors SYS_TREES_O_INDICES */
+#define LOCAL_SYS_TREES_COUNT        2
+
+/*
+ * Datoid used for per-backend local sys tree descriptors.  Must not collide
+ * with SYS_TREES_DATOID (1) or any real database OID.  Real PostgreSQL
+ * database OIDs are assigned starting well above the bootstrap OID range
+ * (FirstNormalObjectId = 16384), so a low fixed value of 2 is safe.  We use
+ * the symbolic name to make the intent explicit.
+ */
+#define LOCAL_SYS_TREES_DATOID 2
+
+/*
+ * Per-entry metadata for local (per-backend) sys trees.  Each entry points at
+ * the shared sysTreesMeta[] entry being mirrored and records the OID values to
+ * assign to the local descriptor.
+ */
+typedef struct
+{
+	int			mirrorMetaIdx;	/* index into sysTreesMeta[] of the shared tree */
+	Oid			reloid;			/* reloid / relnode for the local descriptor */
+} LocalSysTreeMeta;
+
+static const LocalSysTreeMeta localSysTreesMeta[] =
+{
+	[LOCAL_SYS_TREE_O_TABLES_IDX] =
+	{
+		.mirrorMetaIdx = SYS_TREES_O_TABLES - 1,
+		.reloid = LOCAL_SYS_TREE_O_TABLES_IDX + 1,
+	},
+	[LOCAL_SYS_TREE_O_INDICES_IDX] =
+	{
+		.mirrorMetaIdx = SYS_TREES_O_INDICES - 1,
+		.reloid = LOCAL_SYS_TREE_O_INDICES_IDX + 1,
+	},
+};
+
+static SysTreeDescr localSysTreesDescrs[LOCAL_SYS_TREES_COUNT];
+
+/*
+ * Hash set of temp table relnodes whose metadata lives in the local trees.
+ * Key is Oid (relnode); no associated value.
+ */
+static HTAB *localTempRelnodesSet = NULL;
+
+static void
+local_sys_tree_init(int local_idx)
+{
+	const LocalSysTreeMeta *lmeta;
+	SysTreeMeta *meta;
+	SysTreeDescr *sd;
+	BTreeDescr *descr;
+	BTreeOps   *ops;
+	PagePool   *pool;
+
+	StaticAssertStmt(lengthof(localSysTreesMeta) == LOCAL_SYS_TREES_COUNT,
+					 "mismatch between localSysTreesMeta and LOCAL_SYS_TREES_COUNT");
+
+	lmeta = &localSysTreesMeta[local_idx];
+	meta = &sysTreesMeta[lmeta->mirrorMetaIdx];
+	sd = &localSysTreesDescrs[local_idx];
+	descr = &sd->descr;
+	ops = &sd->ops;
+	pool = (PagePool *) &local_ppool;
+
+	/* Allocate root and meta pages from the local pool */
+	if (local_ppool.base.ops == NULL)
+		local_ppool_init(&local_ppool, local_page_pool_size_guc);
+	(*pool->ops->reserve_pages) (pool, PPOOL_RESERVE_META, 2);
+
+	descr->rootInfo.rootPageBlkno = (*pool->ops->alloc_page) (pool, PPOOL_RESERVE_META);
+	descr->rootInfo.metaPageBlkno = (*pool->ops->alloc_page) (pool, PPOOL_RESERVE_META);
+	descr->rootInfo.rootPageChangeCount =
+		O_PAGE_GET_CHANGE_COUNT(O_GET_IN_MEMORY_PAGE(descr->rootInfo.rootPageBlkno));
+
+	(*pool->ops->release_reserved) (pool, PPOOL_RESERVE_META_MASK);
+
+	descr->type = oIndexPrimary;
+	/* Use a distinct datoid so IS_SYS_TREE_OIDS() is false for these */
+	descr->oids.datoid = LOCAL_SYS_TREES_DATOID;
+	descr->oids.reloid = lmeta->reloid;
+	descr->oids.relnode = lmeta->reloid;
+
+	descr->arg = meta;
+	ops->key_to_jsonb = meta->keyToJsonb;
+	ops->len = sys_tree_len;
+	ops->tuple_make_key = sys_tree_tuple_make_key;
+	/* No undo for local in-memory trees */
+	ops->needs_undo = NULL;
+	ops->cmp = meta->cmpFunc;
+	ops->unique_hash = NULL;
+	ops->hash = sys_tree_hash;
+	descr->ops = ops;
+
+	descr->compress = InvalidOCompress;
+	descr->fillfactor = BTREE_DEFAULT_FILLFACTOR;
+	descr->ppool = pool;
+	descr->undoType = UndoLogNone;
+	descr->storageType = BTreeStorageInMemory;
+	descr->createOxid = InvalidOXid;
+
+	btree_init_smgr(descr);
+
+	/*
+	 * Initialize the root and meta pages for this local in-memory tree.
+	 * We use noLock=true because local pool pages don't use the shared
+	 * locking protocol (lock_page asserts !O_PAGE_IS_LOCAL).
+	 */
+	init_new_btree_page(descr, descr->rootInfo.rootPageBlkno,
+						O_BTREE_FLAGS_ROOT_INIT, 0, true);
+	init_page_first_chunk(descr,
+						  O_GET_IN_MEMORY_PAGE(descr->rootInfo.rootPageBlkno),
+						  0);
+	init_meta_page(descr->rootInfo.metaPageBlkno, 1);
+
+	sd->initialized = true;
+}
+
+/*
+ * Get the per-backend local O_TABLES descriptor, initializing it on first use.
+ */
+BTreeDescr *
+get_local_sys_tree_o_tables(void)
+{
+	if (!localSysTreesDescrs[LOCAL_SYS_TREE_O_TABLES_IDX].initialized)
+		local_sys_tree_init(LOCAL_SYS_TREE_O_TABLES_IDX);
+	return &localSysTreesDescrs[LOCAL_SYS_TREE_O_TABLES_IDX].descr;
+}
+
+/*
+ * Get the per-backend local O_INDICES descriptor, initializing it on first use.
+ */
+BTreeDescr *
+get_local_sys_tree_o_indices(void)
+{
+	if (!localSysTreesDescrs[LOCAL_SYS_TREE_O_INDICES_IDX].initialized)
+		local_sys_tree_init(LOCAL_SYS_TREE_O_INDICES_IDX);
+	return &localSysTreesDescrs[LOCAL_SYS_TREE_O_INDICES_IDX].descr;
+}
+
+/*
+ * Return true if the given table relnode was registered as a local temp table.
+ */
+bool
+is_local_temp_relnode(Oid relnode)
+{
+	if (localTempRelnodesSet == NULL)
+		return false;
+	return hash_search(localTempRelnodesSet, &relnode, HASH_FIND, NULL) != NULL;
+}
+
+/*
+ * Register a relnode as belonging to a local temp table.
+ */
+void
+mark_local_temp_relnode(Oid relnode)
+{
+	if (localTempRelnodesSet == NULL)
+	{
+		HASHCTL		ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(Oid);
+		ctl.hcxt = TopMemoryContext;
+		localTempRelnodesSet = hash_create("local temp relnode set",
+										   64, &ctl,
+										   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	hash_search(localTempRelnodesSet, &relnode, HASH_ENTER, NULL);
+}
+
+/*
+ * Remove a relnode from the local temp table registry.
+ */
+void
+unmark_local_temp_relnode(Oid relnode)
+{
+	if (localTempRelnodesSet == NULL)
+		return;
+	hash_search(localTempRelnodesSet, &relnode, HASH_REMOVE, NULL);
+}
+
+/*
+ * Returns true if there is at least one local temp table registered.
+ * Used to skip iteration of the local tree when it is empty.
+ */
+bool
+local_sys_trees_have_temp_tables(void)
+{
+	return localTempRelnodesSet != NULL &&
+		hash_get_num_entries(localTempRelnodesSet) > 0;
 }
 
 PrintFunc
@@ -637,6 +847,113 @@ orioledb_sys_tree_rows(PG_FUNCTION_ARGS)
 
 	td = get_sys_tree(num);
 	o_btree_ensure_initialized(get_sys_tree(num));
+
+	it = o_btree_iterator_create(td, NULL, BTreeKeyNone,
+								 &o_in_progress_snapshot, ForwardScanDirection);
+
+	do
+	{
+		bool		end;
+		OTuple		key;
+		bool		allocated;
+		JsonbParseState *state = NULL;
+		Jsonb	   *res;
+		BTreeLeafTuphdr *tupHdr;
+		OTuple		tup;
+
+		tup = btree_iterate_all(it, NULL, BTreeKeyNone, false, &end, NULL,
+								&tupHdr);
+
+		if (O_TUPLE_IS_NULL(tup))
+			break;
+
+		(void) pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+		key = o_btree_tuple_make_key(td, tup, NULL, true, &allocated);
+		jsonb_push_key(&state, "tupHdr");
+		(void) o_tuphdr_to_jsonb(tupHdr, &state);
+		jsonb_push_key(&state, "key");
+		(void) o_btree_key_to_jsonb(td, key, &state);
+		res = JsonbValueToJsonb(pushJsonbValue(&state, WJB_END_OBJECT, NULL));
+		if (allocated)
+			pfree(key.data);
+
+		values[0] = PointerGetDatum(res);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
+							 nulls);
+	} while (true);
+
+	btree_iterator_free(it);
+
+	return (Datum) 0;
+}
+
+/*
+ * Validate local sys tree index (1-based, matching the SQL interface).
+ */
+static void
+check_local_tree_num_input(int num)
+{
+	if (!(num >= 1 && num <= LOCAL_SYS_TREES_COUNT))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Value num must be in the range from 1 to %d",
+						LOCAL_SYS_TREES_COUNT)));
+}
+
+/*
+ * Get the local sys tree descriptor for a 1-based index.
+ * Initializes the descriptor lazily if needed.
+ */
+static BTreeDescr *
+get_local_sys_tree(int num)
+{
+	int			idx = num - 1;
+
+	if (!localSysTreesDescrs[idx].initialized)
+		local_sys_tree_init(idx);
+	return &localSysTreesDescrs[idx].descr;
+}
+
+/*
+ * Returns content of a local (per-backend) sys tree as a SETOF jsonb.
+ * Mirrors orioledb_sys_tree_rows() for the local trees.
+ */
+Datum
+orioledb_local_sys_tree_rows(PG_FUNCTION_ARGS)
+{
+	int			num = PG_GETARG_INT32(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	BTreeIterator *it;
+	BTreeDescr *td;
+	Datum		values[1];
+	bool		nulls[1] = {false};
+	Oid			funcrettype;
+
+	check_local_tree_num_input(num);
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, &funcrettype, NULL) != TYPEFUNC_SCALAR)
+		elog(ERROR, "return type must be a scalar type");
+
+	/* Base data type, i.e. scalar */
+	tupdesc = CreateTemplateTupleDesc(1);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 1, NULL, funcrettype, -1, 0);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	td = get_local_sys_tree(num);
+	o_btree_ensure_initialized(td);
 
 	it = o_btree_iterator_create(td, NULL, BTreeKeyNone,
 								 &o_in_progress_snapshot, ForwardScanDirection);

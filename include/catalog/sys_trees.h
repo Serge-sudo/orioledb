@@ -168,4 +168,29 @@ extern Pointer sys_tree_get_extra(int tree_num);
 extern const text *inspect_sys_tree_structure(int systree, int depth);
 #endif
 
+/*
+ * Per-backend local sys trees for temp table metadata.
+ *
+ * Instead of writing temp-table metadata (OTable/OIndex chunks) to the
+ * shared persistent sys trees (which generates WAL and pollutes shared
+ * memory), we keep it in per-backend in-memory B-trees backed by the
+ * local page pool.  The shared trees are still used for non-temp tables.
+ *
+ * Call get_local_sys_tree_o_tables() / get_local_sys_tree_o_indices() to
+ * obtain the backend-local descriptor for the respective tree.  They are
+ * lazily initialised on first call and require the local page pool to have
+ * been set up (enable_local_page_pool_guc = true).
+ *
+ * is_local_temp_relnode() returns true when the given table OID belongs to a
+ * temp table whose metadata is stored in the local trees.
+ * mark_local_temp_relnode() must be called when a temp table is added to the
+ * local tree, and unmark_local_temp_relnode() when it is dropped.
+ */
+extern BTreeDescr *get_local_sys_tree_o_tables(void);
+extern BTreeDescr *get_local_sys_tree_o_indices(void);
+extern bool is_local_temp_relnode(Oid relnode);
+extern void mark_local_temp_relnode(Oid relnode);
+extern void unmark_local_temp_relnode(Oid relnode);
+extern bool local_sys_trees_have_temp_tables(void);
+
 #endif							/* __SYS_TREES_H__ */
