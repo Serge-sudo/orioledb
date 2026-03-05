@@ -828,13 +828,12 @@ local_ppool_alloc_page(PagePool *pool, int kind)
 		local_pool->numFreePages--;
 
 		blkno = ucm_occupy_free_page(&local_pool->ucm);
-		Assert(OInMemoryBlknoIsValid(blkno));
-
-		/*
-		 * Update current_slot hint to the next position (mirrors the
-		 * unbounded path for consistent hint-tracking semantics).
-		 */
-		local_pool->current_slot = ((blkno & O_BLKNO_MASK) + 1) % local_pool->size;
+		if (!OInMemoryBlknoIsValid(blkno))
+			ereport(ERROR,
+					(errmsg("local page pool is full: could not allocate a page"),
+					 errdetail("All %u pages in the bounded local pool are in use.", (unsigned) local_pool->size),
+					 errhint("Increase orioledb.local_page_pool_size or reduce "
+							 "the size of temporary tables.")));
 
 		return blkno;
 	}
