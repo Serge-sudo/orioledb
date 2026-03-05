@@ -119,18 +119,10 @@ typedef struct LocalPagePool
 								 * size (bounded) */
 	int32		max_size;		/* -1 = unbounded (grows with repalloc), >= 0 =
 								 * fixed max size with eviction */
-	uint32		current_slot;	/* hint for next free slot search (unbounded) or
-								 * last UCM init position (bounded) */
-	uint32		numFreePages;	/* count of free pages (bounded mode only) */
-
-	/*
-	 * Usage Count Map for bounded pools (mirrors OPagePool.ucm). All page
-	 * buffers are pre-allocated at init time so the UCM can always read the
-	 * page header state. ucm_memory holds the backing palloc'd block.
-	 */
-	UsageCountMap ucm;
-	Pointer		ucm_memory;
-
+	uint32		current_slot;	/* hint for next free slot search */
+	uint32		clock_hand;		/* clock sweep hand position (bounded mode) */
+	uint8	   *usage_counts;	/* per-slot usage count array (NULL if
+								 * unbounded) */
 	uint32		numReserved[PPOOL_RESERVE_COUNT];	/* pre-reserved slot counts
 													 * per kind (bounded mode) */
 } LocalPagePool;

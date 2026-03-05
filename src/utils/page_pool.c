@@ -522,6 +522,7 @@ local_ppool_init(LocalPagePool *pool, int32 max_size)
 	pool->size = init_size;
 	pool->max_size = max_size;
 	pool->current_slot = 0;
+	pool->clock_hand = 0;
 	memset(pool->numReserved, 0, sizeof(pool->numReserved));
 	pool->slab_context = SlabContextCreate(TopMemoryContext, "oriole local page pool", ORIOLEDB_BLCKSZ * 16, ORIOLEDB_BLCKSZ);
 	/* This might lead to PANIC on allocation failure in critical section */
@@ -529,42 +530,9 @@ local_ppool_init(LocalPagePool *pool, int32 max_size)
 	pool->base.ops = &local_ppool_ops;
 
 	if (LOCAL_PPOOL_IS_BOUNDED(pool))
-	{
-		Size		ucm_size;
-		int			i;
-
-		/*
-		 * Initialize the UCM for the bounded pool.  Local blknos have bit 31
-		 * set (slot | 0x80000000), so the UCM offset is 0x80000000 and size
-		 * is max_size.  This mirrors how OPagePool uses estimate_ucm_space /
-		 * init_ucm with its shared-memory offset.
-		 */
-		ucm_size = estimate_ucm_space(&pool->ucm, (OInMemoryBlkno) 0x80000000U,
-									  (OInMemoryBlkno) max_size);
-		pool->ucm_memory = palloc(ucm_size);
-		init_ucm(&pool->ucm, pool->ucm_memory, false);
-
-		/*
-		 * Pre-allocate all page buffers and set their initial state to
-		 * UCM_FREE_PAGES_LEVEL.  ucm_occupy_free_page() reads the page header
-		 * state to find a free slot, so the buffers must exist up front.
-		 * init_ucm() already told the UCM tree that all pages are free; we
-		 * just need the page states to agree.
-		 */
-		for (i = 0; i < max_size; i++)
-		{
-			local_ppool_pages[i] = (Page) MemoryContextAllocZero(pool->slab_context, ORIOLEDB_BLCKSZ);
-			pg_atomic_init_u64(&O_PAGE_HEADER(local_ppool_pages[i])->state,
-							   O_PAGE_STATE_SET_USAGE_COUNT(0, UCM_FREE_PAGES_LEVEL));
-		}
-
-		pool->numFreePages = max_size;
-	}
+		pool->usage_counts = (uint8 *) palloc0(init_size * sizeof(uint8));
 	else
-	{
-		pool->ucm_memory = NULL;
-		pool->numFreePages = 0;	/* unused for unbounded */
-	}
+		pool->usage_counts = NULL;
 }
 
 /*
@@ -592,13 +560,8 @@ local_ppool_evict_page(LocalPagePool *local_pool, uint32 slot)
 	FileExtent	extent;
 	uint64		disk_downlink;
 
-	/*
-	 * In bounded mode all page buffers are pre-allocated; a free slot is
-	 * identified by the OIDs being invalid (set to invalid in free_page and
-	 * evict_page cleanup).  NULL check is only needed for the unbounded case,
-	 * but this function is only called for bounded pools.
-	 */
-	if (!ORelOidsIsValid(page_desc->oids))
+	/* Skip uninitialized slots */
+	if (p == NULL || !ORelOidsIsValid(page_desc->oids))
 		return false;
 
 	/* Skip system in-memory trees (they use local pages too) */
@@ -735,13 +698,10 @@ local_ppool_evict_page(LocalPagePool *local_pool, uint32 slot)
 	 */
 	int_hdr->downlink = disk_downlink;
 
-	/* Free the in-memory page slot via UCM */
-	O_PAGE_CHANGE_COUNT_INC(local_ppool_pages[slot]);
-	ORelOidsSetInvalid(local_ppool_page_descs[slot].oids);
-	local_ppool_page_descs[slot].fileExtent.off = InvalidFileExtentOff;
-	local_ppool_page_descs[slot].fileExtent.len = InvalidFileExtentLen;
-	local_pool->numFreePages++;
-	page_change_usage_count(&local_pool->ucm, local_blkno, UCM_FREE_PAGES_LEVEL);
+	/* Free the in-memory page slot and reset usage count */
+	pfree(local_ppool_pages[slot]);
+	local_ppool_pages[slot] = NULL;
+	local_pool->usage_counts[slot] = 0;
 
 	return true;
 }
@@ -811,11 +771,12 @@ local_ppool_alloc_page(PagePool *pool, int kind)
 	{
 		/*
 		 * Bounded mode: reserve_pages() is responsible for pre-evicting pages
-		 * before a critical section.  alloc_page() finds a free slot via the
-		 * UCM (same as o_ppool_get_page does with o_pool->ucm) and returns it.
-		 * All page buffers are pre-allocated, so no palloc happens here.
+		 * before a critical section.  alloc_page() only needs to find a free
+		 * slot; it must not perform any palloc-heavy eviction itself.
 		 */
-		OInMemoryBlkno blkno;
+		uint32		size = local_pool->size;
+		uint32		i;
+		uint32		start;
 
 		/*
 		 * Consume one pre-reserved slot for this kind, if available.
@@ -824,18 +785,26 @@ local_ppool_alloc_page(PagePool *pool, int kind)
 			local_pool->numReserved[kind] > 0)
 			local_pool->numReserved[kind]--;
 
-		Assert(local_pool->numFreePages > 0);
-		local_pool->numFreePages--;
+		/* Scan for a free slot starting at current_slot */
+		start = local_pool->current_slot;
+		i = start;
+		do
+		{
+			if (local_ppool_pages[i] == NULL)
+			{
+				local_ppool_pages[i] = (Page) MemoryContextAllocZero(local_pool->slab_context, ORIOLEDB_BLCKSZ);
+				local_pool->current_slot = (i + 1) % size;
+				return i | 0x80000000;
+			}
+			i = (i + 1) % size;
+		} while (i != start);
 
-		blkno = ucm_occupy_free_page(&local_pool->ucm);
-		if (!OInMemoryBlknoIsValid(blkno))
-			ereport(ERROR,
-					(errmsg("local page pool is full: could not allocate a page"),
-					 errdetail("All %u pages in the bounded local pool are in use.", (unsigned) local_pool->size),
-					 errhint("Increase orioledb.local_page_pool_size or reduce "
-							 "the size of temporary tables.")));
-
-		return blkno;
+		ereport(ERROR,
+				(errmsg("local page pool is full: could not allocate a page"),
+				 errdetail("All %u pages in the bounded local pool are in use.", (unsigned) size),
+				 errhint("Increase orioledb.local_page_pool_size or reduce "
+						 "the size of temporary tables.")));
+		return OInvalidInMemoryBlkno; /* unreachable */
 	}
 }
 
@@ -852,25 +821,12 @@ local_ppool_free_page(PagePool *pool, OInMemoryBlkno blkno, bool haveLock)
 	LocalPagePool *local_pool = (LocalPagePool *) pool;
 	int			i = blkno & O_BLKNO_MASK;
 
+	pfree(local_ppool_pages[i]);
+	local_ppool_pages[i] = NULL;
+
+	/* Reset usage count when page is freed */
 	if (LOCAL_PPOOL_IS_BOUNDED(local_pool))
-	{
-		/*
-		 * Bounded mode: page buffer is pre-allocated and stays allocated.
-		 * Increment change count (to invalidate stale downlinks), reset the
-		 * descriptor, and mark the page free in the UCM.
-		 */
-		O_PAGE_CHANGE_COUNT_INC(local_ppool_pages[i]);
-		ORelOidsSetInvalid(local_ppool_page_descs[i].oids);
-		local_ppool_page_descs[i].fileExtent.off = InvalidFileExtentOff;
-		local_ppool_page_descs[i].fileExtent.len = InvalidFileExtentLen;
-		local_pool->numFreePages++;
-		page_change_usage_count(&local_pool->ucm, blkno, UCM_FREE_PAGES_LEVEL);
-	}
-	else
-	{
-		pfree(local_ppool_pages[i]);
-		local_ppool_pages[i] = NULL;
-	}
+		local_pool->usage_counts[i] = 0;
 }
 
 void
@@ -878,14 +834,16 @@ local_ppool_reserve_pages(PagePool *pool, int kind, int count)
 {
 	LocalPagePool *local_pool = (LocalPagePool *) pool;
 	int			need;
+	uint32		size;
+	uint32		i;
+	uint32		free_slots;
 	uint32		tries;
 
 	/*
 	 * For bounded pools we must pre-evict pages here, outside any critical
 	 * section, so that the subsequent alloc_page calls (which may run inside
 	 * START_CRIT_SECTION) only need to grab a pre-freed slot from the pool.
-	 * Those grabs use ucm_occupy_free_page() which does no allocation and is
-	 * safe inside a critical section.
+	 * Those grabs use the slab context (allowInCritSection=true) and are safe.
 	 *
 	 * For unbounded pools the array grows with realloc() (not palloc) and the
 	 * slot is filled from the slab context, so no pre-eviction is needed.
@@ -900,13 +858,21 @@ local_ppool_reserve_pages(PagePool *pool, int kind, int count)
 	if (need <= 0)
 		return;
 
+	size = local_pool->size;
+
 	/*
 	 * Run the clock sweep (via run_maintenance) until we have at least 'need'
-	 * free slots available, as tracked by numFreePages.
+	 * free slots available.  We recount after each maintenance call; the
+	 * count is bounded by size, so this is O(size * tries).
 	 */
-	for (tries = 0; tries < 2 * local_pool->size; tries++)
+	for (tries = 0; tries < 2 * size; tries++)
 	{
-		if ((int) local_pool->numFreePages >= need)
+		free_slots = 0;
+		for (i = 0; i < size; i++)
+			if (local_ppool_pages[i] == NULL)
+				free_slots++;
+
+		if (free_slots >= (uint32) need)
 			break;
 
 		local_ppool_run_maintenance(pool, true, NULL);
@@ -947,46 +913,38 @@ void
 local_ppool_run_maintenance(PagePool *pool, bool evict, volatile sig_atomic_t *shutdown_requested)
 {
 	LocalPagePool *local_pool = (LocalPagePool *) pool;
-	OInMemoryBlkno init_blkno,
-				blkno;
+	uint32		size;
+	uint32		i;
 	uint32		tries;
 
 	if (!LOCAL_PPOOL_IS_BOUNDED(local_pool))
 		return;
 
+	size = local_pool->size;
+
 	/*
-	 * Use ucm_next_blkno() to find the page with the lowest relative usage
-	 * count — the same strategy used by the shared pool (o_ppool_run_maintenance).
-	 * current_slot serves as the rotating start position so successive calls
-	 * scan different parts of the pool rather than always revisiting the same
-	 * pages.
-	 *
-	 * Our eviction attempts shouldn't themselves affect UCM counters (mirrors
-	 * the shared pool's set_skip_ucm() / unset_skip_ucm() pattern).
+	 * Run the clock sweep: advance clock_hand, decrement usage counts, and
+	 * evict a page when usage_count reaches 0.  Stop as soon as a slot is
+	 * freed (either already free or successfully evicted) or after one full
+	 * cycle (all pages unevictable).
 	 */
-	init_blkno = local_pool->ucm.offset + local_pool->current_slot;
-	set_skip_ucm();
-
-	for (tries = 0; tries < local_pool->size; tries++)
+	for (tries = 0; tries < size; tries++)
 	{
-		blkno = ucm_next_blkno(&local_pool->ucm, init_blkno, 1);
+		i = local_pool->clock_hand;
+		local_pool->clock_hand = (i + 1) % size;
 
-		/* Advance start position for the next run_maintenance call */
-		local_pool->current_slot = ((blkno & O_BLKNO_MASK) + 1) % local_pool->size;
-		init_blkno = blkno + 1;
-		if (init_blkno >= local_pool->ucm.offset + local_pool->size)
-			init_blkno = local_pool->ucm.offset;
+		if (local_ppool_pages[i] == NULL)
+			return;				/* slot already free */
 
-		if (local_ppool_evict_page(local_pool, blkno & O_BLKNO_MASK))
+		if (local_pool->usage_counts[i] > 0)
 		{
-			unset_skip_ucm();
-			if (ucm_epoch_needs_shift(&local_pool->ucm))
-				ucm_epoch_shift(&local_pool->ucm);
-			return;
+			local_pool->usage_counts[i]--;
+			continue;			/* give this page another chance next round */
 		}
-	}
 
-	unset_skip_ucm();
+		if (local_ppool_evict_page(local_pool, i))
+			return;				/* freed one slot */
+	}
 }
 
 OInMemoryBlkno
@@ -1003,25 +961,18 @@ local_ucm_inc_usage(PagePool *pool, OInMemoryBlkno blkno)
 	LocalPagePool *local_pool = (LocalPagePool *) pool;
 
 	if (LOCAL_PPOOL_IS_BOUNDED(local_pool))
-		page_inc_usage_count(&local_pool->ucm, blkno);
+	{
+		uint32		slot = blkno & O_BLKNO_MASK;
+
+		if (slot < local_pool->size && local_pool->usage_counts[slot] < UINT8_MAX)
+			local_pool->usage_counts[slot]++;
+	}
 }
 
 void
 local_ucm_init(PagePool *pool, OInMemoryBlkno blkno)
 {
-	LocalPagePool *local_pool = (LocalPagePool *) pool;
-
-	if (LOCAL_PPOOL_IS_BOUNDED(local_pool))
-	{
-		/*
-		 * Set initial usage count to (epoch + 2) % UCM_USAGE_LEVELS, the
-		 * same value used by o_ucm_init for the shared pool.  This places
-		 * freshly allocated pages two steps ahead of the current eviction
-		 * frontier, giving them a chance to be reused before being evicted.
-		 */
-		page_change_usage_count(&local_pool->ucm, blkno,
-								(pg_atomic_read_u32(local_pool->ucm.epoch) + 2) % UCM_USAGE_LEVELS);
-	}
+	/* Stub: do nothing */
 }
 
 /*
@@ -1084,7 +1035,6 @@ local_load_page(OBTreeFindPageContext *context)
 	OInMemoryBlkno new_blkno;
 	OrioleDBPageDesc *parent_page_desc,
 			   *new_page_desc;
-	char	   *tmp_buf;
 
 	int_hdr = (BTreeNonLeafTuphdr *)
 		BTREE_PAGE_LOCATOR_GET_ITEM(parent_page, parent_loc);
@@ -1093,16 +1043,6 @@ local_load_page(OBTreeFindPageContext *context)
 	disk_downlink = int_hdr->downlink;
 	extent.off = DOWNLINK_GET_DISK_OFF(disk_downlink);
 	extent.len = DOWNLINK_GET_DISK_LEN(disk_downlink);
-
-	/*
-	 * Reserve one FIND-kind slot before allocating.  For the shared pool this
-	 * is done in load_page() (io.c) before alloc_page.  For the local pool,
-	 * local_load_page is called from find.c after encountering an on-disk
-	 * downlink during traversal; the caller may not have reserved a FIND slot,
-	 * so we do it here to ensure eviction can happen outside any critical
-	 * section if the pool is full.
-	 */
-	(*desc->ppool->ops->reserve_pages) (desc->ppool, PPOOL_RESERVE_FIND, 1);
 
 	/*
 	 * Allocate a new slot in the local pool for the reloaded page.  This may
@@ -1120,31 +1060,14 @@ local_load_page(OBTreeFindPageContext *context)
 	new_page_desc->fileExtent = extent;
 
 	/*
-	 * Read the page into a temporary buffer first.  write_page_to_disk()
-	 * stores an OrioleDBOndiskPageHeader in the first 16 bytes of the file
-	 * image (with page_version, checkpointNum, etc.), so we cannot read
-	 * directly into the in-memory slot — that would corrupt the in-memory
-	 * OrioleDBPageHeader (state, pageChangeCount).  Instead, mirroring what
-	 * load_page() does for the shared pool: read into tmp_buf, then copy via
-	 * put_page_image() which skips the first sizeof(OrioleDBPageHeader) bytes,
-	 * preserving the in-memory state.  Finally call ucm_init to assign a
-	 * proper UCM usage count.
+	 * Read the page from the BTree's own smgr file.  The file was written via
+	 * perform_page_io_autonomous so read_page_from_disk can read it back.
 	 */
-	tmp_buf = (char *) palloc(ORIOLEDB_BLCKSZ);
-	if (!read_page_from_disk(desc, tmp_buf, disk_downlink,
+	if (!read_page_from_disk(desc, O_GET_IN_MEMORY_PAGE(new_blkno), disk_downlink,
 							 &new_page_desc->fileExtent))
-	{
-		pfree(tmp_buf);
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not read evicted local page from BTree file: %m")));
-	}
-
-	put_page_image(new_blkno, tmp_buf);
-	pfree(tmp_buf);
-
-	/* Assign a proper UCM usage count to the freshly loaded page */
-	(*desc->ppool->ops->ucm_init) (desc->ppool, new_blkno);
 
 	/*
 	 * Update the parent's downlink to point to the new in-memory blkno.
