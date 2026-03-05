@@ -531,6 +531,31 @@ get_sys_tree_no_init(int tree_num)
  */
 #define LOCAL_SYS_TREES_DATOID 2
 
+/*
+ * Per-entry metadata for local (per-backend) sys trees.  Each entry points at
+ * the shared sysTreesMeta[] entry being mirrored and records the OID values to
+ * assign to the local descriptor.
+ */
+typedef struct
+{
+	int			mirrorMetaIdx;	/* index into sysTreesMeta[] of the shared tree */
+	Oid			reloid;			/* reloid / relnode for the local descriptor */
+} LocalSysTreeMeta;
+
+static const LocalSysTreeMeta localSysTreesMeta[] =
+{
+	[LOCAL_SYS_TREE_O_TABLES_IDX] =
+	{
+		.mirrorMetaIdx = SYS_TREES_O_TABLES - 1,
+		.reloid = LOCAL_SYS_TREE_O_TABLES_IDX + 1,
+	},
+	[LOCAL_SYS_TREE_O_INDICES_IDX] =
+	{
+		.mirrorMetaIdx = SYS_TREES_O_INDICES - 1,
+		.reloid = LOCAL_SYS_TREE_O_INDICES_IDX + 1,
+	},
+};
+
 static SysTreeDescr localSysTreesDescrs[LOCAL_SYS_TREES_COUNT];
 
 /*
@@ -542,19 +567,22 @@ static HTAB *localTempRelnodesSet = NULL;
 static void
 local_sys_tree_init(int local_idx)
 {
-	/*
-	 * mirror_meta_idx is the index into sysTreesMeta[] for the shared tree we
-	 * are mirroring: O_TABLES is tree #2 -> index 1, O_INDICES is tree #3 ->
-	 * index 2.
-	 */
-	int			mirror_meta_idx = (local_idx == LOCAL_SYS_TREE_O_TABLES_IDX)
-		? (SYS_TREES_O_TABLES - 1)
-		: (SYS_TREES_O_INDICES - 1);
-	SysTreeMeta *meta = &sysTreesMeta[mirror_meta_idx];
-	SysTreeDescr *sd = &localSysTreesDescrs[local_idx];
-	BTreeDescr *descr = &sd->descr;
-	BTreeOps   *ops = &sd->ops;
-	PagePool   *pool = (PagePool *) &local_ppool;
+	const LocalSysTreeMeta *lmeta;
+	SysTreeMeta *meta;
+	SysTreeDescr *sd;
+	BTreeDescr *descr;
+	BTreeOps   *ops;
+	PagePool   *pool;
+
+	StaticAssertStmt(lengthof(localSysTreesMeta) == LOCAL_SYS_TREES_COUNT,
+					 "mismatch between localSysTreesMeta and LOCAL_SYS_TREES_COUNT");
+
+	lmeta = &localSysTreesMeta[local_idx];
+	meta = &sysTreesMeta[lmeta->mirrorMetaIdx];
+	sd = &localSysTreesDescrs[local_idx];
+	descr = &sd->descr;
+	ops = &sd->ops;
+	pool = (PagePool *) &local_ppool;
 
 	/* Allocate root and meta pages from the local pool */
 	if (local_ppool.base.ops == NULL)
@@ -571,8 +599,8 @@ local_sys_tree_init(int local_idx)
 	descr->type = oIndexPrimary;
 	/* Use a distinct datoid so IS_SYS_TREE_OIDS() is false for these */
 	descr->oids.datoid = LOCAL_SYS_TREES_DATOID;
-	descr->oids.reloid = local_idx + 1;
-	descr->oids.relnode = local_idx + 1;
+	descr->oids.reloid = lmeta->reloid;
+	descr->oids.relnode = lmeta->reloid;
 
 	descr->arg = meta;
 	ops->key_to_jsonb = meta->keyToJsonb;
