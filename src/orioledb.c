@@ -54,6 +54,8 @@
 #include "access/heapam.h"
 #include "access/table.h"
 #include "access/xlog_internal.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_enum.h"
 #include "executor/execExpr.h"
 #include "funcapi.h"
@@ -1673,6 +1675,34 @@ o_invalidate_oids(ORelOids oids)
 	SharedInvalidationMessage msg;
 
 	Assert(ORelOidsIsValid(oids));
+
+	/*
+	 * For temp relations, only invalidate the local backend's descriptor
+	 * cache.  Temp relations are only accessible to the current backend, so
+	 * there is no need to broadcast the invalidation to other backends.
+	 *
+	 * When the syscache lookup fails (tuple not found), we fall through to the
+	 * normal broadcast path, which is safe: it may send an unnecessary
+	 * message but will not cause incorrect behavior.
+	 */
+	if (OidIsValid(oids.reloid) && IsTransactionState())
+	{
+		HeapTuple	tp;
+
+		tp = SearchSysCache1(RELOID, ObjectIdGetDatum(oids.reloid));
+		if (HeapTupleIsValid(tp))
+		{
+			Oid			nspoid = ((Form_pg_class) GETSTRUCT(tp))->relnamespace;
+
+			if (isTempOrTempToastNamespace(nspoid))
+			{
+				ReleaseSysCache(tp);
+				o_invalidate_descrs(oids.datoid, oids.reloid, oids.relnode);
+				return;
+			}
+			ReleaseSysCache(tp);
+		}
+	}
 
 	msg.usr.id = SHAREDINVALUSERCACHE_ID;
 	msg.usr.arg1 = oids.datoid;
