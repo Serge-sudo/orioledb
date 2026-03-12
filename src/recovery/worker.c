@@ -797,7 +797,7 @@ apply_tbl_insert(OTableDescr *descr, OTuple tuple,
 
 		if (!isPrimary)
 		{
-			stuple = tts_orioledb_make_secondary_tuple(slot, descr->indices[i], true);
+			stuple = tts_orioledb_make_secondary_tuple(slot, descr->indices[i], descr, true);
 		}
 
 		if (!isPrimary)
@@ -1012,7 +1012,7 @@ apply_tbl_update(OTableDescr *descr, OTuple tuple,
 				{
 					callbackInfo.modifyDeletedCallback = recovery_insert_deleted_overwrite_callback;
 					callbackInfo.modifyCallback = recovery_insert_overwrite_callback;
-					new_stup = tts_orioledb_make_secondary_tuple(new_slot, tree, true);
+					new_stup = tts_orioledb_make_secondary_tuple(new_slot, tree, descr, true);
 					(void) o_btree_modify(&tree->desc, BTreeOperationInsert,
 										  new_stup, BTreeKeyLeafTuple,
 										  (Pointer) &new_key, BTreeKeyBound,

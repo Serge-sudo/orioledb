@@ -974,25 +974,28 @@ tts_orioledb_get_index_values(TupleTableSlot *slot, OIndexDescr *idx,
 }
 
 OTuple
-tts_orioledb_make_secondary_tuple(TupleTableSlot *slot, OIndexDescr *idx, bool leaf)
+tts_orioledb_make_secondary_tuple(TupleTableSlot *slot, OIndexDescr *idx,
+								  OTableDescr *descr, bool leaf)
 {
 	Datum		values[2 * INDEX_MAX_KEYS];
 	bool		isnull[2 * INDEX_MAX_KEYS];
-	bool		vfree[2 * INDEX_MAX_KEYS];
 	TupleDesc	tupleDesc;
 	OTupleFixedFormatSpec *spec;
-	int			ctid_off = idx->primaryIsCtid ? 1 : 0;
 	OTableSlot *oslot = (OTableSlot *) slot;
 	BrigeData	bridge_data;
 	BrigeData  *bridge_data_arg = NULL;
-	int			i;
-	int			tup_ctid_off;
-	int			nvals;
-	OTuple		result;
+	int			i,
+				natts;
+	ListCell   *indexpr_item;
 
-	slot_getsomeattrs(slot, idx->maxTableAttnum - ctid_off);
-
-	tts_orioledb_get_index_values(slot, idx, values, isnull, leaf);
+	/*
+	 * Ensure values stored in the slot are properly compressed/toasted, just
+	 * as tts_orioledb_toast() is called before tts_orioledb_form_orphan_tuple().
+	 * This is a no-op when values were already processed (e.g. in the INSERT
+	 * path), and compresses inline varlenas for the index-build path where the
+	 * primary slot is populated directly from the primary B-tree.
+	 */
+	tts_orioledb_toast(slot, descr);
 
 	if (leaf)
 	{
@@ -1014,56 +1017,51 @@ tts_orioledb_make_secondary_tuple(TupleTableSlot *slot, OIndexDescr *idx, bool l
 	}
 
 	/*
-	 * If the secondary tuple would exceed the index size limit, try to
-	 * compress any large decompressed varlena values inline using PGLZ.
-	 * This mirrors the compression that tts_orioledb_toast() applies to
-	 * primary tuples, and handles the case where o_get_tbl_att() returned
-	 * a fully decompressed value (e.g. a previously PGLZ-compressed field
-	 * read back from the primary index during index build).
-	 *
-	 * tup_ctid_off accounts for a bridge ctid at position 0 in tupleDesc
-	 * that is supplied via bridge_data_arg rather than in values[].
+	 * Collect index values directly from slot->tts_values[], like
+	 * tts_orioledb_form_orphan_tuple() does for primary tuples.  Using the
+	 * slot values directly (rather than going through o_get_tbl_att() which
+	 * calls PG_DETOAST_DATUM) preserves any inline-compressed varlena data
+	 * without decompressing it, preventing oversized secondary tuples for
+	 * columns whose values were PGLZ-compressed in the primary index.
 	 */
-	tup_ctid_off = (bridge_data_arg != NULL) ? 1 : 0;
-	nvals = tupleDesc->natts - tup_ctid_off;
+	natts = tupleDesc->natts;
+	indexpr_item = list_head(idx->expressions_state);
 
-	memset(vfree, 0, sizeof(vfree));
+	Assert(natts <= 2 * INDEX_MAX_KEYS);
 
-	if (o_new_tuple_size(tupleDesc, spec, NULL, bridge_data_arg, 0,
-						 values, isnull, NULL) > O_BTREE_MAX_TUPLE_SIZE)
+	for (i = 0; i < natts; i++)
 	{
-		for (i = 0; i < nvals; i++)
+		int			attnum = idx->tableAttnums[i];
+
+		if (attnum == EXPR_ATTNUM)
 		{
-			Form_pg_attribute att = TupleDescAttr(tupleDesc, i + tup_ctid_off);
+			values[i] = o_get_idx_expr_att(slot, idx,
+										   (ExprState *) lfirst(indexpr_item),
+										   &isnull[i]);
+			indexpr_item = lnext(idx->expressions_state, indexpr_item);
+		}
+		else if (idx->primaryIsCtid && attnum == 1)
+		{
+			/* ctid-based primary key column */
+			isnull[i] = false;
+			values[i] = PointerGetDatum(&slot->tts_tid);
+		}
+		else if (attnum == -1)
+		{
+			/* bridge ctid column */
+			isnull[i] = false;
+			values[i] = PointerGetDatum(&oslot->bridge_ctid);
+		}
+		else
+		{
+			int			slot_idx = idx->primaryIsCtid ? attnum - 2 : attnum - 1;
 
-			if (!isnull[i] && att->attlen == -1 &&
-				!VARATT_IS_COMPRESSED(values[i]) &&
-				!VARATT_IS_EXTERNAL(values[i]) &&
-				!VARATT_IS_SHORT(values[i]))
-			{
-				Datum		compressed;
-
-				compressed = toast_compress_datum(values[i],
-												  TOAST_PGLZ_COMPRESSION);
-				if (DatumGetPointer(compressed) != NULL)
-				{
-					values[i] = compressed;
-					vfree[i] = true;
-				}
-			}
+			isnull[i] = slot->tts_isnull[slot_idx];
+			values[i] = slot->tts_values[slot_idx];
 		}
 	}
 
-	result = o_form_tuple(tupleDesc, spec, 0, values, isnull, bridge_data_arg);
-
-	/* Free any locally allocated compressed values */
-	for (i = 0; i < nvals; i++)
-	{
-		if (vfree[i])
-			pfree(DatumGetPointer(values[i]));
-	}
-
-	return result;
+	return o_form_tuple(tupleDesc, spec, 0, values, isnull, bridge_data_arg);
 }
 
 /* fills key bound from tuple or index tuple that belongs to current BTree */

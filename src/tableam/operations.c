@@ -1893,7 +1893,7 @@ o_tbl_index_insert(OTableDescr *descr,
 		else
 		{
 			tts_orioledb_fill_key_bound(slot, id, &knew);
-			tup = tts_orioledb_make_secondary_tuple(slot, id, true);
+			tup = tts_orioledb_make_secondary_tuple(slot, id, descr, true);
 		}
 		o_btree_check_size_of_tuple(o_tuple_size(tup, &id->leafSpec),
 									id->name.data, true);
