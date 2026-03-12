@@ -60,7 +60,6 @@ extern void tts_orioledb_store_non_leaf_tuple(TupleTableSlot *slot,
 											  BTreeLocationHint *hint);
 extern OTuple tts_orioledb_make_secondary_tuple(TupleTableSlot *slot,
 												OIndexDescr *idx,
-												OTableDescr *descr,
 												bool leaf);
 extern void tts_orioledb_fill_key_bound(TupleTableSlot *slot, OIndexDescr *idx,
 										OBTreeKeyBound *bound);
@@ -90,8 +89,17 @@ extern bool tts_orioledb_modified(TupleTableSlot *oldSlot,
 								  TupleTableSlot *newSlot,
 								  Bitmapset *attrs);
 extern void tts_orioledb_set_ctid(TupleTableSlot *slot, ItemPointer iptr);
+/*
+ * Callback passed to o_get_tbl_att() to control whether a particular value
+ * should be detoasted.  Returns true if the value should be detoasted, false
+ * to return the raw (possibly compressed/external) datum as-is.  Pass NULL
+ * to always detoast (the default behaviour).
+ */
+typedef bool (*ODetoastCallback) (Datum value);
+
 extern Datum o_get_tbl_att(TupleTableSlot *slot, int attnum, bool primaryIsCtid,
-						   bool *isnull, Oid *typid);
+						   bool *isnull, Oid *typid,
+						   ODetoastCallback should_detoast);
 Datum		o_get_idx_expr_att(TupleTableSlot *slot, OIndexDescr *idx,
 							   ExprState *exp_state, bool *isnull);
 

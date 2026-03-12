@@ -1355,7 +1355,7 @@ build_secondary_index_worker_heap_scan(OTableDescr *descr, OIndexDescr *idx,
 		if (o_is_index_predicate_satisfied(idx, primarySlot, idx->econtext))
 		{
 			secondaryTup = tts_orioledb_make_secondary_tuple(primarySlot,
-															 idx, descr, true);
+															 idx, true);
 			(*index_tuples[0])++;
 
 			o_btree_check_size_of_tuple(o_tuple_size(secondaryTup,
@@ -1810,7 +1810,7 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 			else
 			{
 				newTup = tts_orioledb_make_secondary_tuple(primarySlot,
-														   idx, descr, true);
+														   idx, true);
 			}
 			o_btree_check_size_of_tuple(o_tuple_size(newTup, &idx->leafSpec),
 										idx->name.data, true);
@@ -1822,7 +1822,7 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 
 		if (descr->bridge)
 		{
-			OTuple		newTup = tts_orioledb_make_secondary_tuple(primarySlot, descr->bridge, descr, true);
+			OTuple		newTup = tts_orioledb_make_secondary_tuple(primarySlot, descr->bridge, true);
 
 			tuplesort_putotuple(sortstates[descr->nIndices + 1], newTup);
 			pfree(newTup.data);

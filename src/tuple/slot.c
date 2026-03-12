@@ -496,7 +496,8 @@ tts_orioledb_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 		if (!primary->primaryIsCtid)
 		{
 			tts_orioledb_getsomeattrs(slot, primary->maxTableAttnum - ctid_off);
-			tts_orioledb_get_index_values(slot, primary, values, isnulls, false);
+			tts_orioledb_get_index_values(slot, primary, values, isnulls, false,
+										  NULL);
 		}
 		result = o_new_rowid(primary, slot, values, isnulls,
 							 oslot->csn, &oslot->hint);
@@ -860,7 +861,7 @@ tts_orioledb_store_non_leaf_tuple(TupleTableSlot *slot, OTuple tuple,
 
 Datum
 o_get_tbl_att(TupleTableSlot *slot, int attnum, bool primaryIsCtid,
-			  bool *isnull, Oid *typid)
+			  bool *isnull, Oid *typid, ODetoastCallback should_detoast)
 {
 	int			i;
 	Datum		value;
@@ -907,7 +908,8 @@ o_get_tbl_att(TupleTableSlot *slot, int attnum, bool primaryIsCtid,
 	*isnull = slot->tts_isnull[i];
 	value = slot->tts_values[i];
 
-	if (!*isnull && att->attlen < 0 && VARATT_IS_EXTENDED(value))
+	if (!*isnull && att->attlen < 0 && VARATT_IS_EXTENDED(value) &&
+		(should_detoast == NULL || should_detoast(value)))
 	{
 		if (!oSlot->to_toast)
 			alloc_to_toast_vfree_detoasted(&oSlot->base);
@@ -944,10 +946,13 @@ o_get_idx_expr_att(TupleTableSlot *slot, OIndexDescr *idx,
  *
  * Detoasts all the values and marks detoasted values in 'detoasted' array.
  * If 'detoasted' array isn't given, asserts not values are toasted.
+ * The optional 'should_detoast' callback controls per-value detoasting;
+ * pass NULL to always detoast (default behaviour).
  */
 static void
 tts_orioledb_get_index_values(TupleTableSlot *slot, OIndexDescr *idx,
-							  Datum *values, bool *isnull, bool leaf)
+							  Datum *values, bool *isnull, bool leaf,
+							  ODetoastCallback should_detoast)
 {
 	TupleDesc	tupleDesc = leaf ? idx->leafTupdesc : idx->nonLeafTupdesc;
 	int			natts = tupleDesc->natts;
@@ -962,7 +967,7 @@ tts_orioledb_get_index_values(TupleTableSlot *slot, OIndexDescr *idx,
 
 		if (attnum != EXPR_ATTNUM)
 			values[i] = o_get_tbl_att(slot, attnum, idx->primaryIsCtid,
-									  &isnull[i], NULL);
+									  &isnull[i], NULL, should_detoast);
 		else
 		{
 			values[i] = o_get_idx_expr_att(slot, idx,
@@ -973,29 +978,35 @@ tts_orioledb_get_index_values(TupleTableSlot *slot, OIndexDescr *idx,
 	}
 }
 
+/*
+ * Callback for o_get_tbl_att() used when forming secondary index tuples.
+ * Inline-compressed varlena values are stored without decompressing them so
+ * that the secondary tuple stays within the index size limit.  External TOAST
+ * values must still be fetched, so only VARATT_IS_COMPRESSED datums are left
+ * as-is; everything else is detoasted normally.
+ */
+static bool
+o_skip_compressed_detoast_cb(Datum value)
+{
+	return !VARATT_IS_COMPRESSED(DatumGetPointer(value));
+}
+
 OTuple
-tts_orioledb_make_secondary_tuple(TupleTableSlot *slot, OIndexDescr *idx,
-								  OTableDescr *descr, bool leaf)
+tts_orioledb_make_secondary_tuple(TupleTableSlot *slot, OIndexDescr *idx, bool leaf)
 {
 	Datum		values[2 * INDEX_MAX_KEYS];
 	bool		isnull[2 * INDEX_MAX_KEYS];
 	TupleDesc	tupleDesc;
 	OTupleFixedFormatSpec *spec;
+	int			ctid_off = idx->primaryIsCtid ? 1 : 0;
 	OTableSlot *oslot = (OTableSlot *) slot;
 	BrigeData	bridge_data;
 	BrigeData  *bridge_data_arg = NULL;
-	int			i,
-				natts;
-	ListCell   *indexpr_item;
 
-	/*
-	 * Ensure values stored in the slot are properly compressed/toasted, just
-	 * as tts_orioledb_toast() is called before tts_orioledb_form_orphan_tuple().
-	 * This is a no-op when values were already processed (e.g. in the INSERT
-	 * path), and compresses inline varlenas for the index-build path where the
-	 * primary slot is populated directly from the primary B-tree.
-	 */
-	tts_orioledb_toast(slot, descr);
+	slot_getsomeattrs(slot, idx->maxTableAttnum - ctid_off);
+
+	tts_orioledb_get_index_values(slot, idx, values, isnull, leaf,
+								  o_skip_compressed_detoast_cb);
 
 	if (leaf)
 	{
@@ -1014,51 +1025,6 @@ tts_orioledb_make_secondary_tuple(TupleTableSlot *slot, OIndexDescr *idx,
 		bridge_data.is_pkey = false;
 		bridge_data.attnum = 1;
 		bridge_data_arg = &bridge_data;
-	}
-
-	/*
-	 * Collect index values directly from slot->tts_values[], like
-	 * tts_orioledb_form_orphan_tuple() does for primary tuples.  Using the
-	 * slot values directly (rather than going through o_get_tbl_att() which
-	 * calls PG_DETOAST_DATUM) preserves any inline-compressed varlena data
-	 * without decompressing it, preventing oversized secondary tuples for
-	 * columns whose values were PGLZ-compressed in the primary index.
-	 */
-	natts = tupleDesc->natts;
-	indexpr_item = list_head(idx->expressions_state);
-
-	Assert(natts <= 2 * INDEX_MAX_KEYS);
-
-	for (i = 0; i < natts; i++)
-	{
-		int			attnum = idx->tableAttnums[i];
-
-		if (attnum == EXPR_ATTNUM)
-		{
-			values[i] = o_get_idx_expr_att(slot, idx,
-										   (ExprState *) lfirst(indexpr_item),
-										   &isnull[i]);
-			indexpr_item = lnext(idx->expressions_state, indexpr_item);
-		}
-		else if (idx->primaryIsCtid && attnum == 1)
-		{
-			/* ctid-based primary key column */
-			isnull[i] = false;
-			values[i] = PointerGetDatum(&slot->tts_tid);
-		}
-		else if (attnum == -1)
-		{
-			/* bridge ctid column */
-			isnull[i] = false;
-			values[i] = PointerGetDatum(&oslot->bridge_ctid);
-		}
-		else
-		{
-			int			slot_idx = idx->primaryIsCtid ? attnum - 2 : attnum - 1;
-
-			isnull[i] = slot->tts_isnull[slot_idx];
-			values[i] = slot->tts_values[slot_idx];
-		}
 	}
 
 	return o_form_tuple(tupleDesc, spec, 0, values, isnull, bridge_data_arg);
@@ -1087,7 +1053,7 @@ tts_orioledb_fill_key_bound(TupleTableSlot *slot, OIndexDescr *idx,
 
 		if (attnum != EXPR_ATTNUM)
 			value = o_get_tbl_att(slot, attnum, idx->primaryIsCtid,
-								  &isnull, &typid);
+								  &isnull, &typid, NULL);
 		else
 		{
 			value = o_get_idx_expr_att(slot, idx,
@@ -1127,7 +1093,7 @@ appendStringInfoIndexKey(StringInfo str, TupleTableSlot *slot, OIndexDescr *id)
 
 		if (attnum != EXPR_ATTNUM)
 			value = o_get_tbl_att(slot, attnum, id->primaryIsCtid,
-								  &isnull, NULL);
+								  &isnull, NULL, NULL);
 		else
 		{
 			value = o_get_idx_expr_att(slot, id,

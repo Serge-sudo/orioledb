@@ -610,7 +610,7 @@ exclusion_fill_bound(TupleTableSlot *slot, OIndexDescr *idx, OBTreeKeyBound *bou
 
 		if (attnum != EXPR_ATTNUM)
 			value = o_get_tbl_att(slot, attnum, idx->primaryIsCtid,
-								  &isnull, &typid);
+								  &isnull, &typid, NULL);
 		else
 		{
 			value = o_get_idx_expr_att(slot, idx,
@@ -1893,7 +1893,7 @@ o_tbl_index_insert(OTableDescr *descr,
 		else
 		{
 			tts_orioledb_fill_key_bound(slot, id, &knew);
-			tup = tts_orioledb_make_secondary_tuple(slot, id, descr, true);
+			tup = tts_orioledb_make_secondary_tuple(slot, id, true);
 		}
 		o_btree_check_size_of_tuple(o_tuple_size(tup, &id->leafSpec),
 									id->name.data, true);
