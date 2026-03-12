@@ -907,7 +907,7 @@ o_get_tbl_att(TupleTableSlot *slot, int attnum, bool primaryIsCtid,
 	*isnull = slot->tts_isnull[i];
 	value = slot->tts_values[i];
 
-	if (!*isnull && att->attlen < 0 && VARATT_IS_EXTENDED(value))
+	if (!*isnull && att->attlen < 0 && VARATT_IS_EXTERNAL(value))
 	{
 		if (!oSlot->to_toast)
 			alloc_to_toast_vfree_detoasted(&oSlot->base);

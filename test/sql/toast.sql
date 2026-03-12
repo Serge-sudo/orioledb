@@ -1021,6 +1021,20 @@ SELECT id, length(m), length(e) FROM o_sm_upsert;
 SELECT orioledb_tbl_structure('o_sm_upsert'::regclass, 'nuet');
 
 -----
+-- CREATE INDEX on toasted data (compressed EXTENDED storage)
+-- Regression test: index build on existing toasted rows must not fail
+-- with "index row size exceeds orioledb maximum"
+-----
+CREATE TABLE o_sm_idx_on_toast (
+	a int,
+	f1 text STORAGE EXTENDED
+) USING orioledb;
+INSERT INTO o_sm_idx_on_toast VALUES (1, repeat('1234567890', 1000));
+CREATE INDEX o_sm_idx_on_toast_idx ON o_sm_idx_on_toast(f1);
+SELECT a, length(f1) FROM o_sm_idx_on_toast WHERE f1 = repeat('1234567890', 1000);
+DROP TABLE o_sm_idx_on_toast;
+
+-----
 -- Cleanup
 -----
 DROP TABLE o_sm_text;
