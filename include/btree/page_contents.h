@@ -19,14 +19,80 @@
 
 #define NUM_SEQ_SCANS_ARRAY_SIZE	32
 
-/* The structure of BTree meta page.  Referenced by metaPageBlkno. */
+/*
+ * The structure of BTree meta page.  Referenced by metaPageBlkno.
+ *
+ * The meta page lives in the OrioleDB in-memory page pool (not in a
+ * PostgreSQL shared-buffer) and is pinned for the lifetime of the tree
+ * descriptor.  It holds all shared state that the checkpointer and ordinary
+ * backends must be able to access concurrently.
+ *
+ * DUAL CHECKPOINT BUFFERS (nextChkp[2], tmpBuf[2], datafileLength[2],
+ * partsInfo[2])
+ *
+ * OrioleDB performs checkpoints while normal DML continues.  To avoid
+ * serialising the current checkpoint against the next one, each of the
+ * above arrays is indexed by (checkpointNumber % 2).  At any moment only
+ * one slot is "active" – the slot currently being written by the ongoing
+ * checkpoint.  The other slot either holds data from the previous
+ * checkpoint (which may still be needed for recovery) or is idle.
+ *
+ *   nextChkp[chkpNum % 2] – shared state of the checkpoint map seq buf
+ *                            that is being written during checkpoint N.
+ *                            The map records the on-disk location of every
+ *                            page written during the checkpoint so that the
+ *                            *next* checkpoint (N+1) can reuse those
+ *                            locations without re-walking the whole tree.
+ *
+ *   tmpBuf[chkpNum % 2]   – shared state of the temporary seq buf used
+ *                            during checkpoint N to track newly placed and
+ *                            dirty pages.  Consumed during post-processing
+ *                            (sort + hole-punch) and removed on completion.
+ *
+ *   datafileLength[chkpNum % 2] – logical end-of-file for the B-tree data
+ *                                  file as grown by checkpoint N.  Used to
+ *                                  hand out fresh extents atomically.
+ *
+ * FREE-EXTENT BUFFER (freeBuf)
+ *
+ * freeBuf holds the shared state of the single free-extent seq buf.  It
+ * reads the list of extents that were freed during the previous checkpoint
+ * and makes them available for reuse by the current one.  There is only one
+ * instance (no [2] array) because it is replaced atomically at the start of
+ * each checkpoint: the new free-extent file is put in place before the old
+ * one is removed.
+ *
+ * DIRTY FLAGS (dirtyFlag1, dirtyFlag2)
+ *
+ * These two booleans track whether the tree has been modified since the
+ * last checkpoint.  Both must be false for the checkpointer to conclude
+ * that the tree is clean and skip writing any checkpoint data for it.
+ * dirtyFlag1 is cleared at the start of the checkpoint and set again
+ * whenever a page is dirtied; dirtyFlag2 provides an extra generation of
+ * protection so that a modification that races with the flag-clear is not
+ * missed.
+ */
 typedef struct
 {
 	OrioleDBPageHeader o_header;
+
+	/* Seq buf for reading free extents recorded by the previous checkpoint. */
 	SeqBufDescShared freeBuf;
+
+	/*
+	 * Seq bufs for writing the checkpoint map and temp files.  Indexed by
+	 * (checkpointNumber % 2) so that consecutive checkpoints use different
+	 * slots and can overlap without interference.
+	 */
 	SeqBufDescShared nextChkp[2];
 	SeqBufDescShared tmpBuf[2];
+
 	pg_atomic_uint64 numFreeBlocks;
+
+	/*
+	 * Logical data file length per checkpoint slot (indexed by
+	 * checkpointNumber % 2).  Atomically incremented to allocate extents.
+	 */
 	pg_atomic_uint64 datafileLength[2];
 	LWLock		metaLock;
 	LWLock		copyBlknoLock;
@@ -54,9 +120,19 @@ typedef struct
 	 */
 	bool		toBeFreedOnSeqScanRelease;
 
+	/*
+	 * Dirty flags used by the checkpointer to decide whether to skip a tree.
+	 * dirtyFlag1 is cleared at the beginning of a checkpoint; dirtyFlag2
+	 * provides a second generation so that modifications racing the clear of
+	 * dirtyFlag1 are still detected.  If both flags are false the tree has
+	 * not been touched since the last checkpoint, the freshly initialised seq
+	 * buf files are closed without writing anything, and the checkpoint is
+	 * marked complete for this tree immediately.
+	 */
 	bool		dirtyFlag1;
 	bool		dirtyFlag2;
 
+	/* S3 segment/part tracking per checkpoint slot (indexed by chkpNum % 2). */
 	BTreeS3PartsInfo partsInfo[2];
 
 	LWLock		punchHolesLock;
