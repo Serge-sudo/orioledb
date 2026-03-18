@@ -45,6 +45,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
+#include "nodes/pg_list.h"
 #include "pgstat.h"
 
 typedef struct
@@ -69,6 +70,7 @@ static void recreate_index_descr(OIndexDescr *descr);
 static OExclusionFn *o_find_exclusion_op_fn(Oid exclusion_op);
 static inline OExclusionFn *o_find_cached_exclusion_fn(Oid exclusion_op);
 static inline OExclusionFn *o_add_exclusion_fn_to_cache(OExclusionFn *exclusion_fn);
+static void o_invalidate_descrs_internal(Oid datoid, Oid reloid, Oid relfilenode);
 
 PG_FUNCTION_INFO_V1(orioledb_get_table_descrs);
 PG_FUNCTION_INFO_V1(orioledb_get_index_descrs);
@@ -473,6 +475,15 @@ o_btree_try_use_shmem_guarded(BTreeDescr *desc)
 	if (!have_locked_pages())
 		(void) o_btree_try_use_shmem(desc);
 }
+
+typedef struct DeferredDescrInvalidation
+{
+	Oid			datoid;
+	Oid			reloid;
+	Oid			relfilenode;
+} DeferredDescrInvalidation;
+
+static List *deferred_descr_invals = NIL;
 
 /*
  * Appends extents from free blocks file to the free extents list.
@@ -951,6 +962,39 @@ init_shared_root_info(OPagePool *pool, SharedRootInfo *sharedRootInfo)
 
 void
 o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
+{
+	DeferredDescrInvalidation *deferred;
+
+	/*
+	 * If we currently hold page locks, recreating descriptors may attempt to
+	 * read sys-tree pages and violate lock invariants.  Defer processing to
+	 * the next invalidation callback when locks are released.
+	 */
+	if (have_locked_pages())
+	{
+		deferred = palloc(sizeof(DeferredDescrInvalidation));
+		deferred->datoid = datoid;
+		deferred->reloid = reloid;
+		deferred->relfilenode = relfilenode;
+		deferred_descr_invals = lappend(deferred_descr_invals, deferred);
+		return;
+	}
+
+	/* Process any previously deferred invalidations first. */
+	while (deferred_descr_invals != NIL && !have_locked_pages())
+	{
+		DeferredDescrInvalidation *head = (DeferredDescrInvalidation *) linitial(deferred_descr_invals);
+
+		deferred_descr_invals = list_delete_first(deferred_descr_invals);
+		o_invalidate_descrs_internal(head->datoid, head->reloid, head->relfilenode);
+		pfree(head);
+	}
+
+	o_invalidate_descrs_internal(datoid, reloid, relfilenode);
+}
+
+static void
+o_invalidate_descrs_internal(Oid datoid, Oid reloid, Oid relfilenode)
 {
 	HASH_SEQ_STATUS scan_status;
 	OTableDescr *tableDescr;
