@@ -1108,6 +1108,15 @@ get_index_descr(ORelOids ixOids, OIndexType ixType,
 						  oIndex->indexType, oIndex->table_persistence, oIndex->createOxid, result);
 	free_o_index(oIndex);
 
+	/*
+	 * index_btree_desc_init() resets rootPageBlkno to OInvalidInMemoryBlkno.
+	 * If the tree is already loaded in shared memory (e.g. another backend
+	 * called o_btree_load_shmem() before this invalidation arrived), restore
+	 * rootInfo from the shared root info system tree to avoid a race where a
+	 * backend finds an invalid rootPageBlkno on a descriptor it still holds.
+	 */
+	(void) o_btree_try_use_shmem(&result->desc);
+
 	return result;
 }
 
