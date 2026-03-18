@@ -1756,6 +1756,7 @@ recreate_table_descr(OTableDescr *descr)
 	OTable	   *o_table;
 	bool		old_enable_stopevents;
 	int			refcnt;
+	int			i;
 
 	old_enable_stopevents = enable_stopevents;
 	enable_stopevents = false;
@@ -1768,6 +1769,23 @@ recreate_table_descr(OTableDescr *descr)
 	table_descr_free(descr);
 	fill_table_descr(descr, o_table, &o_non_deleted_snapshot);
 	descr->refcnt = refcnt;
+
+	/*
+	 * fill_table_descr() may have called index_btree_desc_init() for each
+	 * index, resetting rootPageBlkno to OInvalidInMemoryBlkno.  If the tree
+	 * is already loaded in shared memory, restore rootInfo now so that any
+	 * backend holding a pointer to an index descriptor does not see a
+	 * transiently invalid rootPageBlkno.
+	 */
+	for (i = 0; i < descr->nIndices; i++)
+	{
+		if (descr->indices[i])
+			(void) o_btree_try_use_shmem(&descr->indices[i]->desc);
+	}
+	if (descr->bridge)
+		(void) o_btree_try_use_shmem(&descr->bridge->desc);
+	if (descr->toast)
+		(void) o_btree_try_use_shmem(&descr->toast->desc);
 
 	enable_stopevents = old_enable_stopevents;
 	return true;
