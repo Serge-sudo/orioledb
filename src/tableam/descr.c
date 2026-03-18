@@ -483,7 +483,10 @@ typedef struct DeferredDescrInvalidation
 	Oid			relfilenode;
 } DeferredDescrInvalidation;
 
-/* Backend-local queue of deferred invalidations (no cross-backend sharing). */
+/*
+ * Backend-local queue of deferred invalidations (single-threaded backend, so
+ * no additional synchronization is needed).
+ */
 static List *deferred_descr_invals = NIL;
 
 /*
@@ -975,30 +978,39 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 	if (have_locked_pages())
 	{
 		oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-		deferred = palloc(sizeof(DeferredDescrInvalidation));
-		deferred->datoid = datoid;
-		deferred->reloid = reloid;
-		deferred->relfilenode = relfilenode;
-		deferred_descr_invals = lappend(deferred_descr_invals, deferred);
-		/*
-		 * Each entry is freed during the next lock-free processing pass; list
-		 * cells and the list container are also freed there.  All of this
-		 * lives in TopMemoryContext, which otherwise persists until backend
-		 * shutdown.
-		 */
-		MemoryContextSwitchTo(oldcontext);
+		PG_TRY();
+		{
+			deferred = palloc(sizeof(DeferredDescrInvalidation));
+			deferred->datoid = datoid;
+			deferred->reloid = reloid;
+			deferred->relfilenode = relfilenode;
+			deferred_descr_invals = lappend(deferred_descr_invals, deferred);
+			/*
+			 * Each entry is freed during the next lock-free processing pass;
+			 * list cells and the list container are also freed there.  All of
+			 * this lives in TopMemoryContext, which otherwise persists until
+			 * backend shutdown.
+			 */
+			MemoryContextSwitchTo(oldcontext);
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(oldcontext);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 		return;
 	}
 
 	/* Process any previously deferred invalidations first. */
 	if (deferred_descr_invals != NIL)
 	{
-		List	   *invals_to_process = deferred_descr_invals;
+		List	   *invalidations_to_process = deferred_descr_invals;
 		ListCell   *lc;
 
 		deferred_descr_invals = NIL;
 
-		foreach(lc, invals_to_process)
+		foreach(lc, invalidations_to_process)
 		{
 			DeferredDescrInvalidation *pending_inval;
 
@@ -1009,7 +1021,7 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 			pfree(pending_inval);
 		}
 
-		list_free(invals_to_process);
+		list_free(invalidations_to_process);
 	}
 
 	/* Handle the current invalidation. */
