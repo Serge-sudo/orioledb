@@ -981,21 +981,29 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 		deferred->reloid = reloid;
 		deferred->relfilenode = relfilenode;
 		deferred_descr_invals = lappend(deferred_descr_invals, deferred);
-		/* Freed when processed below or naturally at backend shutdown. */
+		/* Freed on next lock-free invalidation processing or at backend shutdown. */
 		MemoryContextSwitchTo(oldcontext);
 		return;
 	}
 
 	/* Process any previously deferred invalidations first. */
-	while (deferred_descr_invals != NIL)
+	if (deferred_descr_invals != NIL)
 	{
-		head = (DeferredDescrInvalidation *) linitial(deferred_descr_invals);
+		List	   *pending = deferred_descr_invals;
 
-		deferred_descr_invals = list_delete_first(deferred_descr_invals);
-		o_invalidate_descrs_internal(head->datoid, head->reloid, head->relfilenode);
-		pfree(head);
+		deferred_descr_invals = NIL;
+
+		while (pending != NIL)
+		{
+			head = (DeferredDescrInvalidation *) linitial(pending);
+			pending = list_delete_first(pending);
+
+			o_invalidate_descrs_internal(head->datoid, head->reloid, head->relfilenode);
+			pfree(head);
+		}
 	}
 
+	/* Handle the current invalidation. */
 	o_invalidate_descrs_internal(datoid, reloid, relfilenode);
 }
 
