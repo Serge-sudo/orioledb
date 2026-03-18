@@ -483,6 +483,7 @@ typedef struct DeferredDescrInvalidation
 	Oid			relfilenode;
 } DeferredDescrInvalidation;
 
+/* Backend-local queue of deferred invalidations (no cross-backend sharing). */
 static List *deferred_descr_invals = NIL;
 
 /*
@@ -964,6 +965,7 @@ void
 o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 {
 	DeferredDescrInvalidation *deferred;
+	MemoryContext oldcontext;
 
 	/*
 	 * If we currently hold page locks, recreating descriptors may attempt to
@@ -972,17 +974,22 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 	 */
 	if (have_locked_pages())
 	{
+		oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 		deferred = palloc(sizeof(DeferredDescrInvalidation));
 		deferred->datoid = datoid;
 		deferred->reloid = reloid;
 		deferred->relfilenode = relfilenode;
 		deferred_descr_invals = lappend(deferred_descr_invals, deferred);
+		MemoryContextSwitchTo(oldcontext);
 		return;
 	}
 
 	/* Process any previously deferred invalidations first. */
-	while (deferred_descr_invals != NIL && !have_locked_pages())
+	while (deferred_descr_invals != NIL)
 	{
+		if (have_locked_pages())
+			break;
+
 		DeferredDescrInvalidation *head = (DeferredDescrInvalidation *) linitial(deferred_descr_invals);
 
 		deferred_descr_invals = list_delete_first(deferred_descr_invals);
