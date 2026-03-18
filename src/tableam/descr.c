@@ -989,18 +989,19 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 	/* Process any previously deferred invalidations first. */
 	if (deferred_descr_invals != NIL)
 	{
-		List	   *pending = deferred_descr_invals;
+		List	   *pending_invals = deferred_descr_invals;
+		ListCell   *lc;
 
 		deferred_descr_invals = NIL;
 
-		while (pending != NIL)
+		foreach(lc, pending_invals)
 		{
-			head = (DeferredDescrInvalidation *) linitial(pending);
-			pending = list_delete_first(pending);
-
+			head = (DeferredDescrInvalidation *) lfirst(lc);
 			o_invalidate_descrs_internal(head->datoid, head->reloid, head->relfilenode);
 			pfree(head);
 		}
+
+		list_free(pending_invals);
 	}
 
 	/* Handle the current invalidation. */
