@@ -965,7 +965,6 @@ void
 o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 {
 	DeferredDescrInvalidation *deferred;
-	DeferredDescrInvalidation *pending_inval;
 	MemoryContext oldcontext;
 
 	/*
@@ -994,13 +993,15 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 	/* Process any previously deferred invalidations first. */
 	if (deferred_descr_invals != NIL)
 	{
-		List	   *pending_invals = deferred_descr_invals;
+		List	   *invals_to_process = deferred_descr_invals;
 		ListCell   *lc;
 
 		deferred_descr_invals = NIL;
 
-		foreach(lc, pending_invals)
+		foreach(lc, invals_to_process)
 		{
+			DeferredDescrInvalidation *pending_inval;
+
 			pending_inval = (DeferredDescrInvalidation *) lfirst(lc);
 			o_invalidate_descrs_internal(pending_inval->datoid,
 										 pending_inval->reloid,
@@ -1008,7 +1009,7 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 			pfree(pending_inval);
 		}
 
-		list_free(pending_invals);
+		list_free(invals_to_process);
 	}
 
 	/* Handle the current invalidation. */
