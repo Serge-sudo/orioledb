@@ -18,6 +18,7 @@
 #include "btree/io.h"
 #include "btree/iterator.h"
 #include "btree/modify.h"
+#include "btree/page_state.h"
 #include "checkpoint/checkpoint.h"
 #include "catalog/free_extents.h"
 #include "catalog/o_indices.h"
@@ -458,6 +459,19 @@ o_btree_try_use_shmem(BTreeDescr *desc)
 		pfree(shared);
 	}
 	return true;
+}
+
+/*
+ * During invalidation processing a backend may still hold B-tree page locks.
+ * In that case o_find_shared_root_info() path can hit assertions that require
+ * no locked pages.  Defer root info reload until the next tree access after
+ * locks are released.
+ */
+static inline void
+o_btree_try_use_shmem_guarded(BTreeDescr *desc)
+{
+	if (!have_locked_pages())
+		(void) o_btree_try_use_shmem(desc);
 }
 
 /*
@@ -1115,7 +1129,7 @@ get_index_descr(ORelOids ixOids, OIndexType ixType,
 	 * rootInfo from the shared root info system tree to avoid a race where a
 	 * backend finds an invalid rootPageBlkno on a descriptor it still holds.
 	 */
-	(void) o_btree_try_use_shmem(&result->desc);
+	o_btree_try_use_shmem_guarded(&result->desc);
 
 	return result;
 }
@@ -1150,7 +1164,7 @@ recreate_index_descr(OIndexDescr *descr)
 	 * when trying to access the BTree root page.  Restore the rootInfo from
 	 * shared memory to prevent that race condition.
 	 */
-	(void) o_btree_try_use_shmem(&descr->desc);
+	o_btree_try_use_shmem_guarded(&descr->desc);
 }
 
 /*
@@ -1780,12 +1794,12 @@ recreate_table_descr(OTableDescr *descr)
 	for (i = 0; i < descr->nIndices; i++)
 	{
 		if (descr->indices[i])
-			(void) o_btree_try_use_shmem(&descr->indices[i]->desc);
+			o_btree_try_use_shmem_guarded(&descr->indices[i]->desc);
 	}
 	if (descr->bridge)
-		(void) o_btree_try_use_shmem(&descr->bridge->desc);
+		o_btree_try_use_shmem_guarded(&descr->bridge->desc);
 	if (descr->toast)
-		(void) o_btree_try_use_shmem(&descr->toast->desc);
+		o_btree_try_use_shmem_guarded(&descr->toast->desc);
 
 	enable_stopevents = old_enable_stopevents;
 	return true;
