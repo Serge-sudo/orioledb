@@ -2327,7 +2327,7 @@ btree_finalize_private_seq_bufs(BTreeDescr *desc, EvictedTreeData *evicted_data,
 
 		evicted_data->tmpBuf.tag = desc->tmpBuf[chkp_index].shared->tag;
 		if (notModified)
-			seq_buf_close_file(&desc->nextChkp[chkp_index]);
+			seq_buf_close_file(&desc->tmpBuf[chkp_index]);
 		else
 			evicted_data->tmpBuf.offset = seq_buf_finalize(&desc->tmpBuf[chkp_index]);
 		FREE_PAGE_IF_VALID(desc->ppool, desc->tmpBuf[chkp_index].shared->pages[0]);

@@ -1540,7 +1540,7 @@ checkpoint_init_new_seq_bufs(BTreeDescr *descr, int chkpNum)
 				 errmsg("could not init a new sequence buffer file %s: %m",
 						get_seq_buf_filename(&next_tmp_tag))));
 
-	if (descr->storageType != BTreeStoragePersistence)
+	if (descr->storageType == BTreeStorageTemporary)
 		return;
 
 	init_seq_buf_pages(descr, &meta_page->nextChkp[next_chkp_index]);
