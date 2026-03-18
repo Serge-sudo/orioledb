@@ -978,54 +978,36 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 	if (have_locked_pages())
 	{
 		oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+		deferred = palloc(sizeof(DeferredDescrInvalidation));
+		deferred->datoid = datoid;
+		deferred->reloid = reloid;
+		deferred->relfilenode = relfilenode;
+		deferred_descr_invals = lappend(deferred_descr_invals, deferred);
 		/*
-		 * Ensure we restore the caller's memory context even if palloc/lappend
-		 * throws.
+		 * Each entry is freed during the next lock-free processing pass; list
+		 * cells and the list container are also freed there.  All of this
+		 * lives in TopMemoryContext so it survives across callbacks and
+		 * transaction boundaries.
 		 */
-		PG_TRY();
-		{
-			deferred = palloc(sizeof(DeferredDescrInvalidation));
-			deferred->datoid = datoid;
-			deferred->reloid = reloid;
-			deferred->relfilenode = relfilenode;
-			deferred_descr_invals = lappend(deferred_descr_invals, deferred);
-			/*
-			 * Each entry is freed during the next lock-free processing pass;
-			 * list cells and the list container are also freed there.  All of
-			 * this lives in TopMemoryContext so it survives across callbacks
-			 * and transaction boundaries.
-			 */
-			MemoryContextSwitchTo(oldcontext);
-		}
-		PG_CATCH();
-		{
-			MemoryContextSwitchTo(oldcontext);
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
+		MemoryContextSwitchTo(oldcontext);
 		return;
 	}
 
 	/* Process any previously deferred invalidations first. */
 	if (deferred_descr_invals != NIL)
 	{
-		List	   *pending_invals = deferred_descr_invals;
-		ListCell   *lc;
-
-		deferred_descr_invals = NIL;
-
-		foreach(lc, pending_invals)
+		while (deferred_descr_invals != NIL)
 		{
 			DeferredDescrInvalidation *pending_inval;
 
-			pending_inval = (DeferredDescrInvalidation *) lfirst(lc);
+			pending_inval = (DeferredDescrInvalidation *) linitial(deferred_descr_invals);
+			deferred_descr_invals = list_delete_first(deferred_descr_invals);
+
 			o_invalidate_descrs_internal(pending_inval->datoid,
 										 pending_inval->reloid,
 										 pending_inval->relfilenode);
 			pfree(pending_inval);
 		}
-
-		list_free(pending_invals);
 	}
 
 	/* Handle the current invalidation. */
