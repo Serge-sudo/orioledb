@@ -983,7 +983,8 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 		deferred_descr_invals = lappend(deferred_descr_invals, deferred);
 		/*
 		 * Each entry is freed during the next lock-free processing pass; list
-		 * allocation lives in TopMemoryContext, which persists until backend
+		 * cells and the list container are also freed there.  All of this
+		 * lives in TopMemoryContext, which otherwise persists until backend
 		 * shutdown.
 		 */
 		MemoryContextSwitchTo(oldcontext);
@@ -1001,7 +1002,9 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 		foreach(lc, pending_invals)
 		{
 			pending_inval = (DeferredDescrInvalidation *) lfirst(lc);
-			o_invalidate_descrs_internal(pending_inval->datoid, pending_inval->reloid, pending_inval->relfilenode);
+			o_invalidate_descrs_internal(pending_inval->datoid,
+										 pending_inval->reloid,
+										 pending_inval->relfilenode);
 			pfree(pending_inval);
 		}
 
