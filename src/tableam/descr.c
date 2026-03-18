@@ -1133,6 +1133,15 @@ recreate_index_descr(OIndexDescr *descr)
 						  oIndex->indexType, oIndex->table_persistence, oIndex->createOxid, descr);
 	descr->refcnt = refcnt;
 	free_o_index(oIndex);
+
+	/*
+	 * index_btree_desc_init() resets rootPageBlkno to OInvalidInMemoryBlkno.
+	 * If some backend already called o_btree_load_shmem() for this descriptor
+	 * before the invalidation arrived, it would find an invalid rootPageBlkno
+	 * when trying to access the BTree root page.  Restore the rootInfo from
+	 * shared memory to prevent that race condition.
+	 */
+	(void) o_btree_try_use_shmem(&descr->desc);
 }
 
 /*
