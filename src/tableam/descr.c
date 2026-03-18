@@ -978,6 +978,10 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 	if (have_locked_pages())
 	{
 		oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+		/*
+		 * Ensure we restore the caller's memory context even if palloc/lappend
+		 * throws.
+		 */
 		PG_TRY();
 		{
 			deferred = palloc(sizeof(DeferredDescrInvalidation));
@@ -988,8 +992,8 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 			/*
 			 * Each entry is freed during the next lock-free processing pass;
 			 * list cells and the list container are also freed there.  All of
-			 * this lives in TopMemoryContext, which otherwise persists until
-			 * backend shutdown.
+			 * this lives in TopMemoryContext so it survives across callbacks
+			 * and transaction boundaries.
 			 */
 			MemoryContextSwitchTo(oldcontext);
 		}
@@ -1005,12 +1009,12 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 	/* Process any previously deferred invalidations first. */
 	if (deferred_descr_invals != NIL)
 	{
-		List	   *invalidations_to_process = deferred_descr_invals;
+		List	   *pending_invals = deferred_descr_invals;
 		ListCell   *lc;
 
 		deferred_descr_invals = NIL;
 
-		foreach(lc, invalidations_to_process)
+		foreach(lc, pending_invals)
 		{
 			DeferredDescrInvalidation *pending_inval;
 
@@ -1021,7 +1025,7 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 			pfree(pending_inval);
 		}
 
-		list_free(invalidations_to_process);
+		list_free(pending_invals);
 	}
 
 	/* Handle the current invalidation. */
