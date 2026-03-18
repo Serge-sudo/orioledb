@@ -981,7 +981,7 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 		deferred->reloid = reloid;
 		deferred->relfilenode = relfilenode;
 		deferred_descr_invals = lappend(deferred_descr_invals, deferred);
-		/* TopMemoryContext is released at backend exit/abort, so no leak risk. */
+		/* Freed when processed below or naturally at backend shutdown. */
 		MemoryContextSwitchTo(oldcontext);
 		return;
 	}
@@ -989,9 +989,6 @@ o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode)
 	/* Process any previously deferred invalidations first. */
 	while (deferred_descr_invals != NIL)
 	{
-		if (have_locked_pages())
-			break;
-
 		head = (DeferredDescrInvalidation *) linitial(deferred_descr_invals);
 
 		deferred_descr_invals = list_delete_first(deferred_descr_invals);
