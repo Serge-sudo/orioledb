@@ -630,9 +630,9 @@ o_btree_modify_handle_conflicts(BTreeModifyInternalContext *context)
 		context->leafTuphdr.undoLocation = tuphdr->undoLocation;
 
 	/*
-	 * RowLockKeyShare locks are represented with predicate locks (without
-	 * touching tuple headers).  For key-updating writers, check incoming
-	 * serializable conflicts against those predicate locks.
+	 * RowLockKeyShare locks are represented with CTID-level predicate locks
+	 * (without touching tuple headers).  For key-updating writers, check
+	 * incoming serializable conflicts at the same granularity.
 	 */
 	if (IsRelationTree(desc) &&
 		context->lockMode == RowLockUpdate &&
@@ -640,9 +640,12 @@ o_btree_modify_handle_conflicts(BTreeModifyInternalContext *context)
 		 context->action == BTreeOperationUpdate))
 	{
 		Relation	rel;
+		ItemPointerData tid;
+		OffsetNumber off = BTREE_PAGE_LOCATOR_GET_OFFSET(page, loc);
 
 		rel = relation_open(desc->oids.reloid, NoLock);
-		CheckTableForSerializableConflictIn(rel);
+		ItemPointerSet(&tid, (BlockNumber) blkno, off);
+		CheckForSerializableConflictIn(rel, &tid, (BlockNumber) blkno);
 		relation_close(rel, NoLock);
 	}
 
@@ -942,9 +945,12 @@ o_btree_modify_lock(BTreeModifyInternalContext *context)
 			snapshot != NULL)
 		{
 			Relation	rel;
+			ItemPointerData tid;
+			OffsetNumber off = BTREE_PAGE_LOCATOR_GET_OFFSET(page, &loc);
 
 			rel = relation_open(desc->oids.reloid, NoLock);
-			PredicateLockRelation(rel, snapshot);
+			ItemPointerSet(&tid, (BlockNumber) blkno, off);
+			PredicateLockTID(rel, &tid, snapshot, InvalidTransactionId);
 			relation_close(rel, NoLock);
 		}
 
