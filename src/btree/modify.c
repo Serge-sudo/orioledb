@@ -30,7 +30,9 @@
 #include "utils/page_pool.h"
 #include "utils/stopevent.h"
 
+#include "access/relation.h"
 #include "miscadmin.h"
+#include "storage/predicate.h"
 
 #define IsRelationTree(desc) (ORelOidsIsValid(desc->oids) && !IS_SYS_TREE_OIDS(desc->oids))
 
@@ -628,51 +630,20 @@ o_btree_modify_handle_conflicts(BTreeModifyInternalContext *context)
 		context->leafTuphdr.undoLocation = tuphdr->undoLocation;
 
 	/*
-	 * For DELETE and key-column UPDATE on relation trees, also check for
-	 * RowLockKeyShare heavyweight locks held by FK constraint checks or
-	 * SELECT FOR KEY SHARE.  These locks bypass the undo chain (see
-	 * o_btree_modify_lock()) and therefore won't be detected by
-	 * row_lock_conflicts() above.  The heavyweight lock
-	 * (AccessExclusiveLock) conflicts with the AccessShareLock held by
-	 * RowLockKeyShare callers, so a failed TryAcquire means we must wait.
+	 * RowLockKeyShare locks are represented with predicate locks (without
+	 * touching tuple headers).  For key-updating writers, check incoming
+	 * serializable conflicts against those predicate locks.
 	 */
 	if (IsRelationTree(desc) &&
 		context->lockMode == RowLockUpdate &&
 		(context->action == BTreeOperationDelete ||
 		 context->action == BTreeOperationUpdate))
 	{
-		LOCKTAG		hwLockTag;
-		LOCKMODE	hwLockMode = hwLockModes[RowLockUpdate];
-		uint32		hash;
+		Relation	rel;
 
-		hash = o_btree_hash(desc, curTuple, BTreeKeyLeafTuple);
-		SET_LOCKTAG_TUPLE(hwLockTag,
-						  desc->oids.datoid,
-						  desc->oids.reloid,
-						  hash,
-						  0);
-
-		if (!LockAcquire(&hwLockTag, hwLockMode, false, true))
-		{
-			/*
-			 * A conflicting RowLockKeyShare heavyweight lock is held.
-			 * Release the page lock, wait for the conflicting lock to be
-			 * released, drop our lock, and retry the operation.
-			 */
-			unlock_page(blkno);
-			(void) LockAcquire(&hwLockTag, hwLockMode, false, false);
-			LockRelease(&hwLockTag, hwLockMode, false);
-			(void) refind_page(pageFindContext,
-							   context->key,
-							   context->keyType,
-							   0,
-							   pageFindContext->items[pageFindContext->index].blkno,
-							   pageFindContext->items[pageFindContext->index].pageChangeCount);
-			return ConflictResolutionRetry;
-		}
-
-		/* No conflicting lock held — release the lock we just acquired */
-		LockRelease(&hwLockTag, hwLockMode, false);
+		rel = relation_open(desc->oids.reloid, NoLock);
+		CheckTableForSerializableConflictIn(rel);
+		relation_close(rel, NoLock);
 	}
 
 	return ConflictResolutionOK;
@@ -961,46 +932,22 @@ o_btree_modify_lock(BTreeModifyInternalContext *context)
 		return OBTreeModifyResultLocked;
 	}
 
-	/*
-	 * For RowLockKeyShare (used by FK constraint checks and SELECT FOR KEY
-	 * SHARE), skip creating a row-level undo record and avoid marking the
-	 * page dirty.  Instead, use only the heavyweight lock manager to track
-	 * the lock.  This prevents FK reference checks from making the referenced
-	 * page checkpointable when no data was actually changed.
-	 *
-	 * The heavyweight lock (AccessShareLock) conflicts with
-	 * AccessExclusiveLock (acquired by DELETE/key-UPDATE), ensuring correct
-	 * conflict detection even without an undo-chain entry.
-	 */
+	/* RowLockKeyShare (FK checks) shouldn't dirty referenced pages. */
 	if (context->lockMode == RowLockKeyShare)
 	{
-		Assert(OXidIsValid(context->opOxid));
+		Snapshot	snapshot = GetActiveSnapshot();
 
-		/*
-		 * Acquire the heavyweight lock if not already held (it may have been
-		 * acquired by wait_for_tuple() during prior conflict resolution).
-		 */
-		if (context->hwLockMode == NoLock)
+		if (IsRelationTree(desc) &&
+			OidIsValid(desc->oids.reloid) &&
+			snapshot != NULL)
 		{
-			uint32		hash = o_btree_hash(desc, curTuple, BTreeKeyLeafTuple);
+			Relation	rel;
 
-			SET_LOCKTAG_TUPLE(context->hwLockTag,
-							  desc->oids.datoid,
-							  desc->oids.reloid,
-							  hash,
-							  0);
-			context->hwLockMode = hwLockModes[RowLockKeyShare];
-			(void) LockAcquire(&context->hwLockTag, context->hwLockMode,
-							   false, false);
+			rel = relation_open(desc->oids.reloid, NoLock);
+			PredicateLockRelation(rel, snapshot);
+			relation_close(rel, NoLock);
 		}
 
-		/*
-		 * Keep the heavyweight lock held for the transaction duration.
-		 * Setting hwLockMode to NoLock prevents unlock_release() from
-		 * calling LockRelease(); the lock manager releases it at transaction
-		 * end automatically.
-		 */
-		context->hwLockMode = NoLock;
 		unlock_release(context, true);
 		return OBTreeModifyResultLocked;
 	}
