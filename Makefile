@@ -125,6 +125,7 @@ REGRESSCHECKS = btree_sys_check \
 				primary_key \
 				row_level_locks \
 				row_security \
+				checkpoint_file_growth \
 				sanitizers \
 				stats \
 				subquery \

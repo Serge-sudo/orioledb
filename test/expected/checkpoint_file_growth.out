@@ -1,0 +1,71 @@
+CREATE SCHEMA checkpoint_file_growth;
+SET SESSION search_path = 'checkpoint_file_growth';
+CREATE EXTENSION orioledb;
+CREATE TABLE o_test
+(
+	id int8 NOT NULL,
+	val text,
+	PRIMARY KEY (id)
+) USING orioledb;
+INSERT INTO o_test
+	(SELECT i, i::text FROM generate_series(1, 5000, 1) i);
+CHECKPOINT;
+DO $$
+BEGIN
+	FOR i IN 1..10 LOOP
+		UPDATE o_test SET val = val || i::text WHERE id % 10 = 0;
+		CHECKPOINT;
+	END LOOP;
+END;
+$$;
+CHECKPOINT;
+CHECKPOINT;
+WITH params AS (
+	SELECT oid AS datoid
+		FROM pg_database
+		WHERE datname = current_database()
+), rel AS (
+	SELECT relfilenode::text AS relnode
+		FROM pg_class
+		WHERE oid = 'o_test_pkey'::regclass
+), map_files AS (
+	SELECT f AS name
+		FROM params p, rel r,
+			 LATERAL pg_ls_dir(current_setting('data_directory') || '/orioledb_data/' || p.datoid::text) f
+		WHERE f ~ ('^' || r.relnode || '-[0-9]+\\.map$')
+), tmp_files AS (
+	SELECT f AS name
+		FROM params p, rel r,
+			 LATERAL pg_ls_dir(current_setting('data_directory') || '/orioledb_data/' || p.datoid::text) f
+		WHERE f ~ ('^' || r.relnode || '-[0-9]+\\.tmp$')
+)
+SELECT count(*) <= 2 AS map_files_bounded FROM map_files;
+ map_files_bounded 
+-------------------
+ t
+(1 row)
+
+WITH params AS (
+	SELECT oid AS datoid
+		FROM pg_database
+		WHERE datname = current_database()
+), rel AS (
+	SELECT relfilenode::text AS relnode
+		FROM pg_class
+		WHERE oid = 'o_test_pkey'::regclass
+), tmp_files AS (
+	SELECT f AS name
+		FROM params p, rel r,
+			 LATERAL pg_ls_dir(current_setting('data_directory') || '/orioledb_data/' || p.datoid::text) f
+		WHERE f ~ ('^' || r.relnode || '-[0-9]+\\.tmp$')
+)
+SELECT count(*) = 0 AS tmp_files_cleaned FROM tmp_files;
+ tmp_files_cleaned 
+-------------------
+ t
+(1 row)
+
+DROP EXTENSION orioledb CASCADE;
+NOTICE:  drop cascades to table o_test
+DROP SCHEMA checkpoint_file_growth CASCADE;
+RESET search_path;
