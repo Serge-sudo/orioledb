@@ -32,9 +32,9 @@
 
 #include "access/relation.h"
 #include "miscadmin.h"
-#include "storage/predicate.h"
 
 #define IsRelationTree(desc) (ORelOidsIsValid(desc->oids) && !IS_SYS_TREE_OIDS(desc->oids))
+#define O_FK_KEYSHARE_SEGMENT_SIZE 32
 
 /*
  * Context for o_btree_modify_internal()
@@ -83,6 +83,24 @@ BTreeModifyCallbackInfo nullCallbackInfo =
 };
 
 static const LOCKMODE hwLockModes[] = {AccessShareLock, RowShareLock, ExclusiveLock, AccessExclusiveLock};
+
+static inline OffsetNumber
+o_fk_keyshare_segment(OffsetNumber offset)
+{
+	Assert(offset > 0);
+	return (OffsetNumber) (((offset - 1) / O_FK_KEYSHARE_SEGMENT_SIZE) + 1);
+}
+
+static inline void
+o_fk_keyshare_fill_locktag(BTreeDescr *desc, OInMemoryBlkno blkno,
+						   OffsetNumber offset, LOCKTAG *tag)
+{
+	SET_LOCKTAG_TUPLE(*tag,
+					  desc->oids.datoid,
+					  desc->oids.reloid,
+					  (uint32) blkno,
+					  (uint32) o_fk_keyshare_segment(offset));
+}
 
 static void unlock_release(BTreeModifyInternalContext *context, bool unlock);
 static ConflictResolution o_btree_modify_handle_conflicts(BTreeModifyInternalContext *context);
@@ -630,23 +648,40 @@ o_btree_modify_handle_conflicts(BTreeModifyInternalContext *context)
 		context->leafTuphdr.undoLocation = tuphdr->undoLocation;
 
 	/*
-	 * RowLockKeyShare locks are represented with CTID-level predicate locks
-	 * (without touching tuple headers).  For key-updating writers, check
-	 * incoming serializable conflicts at the same granularity.
+	 * RowLockKeyShare locks bypass tuple-header row-lock undo chain in
+	 * o_btree_modify_lock().  For key-updating writers we therefore need an
+	 * explicit conflict check against those in-memory locks.
 	 */
 	if (IsRelationTree(desc) &&
 		context->lockMode == RowLockUpdate &&
 		(context->action == BTreeOperationDelete ||
 		 context->action == BTreeOperationUpdate))
 	{
-		Relation	rel;
-		ItemPointerData tid;
+		LOCKTAG		hwLockTag;
+		LOCKMODE	hwLockMode = hwLockModes[RowLockUpdate];
 		OffsetNumber off = BTREE_PAGE_LOCATOR_GET_OFFSET(page, loc);
 
-		rel = relation_open(desc->oids.reloid, NoLock);
-		ItemPointerSet(&tid, (BlockNumber) blkno, off);
-		CheckForSerializableConflictIn(rel, &tid, (BlockNumber) blkno);
-		relation_close(rel, NoLock);
+		o_fk_keyshare_fill_locktag(desc, blkno, off, &hwLockTag);
+
+		if (!LockAcquire(&hwLockTag, hwLockMode, false, true))
+		{
+			/*
+			 * Conflicting FK/KEY SHARE lock is held on the same segment.
+			 * Release page lock, wait for the lock, then retry.
+			 */
+			unlock_page(blkno);
+			(void) LockAcquire(&hwLockTag, hwLockMode, false, false);
+			LockRelease(&hwLockTag, hwLockMode, false);
+			(void) refind_page(pageFindContext,
+							   context->key,
+							   context->keyType,
+							   0,
+							   pageFindContext->items[pageFindContext->index].blkno,
+							   pageFindContext->items[pageFindContext->index].pageChangeCount);
+			return ConflictResolutionRetry;
+		}
+
+		LockRelease(&hwLockTag, hwLockMode, false);
 	}
 
 	return ConflictResolutionOK;
@@ -938,20 +973,17 @@ o_btree_modify_lock(BTreeModifyInternalContext *context)
 	/* RowLockKeyShare (FK checks) shouldn't dirty referenced pages. */
 	if (context->lockMode == RowLockKeyShare)
 	{
-		Snapshot	snapshot = GetActiveSnapshot();
+		Assert(OXidIsValid(context->opOxid));
 
 		if (IsRelationTree(desc) &&
-			OidIsValid(desc->oids.reloid) &&
-			snapshot != NULL)
+			OidIsValid(desc->oids.reloid))
 		{
-			Relation	rel;
-			ItemPointerData tid;
+			LOCKTAG		hwLockTag;
+			LOCKMODE	hwLockMode = hwLockModes[RowLockKeyShare];
 			OffsetNumber off = BTREE_PAGE_LOCATOR_GET_OFFSET(page, &loc);
 
-			rel = relation_open(desc->oids.reloid, NoLock);
-			ItemPointerSet(&tid, (BlockNumber) blkno, off);
-			PredicateLockTID(rel, &tid, snapshot, InvalidTransactionId);
-			relation_close(rel, NoLock);
+			o_fk_keyshare_fill_locktag(desc, blkno, off, &hwLockTag);
+			(void) LockAcquire(&hwLockTag, hwLockMode, false, false);
 		}
 
 		unlock_release(context, true);
