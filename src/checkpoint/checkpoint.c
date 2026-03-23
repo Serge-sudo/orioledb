@@ -545,8 +545,8 @@ add_index_id_item(List *list, BTreeDescr *desc)
 													 checkpoint_state->lastCheckpointNumber,
 													 NULL);
 		if (!OCompressIsValid(desc->compress) &&
-			desc->freeBuf.tag.type == 'm' &&
-			desc->freeBuf.tag.num == item->lastMapChkpNum)
+			desc->freeBuf.shared->tag.type == 'm' &&
+			desc->freeBuf.shared->tag.num == item->lastMapChkpNum)
 		{
 			item->cleanupMap = false;
 		}
