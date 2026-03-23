@@ -34,6 +34,11 @@
 #include "miscadmin.h"
 
 #define IsRelationTree(desc) (ORelOidsIsValid(desc->oids) && !IS_SYS_TREE_OIDS(desc->oids))
+/*
+ * Compact FK/KEY SHARE lock map granularity inside a leaf page.
+ * 32 offsets per segment is a compromise: fewer locktags than per-item, while
+ * still narrow enough to avoid page-wide conflicts for sparse FK checks.
+ */
 #define O_FK_KEYSHARE_SEGMENT_SIZE 32
 
 /*
@@ -88,6 +93,7 @@ static inline OffsetNumber
 o_fk_keyshare_segment(OffsetNumber offset)
 {
 	Assert(offset > 0);
+	/* Convert 1-based OffsetNumber into 1-based fixed-size segment index. */
 	return (OffsetNumber) (((offset - 1) / O_FK_KEYSHARE_SEGMENT_SIZE) + 1);
 }
 
@@ -663,21 +669,29 @@ o_btree_modify_handle_conflicts(BTreeModifyInternalContext *context)
 
 		o_fk_keyshare_fill_locktag(desc, blkno, off, &hwLockTag);
 
-		if (!LockAcquire(&hwLockTag, hwLockMode, false, true))
+		if (!LockAcquire(&hwLockTag, hwLockMode, false /* sessionLock */,
+						 true /* dontWait */))
 		{
+			OFindPageResult result;
+
 			/*
 			 * Conflicting FK/KEY SHARE lock is held on the same segment.
-			 * Release page lock, wait for the lock, then retry.
+			 * Release page lock, block on lock acquisition once, then release
+			 * immediately and retry to refetch the tuple state.
 			 */
 			unlock_page(blkno);
-			(void) LockAcquire(&hwLockTag, hwLockMode, false, false);
+			Assert(LockAcquire(&hwLockTag, hwLockMode,
+							   false /* sessionLock */,
+							   false /* dontWait */));
 			LockRelease(&hwLockTag, hwLockMode, false);
-			(void) refind_page(pageFindContext,
-							   context->key,
-							   context->keyType,
-							   0,
-							   pageFindContext->items[pageFindContext->index].blkno,
-							   pageFindContext->items[pageFindContext->index].pageChangeCount);
+			result = refind_page(pageFindContext,
+								 context->key,
+								 context->keyType,
+								 0,
+								 pageFindContext->items[pageFindContext->index].blkno,
+								 pageFindContext->items[pageFindContext->index].pageChangeCount);
+			/* We wait only for external key-share locker, tuple identity is stable. */
+			Assert(result == OFindPageResultSuccess);
 			return ConflictResolutionRetry;
 		}
 
@@ -973,6 +987,7 @@ o_btree_modify_lock(BTreeModifyInternalContext *context)
 	/* RowLockKeyShare (FK checks) shouldn't dirty referenced pages. */
 	if (context->lockMode == RowLockKeyShare)
 	{
+		/* Row-level lock operations are transactional for regular-undo trees. */
 		Assert(OXidIsValid(context->opOxid));
 
 		if (IsRelationTree(desc) &&
@@ -983,7 +998,9 @@ o_btree_modify_lock(BTreeModifyInternalContext *context)
 			OffsetNumber off = BTREE_PAGE_LOCATOR_GET_OFFSET(page, &loc);
 
 			o_fk_keyshare_fill_locktag(desc, blkno, off, &hwLockTag);
-			(void) LockAcquire(&hwLockTag, hwLockMode, false, false);
+			Assert(LockAcquire(&hwLockTag, hwLockMode,
+							   false /* sessionLock */,
+							   false /* dontWait */));
 		}
 
 		unlock_release(context, true);
