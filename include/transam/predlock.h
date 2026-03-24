@@ -19,8 +19,9 @@
  *	  Locks are stored per-backend in shared memory.  If a backend accumulates
  *	  too many fine-grained (tuple-level) locks on the same page, they are
  *	  promoted to a single page-level lock covering the page's [lokey, hikey)
- *	  range.  Similarly, too many page-level locks for the same tree promote
- *	  to a tree-level lock.
+ *	  range.  Page-level locks are maintained as a monotone set of disjoint
+ *	  intervals; when space is tight, neighbouring intervals are merged
+ *	  instead of promoting to a tree-level lock.
  *
  *	  When another backend attempts a DELETE or UPDATE that could conflict
  *	  with a predicate lock it must wait for the lock holder to commit or
@@ -57,10 +58,7 @@
  */
 #define O_PRED_LOCK_PAGE_PROMOTE_THRESHOLD	8
 
-/*
- * After this many page-level locks exist for the same tree they are merged
- * into a single tree-level lock.
- */
+/* Reserved for potential future tuning of page-level consolidation. */
 #define O_PRED_LOCK_TREE_PROMOTE_THRESHOLD	8
 
 /*

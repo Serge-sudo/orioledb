@@ -188,6 +188,235 @@ predlock_cmp_with_lokey(BTreeDescr *desc,
 }
 
 /*
+ * Compare two stored predicate lock keys.
+ *
+ * aIsHi/bIsHi determine whether NULL means +infinity (hi key) or -infinity
+ * (lo key).
+ */
+static int
+predlock_cmp_stored_keys(BTreeDescr *desc,
+						 OPredLockKey *a, bool aIsHi,
+						 OPredLockKey *b, bool bIsHi)
+{
+	if (!a->notNull && !b->notNull)
+		return 0;
+	if (!a->notNull)
+		return aIsHi ? 1 : -1;
+	if (!b->notNull)
+		return bIsHi ? -1 : 1;
+
+	{
+		OTuple		ta = predlock_key_to_tuple(a);
+		OTuple		tb = predlock_key_to_tuple(b);
+
+		return o_btree_cmp(desc, &ta, BTreeKeyNonLeafKey,
+						   &tb, BTreeKeyNonLeafKey);
+	}
+}
+
+static bool
+page_range_contains(BTreeDescr *desc,
+					OPredLockKey *outerLo, OPredLockKey *outerHi,
+					OPredLockKey *innerLo, OPredLockKey *innerHi)
+{
+	return predlock_cmp_stored_keys(desc, outerLo, false, innerLo, false) <= 0 &&
+		predlock_cmp_stored_keys(desc, outerHi, true, innerHi, true) >= 0;
+}
+
+static bool
+page_ranges_overlap_or_touch(BTreeDescr *desc,
+							 OPredLockKey *lo1, OPredLockKey *hi1,
+							 OPredLockKey *lo2, OPredLockKey *hi2)
+{
+	OPredLockKey *leftLo,
+			   *leftHi,
+			   *rightLo,
+			   *rightHi;
+
+	if (predlock_cmp_stored_keys(desc, lo1, false, lo2, false) <= 0)
+	{
+		leftLo = lo1;
+		leftHi = hi1;
+		rightLo = lo2;
+		rightHi = hi2;
+	}
+	else
+	{
+		leftLo = lo2;
+		leftHi = hi2;
+		rightLo = lo1;
+		rightHi = hi1;
+	}
+
+	return predlock_cmp_stored_keys(desc, leftHi, true, rightLo, false) >= 0;
+}
+
+static void
+page_range_widen(BTreeDescr *desc,
+				 OPredLockKey *dstLo, OPredLockKey *dstHi,
+				 OPredLockKey *srcLo, OPredLockKey *srcHi)
+{
+	if (predlock_cmp_stored_keys(desc, dstLo, false, srcLo, false) > 0)
+		*dstLo = *srcLo;
+	if (predlock_cmp_stored_keys(desc, dstHi, true, srcHi, true) < 0)
+		*dstHi = *srcHi;
+}
+
+static BTreeDescr *page_lock_cmp_desc = NULL;
+static OPredLocksData *page_lock_cmp_tbl = NULL;
+
+static int
+page_lock_index_cmp(const void *pa, const void *pb)
+{
+	int			ia = *(const int *) pa;
+	int			ib = *(const int *) pb;
+	OPredLockEntry *a = &page_lock_cmp_tbl->entries[ia];
+	OPredLockEntry *b = &page_lock_cmp_tbl->entries[ib];
+	int			cmp;
+
+	cmp = predlock_cmp_stored_keys(page_lock_cmp_desc,
+								   &a->loKey, false,
+								   &b->loKey, false);
+	if (cmp != 0)
+		return cmp;
+
+	return predlock_cmp_stored_keys(page_lock_cmp_desc,
+									&a->key, true,
+									&b->key, true);
+}
+
+/*
+ * Collapse overlapping or adjacent page-level intervals for a given tree/oxid.
+ */
+static void
+coalesce_page_intervals(BTreeDescr *desc, OPredLocksData *tbl,
+						ORelOids oids, OXid oxid)
+{
+	int			idx[O_PRED_LOCKS_MAX_ENTRIES];
+	int			n = 0;
+	int			i;
+
+	for (i = 0; i < O_PRED_LOCKS_MAX_ENTRIES; i++)
+	{
+		OPredLockEntry *e = &tbl->entries[i];
+
+		if (!e->valid || e->level != OPredLockLevelPage)
+			continue;
+		if (!ORelOidsIsEqual(e->oids, oids) || e->oxid != oxid)
+			continue;
+		idx[n++] = i;
+	}
+
+	if (n < 2)
+		return;
+
+	page_lock_cmp_desc = desc;
+	page_lock_cmp_tbl = tbl;
+	qsort(idx, n, sizeof(int), page_lock_index_cmp);
+
+	{
+		int			anchorIdx = idx[0];
+		OPredLockEntry *anchor = &tbl->entries[anchorIdx];
+
+		for (i = 1; i < n; i++)
+		{
+			int			curIdx = idx[i];
+			OPredLockEntry *cur = &tbl->entries[curIdx];
+
+			if (!cur->valid)
+				continue;
+
+			if (page_ranges_overlap_or_touch(desc,
+											 &anchor->loKey, &anchor->key,
+											 &cur->loKey, &cur->key))
+			{
+				page_range_widen(desc, &anchor->loKey, &anchor->key,
+								 &cur->loKey, &cur->key);
+				cur->valid = false;
+				tbl->numValid--;
+			}
+			else
+			{
+				anchorIdx = curIdx;
+				anchor = &tbl->entries[anchorIdx];
+			}
+		}
+	}
+}
+
+/*
+ * Merge the pair of intervals with the smallest gap (overlap/adjacent preferred)
+ * for the given tree/oxid.  Returns true if a merge happened.
+ */
+static bool
+merge_closest_page_intervals(BTreeDescr *desc, OPredLocksData *tbl,
+							 ORelOids oids, OXid oxid)
+{
+	int			idx[O_PRED_LOCKS_MAX_ENTRIES];
+	int			n = 0;
+	int			i;
+	int			bestLeft = -1,
+				bestRight = -1;
+	int			bestGap = INT_MAX;
+
+	coalesce_page_intervals(desc, tbl, oids, oxid);
+
+	for (i = 0; i < O_PRED_LOCKS_MAX_ENTRIES; i++)
+	{
+		OPredLockEntry *e = &tbl->entries[i];
+
+		if (!e->valid || e->level != OPredLockLevelPage)
+			continue;
+		if (!ORelOidsIsEqual(e->oids, oids) || e->oxid != oxid)
+			continue;
+		idx[n++] = i;
+	}
+
+	if (n < 2)
+		return false;
+
+	page_lock_cmp_desc = desc;
+	page_lock_cmp_tbl = tbl;
+	qsort(idx, n, sizeof(int), page_lock_index_cmp);
+
+	for (i = 0; i < n - 1; i++)
+	{
+		OPredLockEntry *left = &tbl->entries[idx[i]];
+		OPredLockEntry *right = &tbl->entries[idx[i + 1]];
+		int			gapScore;
+
+		if (page_ranges_overlap_or_touch(desc,
+										 &left->loKey, &left->key,
+										 &right->loKey, &right->key))
+			gapScore = 0;
+		else
+			gapScore = 1;
+
+		if (gapScore < bestGap)
+		{
+			bestGap = gapScore;
+			bestLeft = idx[i];
+			bestRight = idx[i + 1];
+
+			if (gapScore == 0)
+				break;
+		}
+	}
+
+	if (bestLeft < 0 || bestRight < 0)
+		return false;
+
+	page_range_widen(desc,
+					 &tbl->entries[bestLeft].loKey,
+					 &tbl->entries[bestLeft].key,
+					 &tbl->entries[bestRight].loKey,
+					 &tbl->entries[bestRight].key);
+	tbl->entries[bestRight].valid = false;
+	tbl->numValid--;
+	return true;
+}
+
+/*
  * Does the key (keyType) fall within a page-level lock entry whose range is
  * [loKey, hiKey)?  The hiKey is exclusive (key < hiKey), loKey is inclusive
  * (key >= loKey).
@@ -268,28 +497,6 @@ count_tuple_entries_on_page(OPredLocksData *tbl,
 			(e->key.len != pageHikey->len ||
 			 e->key.formatFlags != pageHikey->formatFlags ||
 			 memcmp(e->key.data, pageHikey->data, e->key.len) != 0))
-			continue;
-		count++;
-	}
-	return count;
-}
-
-static int
-count_page_entries_for_tree(OPredLocksData *tbl,
-							ORelOids oids, OXid oxid)
-{
-	int			count = 0;
-	int			i;
-
-	for (i = 0; i < O_PRED_LOCKS_MAX_ENTRIES; i++)
-	{
-		OPredLockEntry *e = &tbl->entries[i];
-
-		if (!e->valid || e->level != OPredLockLevelPage)
-			continue;
-		if (!ORelOidsIsEqual(e->oids, oids))
-			continue;
-		if (e->oxid != oxid)
 			continue;
 		count++;
 	}
@@ -422,19 +629,34 @@ already_locked(BTreeDescr *desc,
 }
 
 /*
- * Insert a page-level lock entry into tbl.  If tbl is full, promote to a
- * tree-level lock.  Returns the slot used, or -1 if promoted to tree level
- * (which means the entry is now a tree-level lock in some free slot).
+ * Insert a page-level lock entry into tbl.  Page locks are kept as disjoint,
+ * monotonically increasing intervals; overlapping or adjacent locks are merged.
+ * If we run out of space we first merge the closest page intervals before
+ * falling back to a tree-level lock.
  */
 static void
-insert_page_lock(OPredLocksData *tbl,
+insert_page_lock(BTreeDescr *desc,
+				 OPredLocksData *tbl,
 				 ORelOids oids, OXid oxid,
 				 OPredLockKey *pageHikey, OPredLockKey *pageLokey)
 {
 	int			slot;
 	OPredLockEntry *e;
+	OPredLockKey mergedHi = *pageHikey;
+	OPredLockKey mergedLo = *pageLokey;
 
-	/* Check if a page-level lock for this exact page already exists. */
+	/* Tree-level lock already covers everything. */
+	for (int i = 0; i < O_PRED_LOCKS_MAX_ENTRIES; i++)
+	{
+		OPredLockEntry *ex = &tbl->entries[i];
+
+		if (!ex->valid || ex->level != OPredLockLevelTree)
+			continue;
+		if (ORelOidsIsEqual(ex->oids, oids) && ex->oxid == oxid)
+			return;
+	}
+
+	/* Merge with existing page locks of the same tree/transaction. */
 	for (int i = 0; i < O_PRED_LOCKS_MAX_ENTRIES; i++)
 	{
 		OPredLockEntry *ex = &tbl->entries[i];
@@ -443,50 +665,43 @@ insert_page_lock(OPredLocksData *tbl,
 			continue;
 		if (!ORelOidsIsEqual(ex->oids, oids) || ex->oxid != oxid)
 			continue;
-		/* Same hikey? */
-		if (ex->key.notNull == pageHikey->notNull &&
-			(!pageHikey->notNull ||
-			 (ex->key.len == pageHikey->len &&
-			  ex->key.formatFlags == pageHikey->formatFlags &&
-			  memcmp(ex->key.data, pageHikey->data, pageHikey->len) == 0)))
-			return;				/* already have this page lock */
-	}
 
-	/* Possibly promote many page locks to a tree lock. */
-	if (count_page_entries_for_tree(tbl, oids, oxid) >=
-		O_PRED_LOCK_TREE_PROMOTE_THRESHOLD)
-	{
-		/* Promote: remove all page-level entries for this tree. */
-		remove_page_entries_for_tree(tbl, oids, oxid);
+		if (page_range_contains(desc,
+								&ex->loKey, &ex->key,
+								&mergedLo, &mergedHi))
+			return;				/* already covered */
 
-		slot = find_free_slot(tbl);
-		if (slot < 0)
+		if (page_range_contains(desc,
+								&mergedLo, &mergedHi,
+								&ex->loKey, &ex->key) ||
+			page_ranges_overlap_or_touch(desc,
+										 &mergedLo, &mergedHi,
+										 &ex->loKey, &ex->key))
 		{
-			/*
-			 * Still full – this shouldn't happen since we just freed
-			 * entries, but be safe.
-			 */
-			return;
+			page_range_widen(desc, &mergedLo, &mergedHi,
+							 &ex->loKey, &ex->key);
+			ex->valid = false;
+			tbl->numValid--;
 		}
-		e = &tbl->entries[slot];
-		e->valid = true;
-		e->oids = oids;
-		e->oxid = oxid;
-		e->level = OPredLockLevelTree;
-		e->key.notNull = false;
-		e->loKey.notNull = false;
-		tbl->numValid++;
-		return;
 	}
+
+	/* Ensure remaining intervals for this tree are coalesced. */
+	coalesce_page_intervals(desc, tbl, oids, oxid);
 
 	slot = find_free_slot(tbl);
-	if (slot < 0)
+	while (slot < 0)
 	{
-		/* Table is full. Promote to tree lock immediately. */
+		if (merge_closest_page_intervals(desc, tbl, oids, oxid))
+		{
+			slot = find_free_slot(tbl);
+			continue;
+		}
+
+		/* Last resort: collapse to a tree-level lock. */
 		remove_page_entries_for_tree(tbl, oids, oxid);
 		slot = find_free_slot(tbl);
 		if (slot < 0)
-			return;				/* still no room – shouldn't happen */
+			return;
 
 		e = &tbl->entries[slot];
 		e->valid = true;
@@ -504,9 +719,12 @@ insert_page_lock(OPredLocksData *tbl,
 	e->oids = oids;
 	e->oxid = oxid;
 	e->level = OPredLockLevelPage;
-	e->key = *pageHikey;
-	e->loKey = *pageLokey;
+	e->key = mergedHi;
+	e->loKey = mergedLo;
 	tbl->numValid++;
+
+	/* Maintain monotonic page intervals. */
+	coalesce_page_intervals(desc, tbl, oids, oxid);
 }
 
 /* --------------------------------------------------------------------------
@@ -602,7 +820,7 @@ o_pred_lock_acquire(BTreeDescr *desc,
 	{
 		/* Key too long to store – add a page-level lock immediately. */
 		if (hiOK && loOK)
-			insert_page_lock(tbl, desc->oids, oxid, &pageHikey, &pageLokey);
+			insert_page_lock(desc, tbl, desc->oids, oxid, &pageHikey, &pageLokey);
 		/* else: hikey also too long – promote to tree level */
 		else
 		{
@@ -650,7 +868,7 @@ o_pred_lock_acquire(BTreeDescr *desc,
 	{
 		/* Promote: replace tuple-level entries for this page with one page lock. */
 		remove_tuple_entries_on_page(tbl, desc->oids, oxid, &pageHikey);
-		insert_page_lock(tbl, desc->oids, oxid, &pageHikey, &pageLokey);
+		insert_page_lock(desc, tbl, desc->oids, oxid, &pageHikey, &pageLokey);
 		LWLockRelease(&tbl->lock);
 		return;
 	}
@@ -661,7 +879,7 @@ o_pred_lock_acquire(BTreeDescr *desc,
 	{
 		/* No free slot – promote to page level. */
 		remove_tuple_entries_on_page(tbl, desc->oids, oxid, &pageHikey);
-		insert_page_lock(tbl, desc->oids, oxid, &pageHikey, &pageLokey);
+		insert_page_lock(desc, tbl, desc->oids, oxid, &pageHikey, &pageLokey);
 		LWLockRelease(&tbl->lock);
 		return;
 	}
