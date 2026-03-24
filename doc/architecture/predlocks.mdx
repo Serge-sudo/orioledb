@@ -1,0 +1,27 @@
+# Predicate locks and interval merging
+
+## Overview
+
+OrioleDB uses lightweight predicate locks to track keys read by operations such as foreign-key checks without dirtying B-tree pages. Predicate locks live in per-backend shared memory and can be taken at three granularities:
+
+- **Tuple**: exact key.
+- **Page**: key range `[loKey, hiKey)` covered by a single leaf page.
+- **Tree**: entire B‑tree.
+
+## Page locks as monotonic intervals
+
+Page‑level predicate locks are stored as a monotonic set of non‑overlapping intervals per backend/transaction:
+
+- Intervals are **sorted** by `loKey`, and `hiKey` of an interval is always `< loKey` of the next (adjacent intervals get coalesced).
+- Overlapping or adjacent intervals are **coalesced** immediately.
+- When space is limited, the two **nearest intervals** are merged first (preferring overlaps/adjacent ranges) before falling back to a tree‑level lock.
+
+This avoids creating many discrete page locks and reduces promotion to coarse tree locks, while guaranteeing coverage correctness for conflict checks.
+
+## Cleanup
+
+All predicate locks for a transaction are released on commit/abort via `undo_xact_callback()`.
+
+## Conflict checks
+
+Modifications (e.g., DELETE/UPDATE) call `o_pred_lock_check()`, which scans predicate locks and waits on any conflicting in‑progress transaction holding a covering lock (tuple, page interval, or tree).
