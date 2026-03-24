@@ -31,6 +31,7 @@
 #include "tableam/descr.h"
 #include "tableam/handler.h"
 #include "transam/oxid.h"
+#include "transam/predlock.h"
 #include "transam/undo.h"
 #include "utils/o_buffers.h"
 #include "utils/page_pool.h"
@@ -2262,6 +2263,15 @@ undo_xact_callback(XactEvent event, void *arg)
 
 		for (i = 0; i < (int) UndoLogsCount; i++)
 			free_retained_undo_location((UndoLogType) i);
+
+		/*
+		 * Release predicate locks (lightweight KeyShare locks from FK
+		 * reference checks) held by this transaction.  These are stored in
+		 * shared memory and must be released so that waiting DELETE/UPDATE
+		 * operations can proceed.
+		 */
+		if (OXidIsValid(oxid) && o_pred_locks != NULL)
+			o_pred_lock_release_all(oxid);
 	}
 
 	if (event == XACT_EVENT_COMMIT && isParallelWorker)

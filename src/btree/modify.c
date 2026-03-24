@@ -25,6 +25,7 @@
 #include "catalog/o_tables.h"
 #include "recovery/recovery.h"
 #include "recovery/wal.h"
+#include "transam/predlock.h"
 #include "transam/undo.h"
 #include "transam/oxid.h"
 #include "utils/page_pool.h"
@@ -624,6 +625,46 @@ o_btree_modify_handle_conflicts(BTreeModifyInternalContext *context)
 								   context->savepointUndoLocation);
 	}
 
+	/*
+	 * Check predicate locks.  Predicate locks are lightweight KeyShare locks
+	 * taken by FK reference checks (and SELECT FOR KEY SHARE) that avoid
+	 * writing undo records to pages.  A conflict can only arise for
+	 * RowLockUpdate operations (DELETE and UPDATE of key columns) since
+	 * ROW_LOCKS_CONFLICT(RowLockKeyShare, RowLockUpdate) is true.
+	 *
+	 * Only check when we are still looking at the right tuple (cmp == 0).
+	 * page_item_rollback() may set cmp = -1 when the tuple was removed.
+	 *
+	 * We check after the regular undo-chain conflict check so that the caller
+	 * still handles any undo-based conflict first.  When no undo conflict was
+	 * detected (or after it has been resolved on a retry), this catch ensures
+	 * we also wait for predicate-lock holders.
+	 */
+	if (context->cmp == 0 && IsRelationTree(desc))
+	{
+		OXid		predConflictOxid = InvalidOXid;
+
+		if (o_pred_lock_check(desc, curTuple, BTreeKeyLeafTuple,
+							  context->lockMode, context->opOxid,
+							  &predConflictOxid, &context->lockStatus))
+		{
+			OFindPageResult result PG_USED_FOR_ASSERTS_ONLY;
+
+			unlock_page(blkno);
+
+			wait_for_oxid(predConflictOxid, false);
+
+			result = refind_page(pageFindContext,
+								 context->key,
+								 context->keyType,
+								 0,
+								 pageFindContext->items[pageFindContext->index].blkno,
+								 pageFindContext->items[pageFindContext->index].pageChangeCount);
+			Assert(result == OFindPageResultSuccess);
+			return ConflictResolutionRetry;
+		}
+	}
+
 	if (!context->needsUndo)
 		context->leafTuphdr.undoLocation = tuphdr->undoLocation;
 	return ConflictResolutionOK;
@@ -915,6 +956,23 @@ o_btree_modify_lock(BTreeModifyInternalContext *context)
 	Assert(context->needsUndo);
 	Assert(context->undoIsReserved);
 	Assert(OXidIsValid(context->opOxid));
+
+	/*
+	 * For RowLockKeyShare (used by FK reference checks and SELECT FOR KEY
+	 * SHARE), use a predicate lock instead of writing an undo record to the
+	 * page.  This avoids marking the page dirty and checkpointing pages when
+	 * no actual data has changed.
+	 *
+	 * Predicate locks are stored in per-backend shared memory and are checked
+	 * by concurrent DELETE/UPDATE operations via o_pred_lock_check().
+	 */
+	if (context->lockMode == RowLockKeyShare && IsRelationTree(desc))
+	{
+		o_pred_lock_acquire(desc, curTuple, page, pageFindContext,
+							context->opOxid);
+		unlock_release(context, true);
+		return OBTreeModifyResultLocked;
+	}
 
 	if (context->tupleType == BTreeKeyNonLeafKey)
 	{

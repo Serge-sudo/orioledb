@@ -81,6 +81,7 @@ OBJS = src/btree/btree.o \
 	   src/tableam/vacuum.o \
 	   src/transam/undo.o \
 	   src/transam/oxid.o \
+	   src/transam/predlock.o \
 	   src/tuple/format.o \
 	   src/tuple/toast.o \
 	   src/tuple/slot.o \
