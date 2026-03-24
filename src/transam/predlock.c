@@ -469,12 +469,15 @@ entry_covers_key(BTreeDescr *desc,
 }
 
 /*
- * Count entries with the given oids and (for page-level matching) the same
- * hikey.  This is used to decide whether to promote.
+ * Count tuple-level entries for the same page (identified by hikey) that also
+ * fall inside the page key range [pageLokey, pageHikey).  Used to decide
+ * whether to promote.
  */
 static int
-count_tuple_entries_on_page(OPredLocksData *tbl,
+count_tuple_entries_on_page(BTreeDescr *desc,
+							OPredLocksData *tbl,
 							ORelOids oids, OXid oxid,
+							OPredLockKey *pageLokey,
 							OPredLockKey *pageHikey)
 {
 	int			count = 0;
@@ -498,6 +501,16 @@ count_tuple_entries_on_page(OPredLocksData *tbl,
 			 e->key.formatFlags != pageHikey->formatFlags ||
 			 memcmp(e->key.data, pageHikey->data, e->key.len) != 0))
 			continue;
+		/* Must be within [pageLokey, pageHikey). */
+		{
+			OTuple		t = predlock_key_to_tuple(&e->key);
+
+			if (predlock_cmp_with_lokey(desc, t, BTreeKeyNonLeafKey, pageLokey) < 0)
+				continue;
+			if (predlock_cmp_with_hikey(desc, t, BTreeKeyNonLeafKey, pageHikey) >= 0)
+				continue;
+		}
+
 		count++;
 	}
 	return count;
@@ -861,7 +874,8 @@ o_pred_lock_acquire(BTreeDescr *desc,
 	}
 
 	/* Count existing tuple-level locks for the same page. */
-	samePage = count_tuple_entries_on_page(tbl, desc->oids, oxid, &pageHikey);
+	samePage = count_tuple_entries_on_page(desc, tbl, desc->oids, oxid,
+										   &pageLokey, &pageHikey);
 
 	if (samePage >= O_PRED_LOCK_PAGE_PROMOTE_THRESHOLD ||
 		tbl->numValid >= O_PRED_LOCKS_MAX_ENTRIES)
