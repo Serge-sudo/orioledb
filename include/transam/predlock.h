@@ -53,12 +53,10 @@
 #define O_PRED_LOCKS_MAX_ENTRIES	64
 
 /*
- * Minimum and maximum thresholds for tuple-level lock promotion.
- * The actual threshold is calculated dynamically based on the relation's
- * tuple size to be ~75% of max tuples per page.
+ * After this many tuple-level locks share the same page highkey the entries
+ * are merged into a single page-level lock.
  */
-#define O_PRED_LOCK_PAGE_PROMOTE_THRESHOLD_MIN	8
-#define O_PRED_LOCK_PAGE_PROMOTE_THRESHOLD_MAX	256
+#define O_PRED_LOCK_PAGE_PROMOTE_THRESHOLD	8
 
 /* Reserved for potential future tuning of page-level consolidation. */
 #define O_PRED_LOCK_TREE_PROMOTE_THRESHOLD	8
@@ -125,12 +123,6 @@ extern OPredLocksData *o_pred_locks;
 /* Shared memory sizing / initialisation (called from orioledb.c). */
 extern Size o_pred_lock_shmem_size(void);
 extern void o_pred_lock_shmem_init(Pointer ptr, bool found);
-
-/*
- * Calculate the dynamic promotion threshold for a relation.
- * Returns ~75% of the estimated max tuples per page based on O_BTREE_MAX_TUPLE_SIZE.
- */
-extern int o_pred_lock_get_promote_threshold(BTreeDescr *desc);
 
 /*
  * Acquire a predicate lock on the tuple currently pointed to by
