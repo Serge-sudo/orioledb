@@ -1169,7 +1169,7 @@ predlock_emit_entry(OPredLockSnapshotEntry *e, TupleDesc tupdesc,
 	memset(values, 0, sizeof(values));
 	memset(nulls, 0, sizeof(nulls));
 
-	if (e->level < PREDLOCK_LEVEL_COUNT)
+	if (e->level < PREDLOCK_LEVEL_COUNT && predlock_level_names[e->level] != NULL)
 		level = predlock_level_names[e->level];
 	else
 		level = "unknown";
@@ -1275,13 +1275,13 @@ orioledb_predicate_locks(PG_FUNCTION_ARGS)
 	rsinfo->setResult = tupstore;
 	rsinfo->setDesc = tupdesc;
 
-	MemoryContextSwitchTo(oldcontext);
-
 	snapshot = predlock_snapshot_locks();
 
 	foreach(lc, snapshot)
 		predlock_emit_entry((OPredLockSnapshotEntry *) lfirst(lc),
 							tupdesc, tupstore);
+
+	MemoryContextSwitchTo(oldcontext);
 
 	tuplestore_donestoring(tupstore);
 
