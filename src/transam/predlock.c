@@ -38,6 +38,12 @@ OPredLocksData *o_pred_locks = NULL;
 
 PG_FUNCTION_INFO_V1(orioledb_predicate_locks);
 
+static const char *const predlock_level_names[] = {
+	[OPredLockLevelTuple] = "tuple",
+	[OPredLockLevelPage] = "page",
+	[OPredLockLevelTree] = "tree"
+};
+
 /* --------------------------------------------------------------------------
  * Shared memory helpers
  * --------------------------------------------------------------------------
@@ -1110,11 +1116,6 @@ orioledb_predicate_locks(PG_FUNCTION_ARGS)
 	Tuplestorestate *tupstore;
 	List	   *snapshot = NIL;
 	ListCell   *lc;
-	static const char *level_names[] = {
-		[OPredLockLevelTuple] = "tuple",
-		[OPredLockLevelPage] = "page",
-		[OPredLockLevelTree] = "tree"
-	};
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 		ereport(ERROR,
@@ -1201,9 +1202,8 @@ orioledb_predicate_locks(PG_FUNCTION_ARGS)
 		memset(nulls, 0, sizeof(nulls));
 
 		if (e->level >= OPredLockLevelTuple &&
-			e->level <= OPredLockLevelTree &&
-			level_names[e->level] != NULL)
-			level = level_names[e->level];
+			e->level <= OPredLockLevelTree)
+			level = predlock_level_names[e->level];
 		else
 			level = "unknown";
 
@@ -1223,51 +1223,34 @@ orioledb_predicate_locks(PG_FUNCTION_ARGS)
 		values[2] = ObjectIdGetDatum(e->oids.relnode);
 		values[3] = Int64GetDatum((int64) e->oxid);
 		values[4] = CStringGetTextDatum(level);
+
 		if (keyJson)
-		{
 			values[5] = PointerGetDatum(keyJson);
-			nulls[5] = false;
-		}
 		else
 			nulls[5] = true;
 
 		if (lokeyJson)
-		{
 			values[6] = PointerGetDatum(lokeyJson);
-			nulls[6] = false;
-		}
 		else
 			nulls[6] = true;
 
 		if (keyRaw)
-		{
 			values[7] = PointerGetDatum(keyRaw);
-			nulls[7] = false;
-		}
 		else
 			nulls[7] = true;
 
 		if (e->key.notNull)
-		{
 			values[8] = Int16GetDatum(e->key.formatFlags);
-			nulls[8] = false;
-		}
 		else
 			nulls[8] = true;
 
 		if (loKeyRaw)
-		{
 			values[9] = PointerGetDatum(loKeyRaw);
-			nulls[9] = false;
-		}
 		else
 			nulls[9] = true;
 
 		if (e->loKey.notNull)
-		{
 			values[10] = Int16GetDatum(e->loKey.formatFlags);
-			nulls[10] = false;
-		}
 		else
 			nulls[10] = true;
 
