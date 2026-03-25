@@ -1189,6 +1189,7 @@ orioledb_predicate_locks(PG_FUNCTION_ARGS)
 		OPredLockSnapshotEntry *e = (OPredLockSnapshotEntry *) lfirst(lc);
 		Datum		values[11];
 		bool		nulls[11];
+		const char *level;
 		OTableDescr *descr = NULL;
 		BTreeDescr *desc = NULL;
 		Jsonb	   *keyJson = NULL;
@@ -1196,7 +1197,15 @@ orioledb_predicate_locks(PG_FUNCTION_ARGS)
 		bytea	   *keyRaw = NULL;
 		bytea	   *loKeyRaw = NULL;
 
+		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
+
+		if (e->level >= OPredLockLevelTuple &&
+			e->level <= OPredLockLevelTree &&
+			level_names[e->level] != NULL)
+			level = level_names[e->level];
+		else
+			level = "unknown";
 
 		if (e->oids.datoid == MyDatabaseId)
 		{
@@ -1213,7 +1222,7 @@ orioledb_predicate_locks(PG_FUNCTION_ARGS)
 		values[1] = ObjectIdGetDatum(e->oids.reloid);
 		values[2] = ObjectIdGetDatum(e->oids.relnode);
 		values[3] = Int64GetDatum((int64) e->oxid);
-		values[4] = CStringGetTextDatum(level_names[e->level]);
+		values[4] = CStringGetTextDatum(level);
 		if (keyJson)
 		{
 			values[5] = PointerGetDatum(keyJson);
