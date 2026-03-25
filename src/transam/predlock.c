@@ -36,6 +36,8 @@
 /* Global pointer to the per-backend predicate lock tables in shared memory. */
 OPredLocksData *o_pred_locks = NULL;
 
+#define PREDLOCK_OUTPUT_COLS 11
+
 PG_FUNCTION_INFO_V1(orioledb_predicate_locks);
 
 static const char *const predlock_level_names[] = {
@@ -1128,7 +1130,7 @@ orioledb_predicate_locks(PG_FUNCTION_ARGS)
 
 	oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
 
-	tupdesc = CreateTemplateTupleDesc(11);
+	tupdesc = CreateTemplateTupleDesc(PREDLOCK_OUTPUT_COLS);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "datoid", OIDOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "reloid", OIDOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "relnode", OIDOID, -1, 0);
@@ -1188,8 +1190,8 @@ orioledb_predicate_locks(PG_FUNCTION_ARGS)
 	foreach(lc, snapshot)
 	{
 		OPredLockSnapshotEntry *e = (OPredLockSnapshotEntry *) lfirst(lc);
-		Datum		values[11];
-		bool		nulls[11];
+		Datum		values[PREDLOCK_OUTPUT_COLS];
+		bool		nulls[PREDLOCK_OUTPUT_COLS];
 		const char *level;
 		OTableDescr *descr = NULL;
 		BTreeDescr *desc = NULL;
