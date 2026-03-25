@@ -25,11 +25,18 @@
 #include "transam/oxid.h"
 #include "transam/predlock.h"
 
+#include "access/htup_details.h"
+#include "funcapi.h"
+#include "tableam/handler.h"
 #include "storage/lwlock.h"
 #include "miscadmin.h"
+#include "utils/builtins.h"
+#include "utils/jsonb.h"
 
 /* Global pointer to the per-backend predicate lock tables in shared memory. */
 OPredLocksData *o_pred_locks = NULL;
+
+PG_FUNCTION_INFO_V1(orioledb_predicate_locks);
 
 /* --------------------------------------------------------------------------
  * Shared memory helpers
@@ -1032,4 +1039,233 @@ o_pred_lock_release_all(OXid oxid)
 		}
 		LWLockRelease(&tbl->lock);
 	}
+}
+
+typedef struct OPredLockSnapshotEntry
+{
+	ORelOids	oids;
+	OXid		oxid;
+	OPredLockLevel level;
+	OPredLockKey key;
+	OPredLockKey loKey;
+} OPredLockSnapshotEntry;
+
+static Jsonb *
+predlock_key_to_jsonb_if_any(OPredLockKey *key, BTreeDescr *desc)
+{
+	JsonbValue *jsval;
+	JsonbParseState *state = NULL;
+	OTuple		tuple;
+
+	if (!desc || !key->notNull)
+		return NULL;
+
+	tuple = predlock_key_to_tuple(key);
+	jsval = o_btree_key_to_jsonb(desc, tuple, &state);
+	if (!jsval)
+		return NULL;
+
+	return JsonbValueToJsonb(jsval);
+}
+
+static bytea *
+predlock_key_to_raw(OPredLockKey *key)
+{
+	bytea	   *raw;
+
+	if (!key->notNull || key->len == 0)
+		return NULL;
+
+	raw = (bytea *) palloc(key->len + VARHDRSZ);
+	SET_VARSIZE(raw, key->len + VARHDRSZ);
+	memcpy(VARDATA(raw), key->data, key->len);
+	return raw;
+}
+
+static BTreeDescr *
+predlock_entry_find_btree(OTableDescr *descr, ORelOids oids)
+{
+	OIndexNumber ixnum;
+
+	if (descr == NULL)
+		return NULL;
+
+	ixnum = find_tree_in_descr(descr, oids);
+	if (ixnum == InvalidIndexNumber)
+		return NULL;
+	if (ixnum == TOASTIndexNumber)
+		return &descr->toast->desc;
+	if (ixnum < descr->nIndices)
+		return &descr->indices[ixnum]->desc;
+
+	return NULL;
+}
+
+Datum
+orioledb_predicate_locks(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	MemoryContext oldcontext;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	List	   *snapshot = NIL;
+	ListCell   *lc;
+	static const char *level_names[] = {
+		[OPredLockLevelTuple] = "tuple",
+		[OPredLockLevelPage] = "page",
+		[OPredLockLevelTree] = "tree"
+	};
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+
+	tupdesc = CreateTemplateTupleDesc(11);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "datoid", OIDOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "reloid", OIDOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "relnode", OIDOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 4, "oxid", INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 5, "lock_level", TEXTOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 6, "key", JSONBOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 7, "lokey", JSONBOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 8, "key_raw", BYTEAOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 9, "key_format_flags", INT2OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 10, "lokey_raw", BYTEAOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 11, "lokey_format_flags", INT2OID, -1, 0);
+
+	tupstore = tuplestore_begin_heap((rsinfo->allowedModes & SFRM_Materialize_Random) != 0,
+									 false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/* Take a stable snapshot of current predicate locks. */
+	for (int proc = 0; proc < max_procs; proc++)
+	{
+		OPredLocksData *tbl = &o_pred_locks[proc];
+		int			i;
+
+		if (tbl->numValid == 0)
+			continue;
+
+		LWLockAcquire(&tbl->lock, LW_SHARED);
+		for (i = 0; i < O_PRED_LOCKS_MAX_ENTRIES; i++)
+		{
+			OPredLockEntry *e = &tbl->entries[i];
+			CommitSeqNo csn;
+			OPredLockSnapshotEntry *copy;
+
+			if (!e->valid)
+				continue;
+
+			/* Skip already finished transactions. */
+			csn = oxid_get_csn(e->oxid, false);
+			if (!COMMITSEQNO_IS_INPROGRESS(csn))
+				continue;
+
+			copy = (OPredLockSnapshotEntry *) palloc(sizeof(OPredLockSnapshotEntry));
+			copy->oids = e->oids;
+			copy->oxid = e->oxid;
+			copy->level = e->level;
+			copy->key = e->key;
+			copy->loKey = e->loKey;
+
+			snapshot = lappend(snapshot, copy);
+		}
+		LWLockRelease(&tbl->lock);
+	}
+
+	foreach(lc, snapshot)
+	{
+		OPredLockSnapshotEntry *e = (OPredLockSnapshotEntry *) lfirst(lc);
+		Datum		values[11];
+		bool		nulls[11];
+		OTableDescr *descr = NULL;
+		BTreeDescr *desc = NULL;
+		Jsonb	   *keyJson = NULL;
+		Jsonb	   *lokeyJson = NULL;
+		bytea	   *keyRaw = NULL;
+		bytea	   *loKeyRaw = NULL;
+
+		memset(nulls, 0, sizeof(nulls));
+
+		if (e->oids.datoid == MyDatabaseId)
+		{
+			descr = o_fetch_table_descr(e->oids);
+			desc = predlock_entry_find_btree(descr, e->oids);
+		}
+
+		keyJson = predlock_key_to_jsonb_if_any(&e->key, desc);
+		lokeyJson = predlock_key_to_jsonb_if_any(&e->loKey, desc);
+		keyRaw = predlock_key_to_raw(&e->key);
+		loKeyRaw = predlock_key_to_raw(&e->loKey);
+
+		values[0] = ObjectIdGetDatum(e->oids.datoid);
+		values[1] = ObjectIdGetDatum(e->oids.reloid);
+		values[2] = ObjectIdGetDatum(e->oids.relnode);
+		values[3] = Int64GetDatum((int64) e->oxid);
+		values[4] = CStringGetTextDatum(level_names[e->level]);
+		if (keyJson)
+		{
+			values[5] = PointerGetDatum(keyJson);
+			nulls[5] = false;
+		}
+		else
+			nulls[5] = true;
+
+		if (lokeyJson)
+		{
+			values[6] = PointerGetDatum(lokeyJson);
+			nulls[6] = false;
+		}
+		else
+			nulls[6] = true;
+
+		if (keyRaw)
+		{
+			values[7] = PointerGetDatum(keyRaw);
+			nulls[7] = false;
+		}
+		else
+			nulls[7] = true;
+
+		if (e->key.notNull)
+		{
+			values[8] = Int16GetDatum(e->key.formatFlags);
+			nulls[8] = false;
+		}
+		else
+			nulls[8] = true;
+
+		if (loKeyRaw)
+		{
+			values[9] = PointerGetDatum(loKeyRaw);
+			nulls[9] = false;
+		}
+		else
+			nulls[9] = true;
+
+		if (e->loKey.notNull)
+		{
+			values[10] = Int16GetDatum(e->loKey.formatFlags);
+			nulls[10] = false;
+		}
+		else
+			nulls[10] = true;
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+	tuplestore_donestoring(tupstore);
+
+	PG_RETURN_VOID();
 }
