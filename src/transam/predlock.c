@@ -1115,18 +1115,18 @@ predlock_snapshot_locks(void)
 {
 	List	   *snapshot = NIL;
 
-	for (int proc_idx = 0; proc_idx < max_procs; proc_idx++)
+	for (int backend_index = 0; backend_index < max_procs; backend_index++)
 	{
-		OPredLocksData *tbl = &o_pred_locks[proc_idx];
-		int			entry_idx;
+		OPredLocksData *tbl = &o_pred_locks[backend_index];
+		int			entry_index;
 
 		if (tbl->numValid == 0)
 			continue;
 
 		LWLockAcquire(&tbl->lock, LW_SHARED);
-		for (entry_idx = 0; entry_idx < O_PRED_LOCKS_MAX_ENTRIES; entry_idx++)
+		for (entry_index = 0; entry_index < O_PRED_LOCKS_MAX_ENTRIES; entry_index++)
 		{
-			OPredLockEntry *e = &tbl->entries[entry_idx];
+			OPredLockEntry *e = &tbl->entries[entry_index];
 			CommitSeqNo csn;
 			OPredLockSnapshotEntry *copy;
 
