@@ -1169,7 +1169,7 @@ predlock_emit_entry(OPredLockSnapshotEntry *e, TupleDesc tupdesc,
 	memset(values, 0, sizeof(values));
 	memset(nulls, 0, sizeof(nulls));
 
-	if (e->level >= 0 && e->level < PREDLOCK_LEVEL_COUNT)
+	if (e->level < PREDLOCK_LEVEL_COUNT)
 		level = predlock_level_names[e->level];
 	else
 		level = "unknown";
@@ -1177,8 +1177,7 @@ predlock_emit_entry(OPredLockSnapshotEntry *e, TupleDesc tupdesc,
 	if (e->oids.datoid == MyDatabaseId)
 	{
 		descr = o_fetch_table_descr(e->oids);
-		if (descr != NULL)
-			desc = predlock_entry_find_btree(descr, e->oids);
+		desc = predlock_entry_find_btree(descr, e->oids);
 	}
 
 	keyJson = predlock_key_to_jsonb_or_null(&e->key, desc);
