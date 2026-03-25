@@ -37,6 +37,7 @@
 OPredLocksData *o_pred_locks = NULL;
 
 #define PREDLOCK_OUTPUT_COLS 11
+#define PREDLOCK_LEVEL_COUNT lengthof(predlock_level_names)
 
 PG_FUNCTION_INFO_V1(orioledb_predicate_locks);
 
@@ -1168,8 +1169,7 @@ predlock_emit_entry(OPredLockSnapshotEntry *e, TupleDesc tupdesc,
 	memset(values, 0, sizeof(values));
 	memset(nulls, 0, sizeof(nulls));
 
-	if (e->level >= OPredLockLevelTuple &&
-		e->level <= OPredLockLevelTree)
+	if (e->level >= 0 && e->level < PREDLOCK_LEVEL_COUNT)
 		level = predlock_level_names[e->level];
 	else
 		level = "unknown";
@@ -1241,6 +1241,7 @@ orioledb_predicate_locks(PG_FUNCTION_ARGS)
 	Tuplestorestate *tupstore;
 	List	   *snapshot = NIL;
 	ListCell   *lc;
+	bool		randomAccess;
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 		ereport(ERROR,
@@ -1266,8 +1267,11 @@ orioledb_predicate_locks(PG_FUNCTION_ARGS)
 	TupleDescInitEntry(tupdesc, (AttrNumber) 10, "lokey_raw", BYTEAOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 11, "lokey_format_flags", INT2OID, -1, 0);
 
-	tupstore = tuplestore_begin_heap((rsinfo->allowedModes & SFRM_Materialize_Random) != 0,
-									 false, work_mem);
+	randomAccess = (rsinfo->allowedModes & SFRM_Materialize_Random) != 0;
+
+	tupstore = tuplestore_begin_heap(randomAccess,
+									 false /* interXact */,
+									 work_mem);
 	rsinfo->returnMode = SFRM_Materialize;
 	rsinfo->setResult = tupstore;
 	rsinfo->setDesc = tupdesc;
