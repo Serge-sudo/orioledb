@@ -1137,7 +1137,7 @@ predlock_snapshot_locks(void)
 			if (!COMMITSEQNO_IS_INPROGRESS(csn))
 				continue;
 
-			copy = (OPredLockSnapshotEntry *) palloc0(sizeof(OPredLockSnapshotEntry));
+			copy = (OPredLockSnapshotEntry *) palloc(sizeof(OPredLockSnapshotEntry));
 			copy->oids = e->oids;
 			copy->oxid = e->oxid;
 			copy->level = e->level;
@@ -1169,7 +1169,7 @@ predlock_emit_entry(OPredLockSnapshotEntry *e, TupleDesc tupdesc,
 	memset(values, 0, sizeof(values));
 	memset(nulls, 0, sizeof(nulls));
 
-	if (e->level < PREDLOCK_LEVEL_COUNT && predlock_level_names[e->level] != NULL)
+	if (e->level < PREDLOCK_LEVEL_COUNT)
 		level = predlock_level_names[e->level];
 	else
 		level = "unknown";
