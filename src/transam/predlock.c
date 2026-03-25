@@ -1056,7 +1056,7 @@ typedef struct OPredLockSnapshotEntry
 	OXid		oxid;
 	OPredLockLevel level;
 	OPredLockKey key;
-	OPredLockKey loKey;
+	OPredLockKey lokey;
 } OPredLockSnapshotEntry;
 
 static Jsonb *
@@ -1137,12 +1137,12 @@ predlock_snapshot_locks(void)
 			if (!COMMITSEQNO_IS_INPROGRESS(csn))
 				continue;
 
-			copy = (OPredLockSnapshotEntry *) palloc(sizeof(OPredLockSnapshotEntry));
+			copy = (OPredLockSnapshotEntry *) palloc0(sizeof(OPredLockSnapshotEntry));
 			copy->oids = e->oids;
 			copy->oxid = e->oxid;
 			copy->level = e->level;
 			copy->key = e->key;
-			copy->loKey = e->loKey;
+			copy->lokey = e->loKey;
 
 			snapshot = lappend(snapshot, copy);
 		}
@@ -1176,14 +1176,15 @@ predlock_emit_entry(OPredLockSnapshotEntry *e, TupleDesc tupdesc,
 
 	if (e->oids.datoid == MyDatabaseId)
 	{
+		/* Descriptor may be absent for dropped/unloaded relations. */
 		descr = o_fetch_table_descr(e->oids);
 		desc = predlock_entry_find_btree(descr, e->oids);
 	}
 
 	keyJson = predlock_key_to_jsonb_or_null(&e->key, desc);
-	lokeyJson = predlock_key_to_jsonb_or_null(&e->loKey, desc);
+	lokeyJson = predlock_key_to_jsonb_or_null(&e->lokey, desc);
 	keyRaw = predlock_key_to_raw(&e->key);
-	loKeyRaw = predlock_key_to_raw(&e->loKey);
+	loKeyRaw = predlock_key_to_raw(&e->lokey);
 
 	values[0] = ObjectIdGetDatum(e->oids.datoid);
 	values[1] = ObjectIdGetDatum(e->oids.reloid);
@@ -1216,8 +1217,8 @@ predlock_emit_entry(OPredLockSnapshotEntry *e, TupleDesc tupdesc,
 	else
 		nulls[9] = true;
 
-	if (e->loKey.notNull)
-		values[10] = Int16GetDatum(e->loKey.formatFlags);
+	if (e->lokey.notNull)
+		values[10] = Int16GetDatum(e->lokey.formatFlags);
 	else
 		nulls[10] = true;
 
