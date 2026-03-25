@@ -1059,7 +1059,7 @@ typedef struct OPredLockSnapshotEntry
 } OPredLockSnapshotEntry;
 
 static Jsonb *
-predlock_key_to_jsonb_if_any(OPredLockKey *key, BTreeDescr *desc)
+predlock_key_to_jsonb_or_null(OPredLockKey *key, BTreeDescr *desc)
 {
 	JsonbValue *jsval;
 	JsonbParseState *state = NULL;
@@ -1109,6 +1109,129 @@ predlock_entry_find_btree(OTableDescr *descr, ORelOids oids)
 	return NULL;
 }
 
+static List *
+predlock_snapshot_locks(void)
+{
+	List	   *snapshot = NIL;
+
+	for (int proc = 0; proc < max_procs; proc++)
+	{
+		OPredLocksData *tbl = &o_pred_locks[proc];
+		int			i;
+
+		if (tbl->numValid == 0)
+			continue;
+
+		LWLockAcquire(&tbl->lock, LW_SHARED);
+		for (i = 0; i < O_PRED_LOCKS_MAX_ENTRIES; i++)
+		{
+			OPredLockEntry *e = &tbl->entries[i];
+			CommitSeqNo csn;
+			OPredLockSnapshotEntry *copy;
+
+			if (!e->valid)
+				continue;
+
+			csn = oxid_get_csn(e->oxid, false);
+			if (!COMMITSEQNO_IS_INPROGRESS(csn))
+				continue;
+
+			copy = (OPredLockSnapshotEntry *) palloc(sizeof(OPredLockSnapshotEntry));
+			copy->oids = e->oids;
+			copy->oxid = e->oxid;
+			copy->level = e->level;
+			copy->key = e->key;
+			copy->loKey = e->loKey;
+
+			snapshot = lappend(snapshot, copy);
+		}
+		LWLockRelease(&tbl->lock);
+	}
+
+	return snapshot;
+}
+
+static void
+predlock_emit_entry(OPredLockSnapshotEntry *e, TupleDesc tupdesc,
+					Tuplestorestate *tupstore)
+{
+	Datum		values[PREDLOCK_OUTPUT_COLS];
+	bool		nulls[PREDLOCK_OUTPUT_COLS];
+	const char *level;
+	OTableDescr *descr = NULL;
+	BTreeDescr *desc = NULL;
+	Jsonb	   *keyJson = NULL;
+	Jsonb	   *lokeyJson = NULL;
+	bytea	   *keyRaw = NULL;
+	bytea	   *loKeyRaw = NULL;
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, 0, sizeof(nulls));
+
+	if (e->level >= OPredLockLevelTuple &&
+		e->level <= OPredLockLevelTree)
+		level = predlock_level_names[e->level];
+	else
+		level = "unknown";
+
+	if (e->oids.datoid == MyDatabaseId)
+	{
+		descr = o_fetch_table_descr(e->oids);
+		if (descr != NULL)
+			desc = predlock_entry_find_btree(descr, e->oids);
+	}
+
+	keyJson = predlock_key_to_jsonb_or_null(&e->key, desc);
+	lokeyJson = predlock_key_to_jsonb_or_null(&e->loKey, desc);
+	keyRaw = predlock_key_to_raw(&e->key);
+	loKeyRaw = predlock_key_to_raw(&e->loKey);
+
+	values[0] = ObjectIdGetDatum(e->oids.datoid);
+	values[1] = ObjectIdGetDatum(e->oids.reloid);
+	values[2] = ObjectIdGetDatum(e->oids.relnode);
+	values[3] = Int64GetDatum((int64) e->oxid);
+	values[4] = CStringGetTextDatum(level);
+
+	if (keyJson)
+		values[5] = PointerGetDatum(keyJson);
+	else
+		nulls[5] = true;
+
+	if (lokeyJson)
+		values[6] = PointerGetDatum(lokeyJson);
+	else
+		nulls[6] = true;
+
+	if (keyRaw)
+		values[7] = PointerGetDatum(keyRaw);
+	else
+		nulls[7] = true;
+
+	if (e->key.notNull)
+		values[8] = Int16GetDatum(e->key.formatFlags);
+	else
+		nulls[8] = true;
+
+	if (loKeyRaw)
+		values[9] = PointerGetDatum(loKeyRaw);
+	else
+		nulls[9] = true;
+
+	if (e->loKey.notNull)
+		values[10] = Int16GetDatum(e->loKey.formatFlags);
+	else
+		nulls[10] = true;
+
+	tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+}
+
+/*
+ * Expose currently held predicate locks for the current database.
+ *
+ * Each row reports tree identifiers (datoid, reloid, relnode), owning oxid,
+ * lock level, JSON representations of keys when available, and raw key bytes
+ * plus format flags for debugging/inspection.
+ */
 Datum
 orioledb_predicate_locks(PG_FUNCTION_ARGS)
 {
@@ -1151,113 +1274,11 @@ orioledb_predicate_locks(PG_FUNCTION_ARGS)
 
 	MemoryContextSwitchTo(oldcontext);
 
-	/* Take a stable snapshot of current predicate locks. */
-	for (int proc = 0; proc < max_procs; proc++)
-	{
-		OPredLocksData *tbl = &o_pred_locks[proc];
-		int			i;
-
-		if (tbl->numValid == 0)
-			continue;
-
-		LWLockAcquire(&tbl->lock, LW_SHARED);
-		for (i = 0; i < O_PRED_LOCKS_MAX_ENTRIES; i++)
-		{
-			OPredLockEntry *e = &tbl->entries[i];
-			CommitSeqNo csn;
-			OPredLockSnapshotEntry *copy;
-
-			if (!e->valid)
-				continue;
-
-			/* Skip already finished transactions. */
-			csn = oxid_get_csn(e->oxid, false);
-			if (!COMMITSEQNO_IS_INPROGRESS(csn))
-				continue;
-
-			copy = (OPredLockSnapshotEntry *) palloc(sizeof(OPredLockSnapshotEntry));
-			copy->oids = e->oids;
-			copy->oxid = e->oxid;
-			copy->level = e->level;
-			copy->key = e->key;
-			copy->loKey = e->loKey;
-
-			snapshot = lappend(snapshot, copy);
-		}
-		LWLockRelease(&tbl->lock);
-	}
+	snapshot = predlock_snapshot_locks();
 
 	foreach(lc, snapshot)
-	{
-		OPredLockSnapshotEntry *e = (OPredLockSnapshotEntry *) lfirst(lc);
-		Datum		values[PREDLOCK_OUTPUT_COLS];
-		bool		nulls[PREDLOCK_OUTPUT_COLS];
-		const char *level;
-		OTableDescr *descr = NULL;
-		BTreeDescr *desc = NULL;
-		Jsonb	   *keyJson = NULL;
-		Jsonb	   *lokeyJson = NULL;
-		bytea	   *keyRaw = NULL;
-		bytea	   *loKeyRaw = NULL;
-
-		memset(values, 0, sizeof(values));
-		memset(nulls, 0, sizeof(nulls));
-
-		if (e->level >= OPredLockLevelTuple &&
-			e->level <= OPredLockLevelTree)
-			level = predlock_level_names[e->level];
-		else
-			level = "unknown";
-
-		if (e->oids.datoid == MyDatabaseId)
-		{
-			descr = o_fetch_table_descr(e->oids);
-			desc = predlock_entry_find_btree(descr, e->oids);
-		}
-
-		keyJson = predlock_key_to_jsonb_if_any(&e->key, desc);
-		lokeyJson = predlock_key_to_jsonb_if_any(&e->loKey, desc);
-		keyRaw = predlock_key_to_raw(&e->key);
-		loKeyRaw = predlock_key_to_raw(&e->loKey);
-
-		values[0] = ObjectIdGetDatum(e->oids.datoid);
-		values[1] = ObjectIdGetDatum(e->oids.reloid);
-		values[2] = ObjectIdGetDatum(e->oids.relnode);
-		values[3] = Int64GetDatum((int64) e->oxid);
-		values[4] = CStringGetTextDatum(level);
-
-		if (keyJson)
-			values[5] = PointerGetDatum(keyJson);
-		else
-			nulls[5] = true;
-
-		if (lokeyJson)
-			values[6] = PointerGetDatum(lokeyJson);
-		else
-			nulls[6] = true;
-
-		if (keyRaw)
-			values[7] = PointerGetDatum(keyRaw);
-		else
-			nulls[7] = true;
-
-		if (e->key.notNull)
-			values[8] = Int16GetDatum(e->key.formatFlags);
-		else
-			nulls[8] = true;
-
-		if (loKeyRaw)
-			values[9] = PointerGetDatum(loKeyRaw);
-		else
-			nulls[9] = true;
-
-		if (e->loKey.notNull)
-			values[10] = Int16GetDatum(e->loKey.formatFlags);
-		else
-			nulls[10] = true;
-
-		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
-	}
+		predlock_emit_entry((OPredLockSnapshotEntry *) lfirst(lc),
+							tupdesc, tupstore);
 
 	tuplestore_donestoring(tupstore);
 
