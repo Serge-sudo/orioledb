@@ -8,6 +8,17 @@ OrioleDB uses lightweight predicate locks to track keys read by operations such 
 - **Page**: key range `[loKey, hiKey)` covered by a single leaf page.
 - **Tree**: entire B‑tree.
 
+## Dynamic promotion threshold
+
+Tuple-level locks are promoted to page-level locks when too many tuple locks accumulate on the same page. The promotion threshold is **dynamically calculated** based on the relation's tuple size:
+
+- For **fixed-format tuples**, the threshold is set to ~75% of the estimated maximum tuples per page.
+- For **narrow tables** (e.g., 300 tuples/page), this gives a threshold of ~225.
+- For **wide tables** (e.g., few tuples/page), the threshold is correspondingly smaller.
+- The threshold is **clamped** between a minimum of 8 and maximum of 256.
+
+This adaptive approach ensures that foreign-key checks on narrow tables can accumulate many tuple locks before promotion, while wide tables promote earlier to avoid excessive memory usage.
+
 ## Page locks as monotonic intervals
 
 Page‑level predicate locks are stored as a monotonic set of non‑overlapping intervals per backend/transaction:

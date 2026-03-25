@@ -22,6 +22,7 @@
 #include "btree/find.h"
 #include "btree/modify.h"
 #include "btree/page_contents.h"
+#include "tableam/descr.h"
 #include "transam/oxid.h"
 #include "transam/predlock.h"
 
@@ -30,6 +31,72 @@
 
 /* Global pointer to the per-backend predicate lock tables in shared memory. */
 OPredLocksData *o_pred_locks = NULL;
+
+/* --------------------------------------------------------------------------
+ * Dynamic threshold calculation
+ * --------------------------------------------------------------------------
+ */
+
+/*
+ * Calculate the dynamic promotion threshold based on tuple size.
+ * Returns ~75% of the estimated max tuples per page.
+ *
+ * For narrow tables (300 tuples/page), this gives ~225.
+ * For wide tables (few tuples/page), this gives a smaller threshold.
+ */
+int
+o_pred_lock_get_promote_threshold(BTreeDescr *desc)
+{
+	OIndexDescr *id;
+	int			tupleSize;
+	int			itemSize;
+	int			maxTuplesPerPage;
+	int			threshold;
+	int			availableSpace;
+
+	/* For system trees or non-primary indices, use minimum threshold. */
+	if (IS_SYS_TREE_OIDS(desc->oids) || desc->type != oIndexPrimary)
+		return O_PRED_LOCK_PAGE_PROMOTE_THRESHOLD_MIN;
+
+	id = (OIndexDescr *) desc->arg;
+	if (!id)
+		return O_PRED_LOCK_PAGE_PROMOTE_THRESHOLD_MIN;
+
+	/*
+	 * Use leafSpec.len for fixed-format tuples, otherwise estimate based on
+	 * average or use minimum threshold for variable-length tuples.
+	 */
+	if ((id->leafSpec.natts == id->leafTupdesc->natts) &&
+		id->leafSpec.len > 0)
+	{
+		tupleSize = id->leafSpec.len;
+	}
+	else
+	{
+		/* Variable-length or incomplete spec – use minimum threshold. */
+		return O_PRED_LOCK_PAGE_PROMOTE_THRESHOLD_MIN;
+	}
+
+	/*
+	 * Calculate max tuples per page:
+	 * Each tuple needs: BTreeLeafTuphdrSize + MAXALIGN(tupleSize) + sizeof(LocationIndex)
+	 * Available space: ORIOLEDB_BLCKSZ - sizeof(BTreePageHeader)
+	 */
+	itemSize = BTreeLeafTuphdrSize + MAXALIGN(tupleSize) + sizeof(LocationIndex);
+	availableSpace = ORIOLEDB_BLCKSZ - sizeof(BTreePageHeader);
+	maxTuplesPerPage = availableSpace / itemSize;
+
+	/* Threshold is 75% of max tuples per page. */
+	threshold = (maxTuplesPerPage * 3) / 4;
+
+	/* Clamp to min/max bounds. */
+	if (threshold < O_PRED_LOCK_PAGE_PROMOTE_THRESHOLD_MIN)
+		threshold = O_PRED_LOCK_PAGE_PROMOTE_THRESHOLD_MIN;
+	if (threshold > O_PRED_LOCK_PAGE_PROMOTE_THRESHOLD_MAX)
+		threshold = O_PRED_LOCK_PAGE_PROMOTE_THRESHOLD_MAX;
+
+	return threshold;
+}
 
 /* --------------------------------------------------------------------------
  * Shared memory helpers
@@ -877,7 +944,7 @@ o_pred_lock_acquire(BTreeDescr *desc,
 	samePage = count_tuple_entries_on_page(desc, tbl, desc->oids, oxid,
 										   &pageLokey, &pageHikey);
 
-	if (samePage >= O_PRED_LOCK_PAGE_PROMOTE_THRESHOLD ||
+	if (samePage >= o_pred_lock_get_promote_threshold(desc) ||
 		tbl->numValid >= O_PRED_LOCKS_MAX_ENTRIES)
 	{
 		/* Promote: replace tuple-level entries for this page with one page lock. */
