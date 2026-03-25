@@ -128,9 +128,7 @@ extern void o_pred_lock_shmem_init(Pointer ptr, bool found);
 
 /*
  * Calculate the dynamic promotion threshold for a relation.
- * Returns ~75% of the estimated max tuples per page based on tuple size.
- *
- * desc - B-tree descriptor (must be a relation tree with OIndexDescr arg)
+ * Returns ~75% of the estimated max tuples per page based on O_BTREE_MAX_TUPLE_SIZE.
  */
 extern int o_pred_lock_get_promote_threshold(BTreeDescr *desc);
 
