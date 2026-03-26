@@ -320,7 +320,7 @@ lexicographic_key_gap(OPredLockKey *left, OPredLockKey *right)
 		if (left->data[i] != right->data[i])
 		{
 			int			diff = (unsigned char) right->data[i] -
-			(unsigned char) left->data[i];
+								(unsigned char) left->data[i];
 
 			/* left < right should imply diff > 0, but guard against zero. */
 			if (diff <= 0)
@@ -329,7 +329,7 @@ lexicographic_key_gap(OPredLockKey *left, OPredLockKey *right)
 		}
 	}
 
-	/* Prefix case: treat as minimal positive gap. */
+	/* Prefix case: all compared bytes match but lengths differ; minimal gap. */
 	return 1;
 }
 
