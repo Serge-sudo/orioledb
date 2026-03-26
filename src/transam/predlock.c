@@ -1336,12 +1336,13 @@ predlock_snapshot_locks(void)
 			if (!COMMITSEQNO_IS_INPROGRESS(csn))
 				continue;
 
+			Assert(backend_index >= 0 && backend_index < max_procs);
 			proc = GetPGProcByNumber(backend_index);
 
 			copy = (OPredLockSnapshotEntry *) palloc(sizeof(OPredLockSnapshotEntry));
 			copy->oids = e->oids;
 			copy->oxid = e->oxid;
-			copy->pid = proc ? proc->pid : 0;
+			copy->pid = (proc && proc->pid > 0) ? proc->pid : InvalidPid;
 			copy->level = e->level;
 			copy->key = e->key;
 			copy->lokey = e->loKey;
@@ -1391,7 +1392,7 @@ predlock_emit_entry(OPredLockSnapshotEntry *e, TupleDesc tupdesc,
 	values[0] = ObjectIdGetDatum(e->oids.datoid);
 	values[1] = ObjectIdGetDatum(e->oids.reloid);
 	values[2] = ObjectIdGetDatum(e->oids.relnode);
-	if (e->pid != 0)
+	if (e->pid != InvalidPid)
 		values[3] = Int32GetDatum(e->pid);
 	else
 		nulls[3] = true;
