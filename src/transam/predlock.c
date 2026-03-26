@@ -330,9 +330,7 @@ lexicographic_key_gap(OPredLockKey *left, OPredLockKey *right)
 	}
 
 	/* Prefix case: treat as minimal positive gap. */
-	distance = 1;
-
-	return distance;
+	return 1;
 }
 
 /*
