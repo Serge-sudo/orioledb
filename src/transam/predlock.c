@@ -306,31 +306,31 @@ predlock_entry_bounds(OPredLockEntry *e, OPredLockKey **lo, OPredLockKey **hi)
 static int
 lexicographic_key_gap(OPredLockKey *left, OPredLockKey *right)
 {
-	int			cmp;
 	int			distance;
 	size_t		minlen;
+	size_t		i;
 
 	if (!left->notNull || !right->notNull)
 		return INT_MAX;
 
 	minlen = Min(left->len, right->len);
-	cmp = memcmp(left->data, right->data, minlen);
 
-	if (cmp == 0)
+	for (i = 0; i < minlen; i++)
 	{
-		if (left->len == right->len)
-			return 0;
+		if (left->data[i] != right->data[i])
+		{
+			int			diff = (unsigned char) right->data[i] -
+			(unsigned char) left->data[i];
 
-		/* Use first extra byte if available, otherwise treat as minimal gap. */
-		if (right->len > minlen)
-			distance = (unsigned char) right->data[minlen];
-		else
-			distance = 1;
+			/* left < right should imply diff > 0, but guard against zero. */
+			if (diff <= 0)
+				return 1;
+			return diff;
+		}
 	}
-	else
-	{
-		distance = Abs(cmp);
-	}
+
+	/* Prefix case: treat as minimal positive gap. */
+	distance = 1;
 
 	return distance;
 }
