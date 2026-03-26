@@ -29,6 +29,7 @@
 #include "funcapi.h"
 #include "tableam/handler.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/jsonb.h"
@@ -36,7 +37,7 @@
 /* Global pointer to the per-backend predicate lock tables in shared memory. */
 OPredLocksData *o_pred_locks = NULL;
 
-#define PREDLOCK_OUTPUT_COLS 11
+#define PREDLOCK_OUTPUT_COLS 12
 #define PREDLOCK_LEVEL_COUNT lengthof(predlock_level_names)
 
 PG_FUNCTION_INFO_V1(orioledb_predicate_locks);
@@ -1250,6 +1251,7 @@ typedef struct OPredLockSnapshotEntry
 {
 	ORelOids	oids;
 	OXid		oxid;
+	pid_t		pid;
 	OPredLockLevel level;
 	OPredLockKey key;
 	OPredLockKey lokey;
@@ -1325,6 +1327,7 @@ predlock_snapshot_locks(void)
 			OPredLockEntry *e = &tbl->entries[entry_index];
 			CommitSeqNo csn;
 			OPredLockSnapshotEntry *copy;
+			PGPROC	   *proc;
 
 			if (!e->valid)
 				continue;
@@ -1333,9 +1336,12 @@ predlock_snapshot_locks(void)
 			if (!COMMITSEQNO_IS_INPROGRESS(csn))
 				continue;
 
+			proc = GetPGProcByNumber(backend_index);
+
 			copy = (OPredLockSnapshotEntry *) palloc(sizeof(OPredLockSnapshotEntry));
 			copy->oids = e->oids;
 			copy->oxid = e->oxid;
+			copy->pid = proc ? proc->pid : 0;
 			copy->level = e->level;
 			copy->key = e->key;
 			copy->lokey = e->loKey;
@@ -1385,38 +1391,42 @@ predlock_emit_entry(OPredLockSnapshotEntry *e, TupleDesc tupdesc,
 	values[0] = ObjectIdGetDatum(e->oids.datoid);
 	values[1] = ObjectIdGetDatum(e->oids.reloid);
 	values[2] = ObjectIdGetDatum(e->oids.relnode);
-	values[3] = Int64GetDatum((int64) e->oxid);
-	values[4] = CStringGetTextDatum(level);
+	if (e->pid != 0)
+		values[3] = Int32GetDatum(e->pid);
+	else
+		nulls[3] = true;
+	values[4] = Int64GetDatum((int64) e->oxid);
+	values[5] = CStringGetTextDatum(level);
 
 	if (keyJson)
-		values[5] = PointerGetDatum(keyJson);
-	else
-		nulls[5] = true;
-
-	if (lokeyJson)
-		values[6] = PointerGetDatum(lokeyJson);
+		values[6] = PointerGetDatum(keyJson);
 	else
 		nulls[6] = true;
 
-	if (keyRaw)
-		values[7] = PointerGetDatum(keyRaw);
+	if (lokeyJson)
+		values[7] = PointerGetDatum(lokeyJson);
 	else
 		nulls[7] = true;
 
-	if (e->key.notNull)
-		values[8] = Int16GetDatum(e->key.formatFlags);
+	if (keyRaw)
+		values[8] = PointerGetDatum(keyRaw);
 	else
 		nulls[8] = true;
 
-	if (loKeyRaw)
-		values[9] = PointerGetDatum(loKeyRaw);
+	if (e->key.notNull)
+		values[9] = Int16GetDatum(e->key.formatFlags);
 	else
 		nulls[9] = true;
 
-	if (e->lokey.notNull)
-		values[10] = Int16GetDatum(e->lokey.formatFlags);
+	if (loKeyRaw)
+		values[10] = PointerGetDatum(loKeyRaw);
 	else
 		nulls[10] = true;
+
+	if (e->lokey.notNull)
+		values[11] = Int16GetDatum(e->lokey.formatFlags);
+	else
+		nulls[11] = true;
 
 	tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 }
@@ -1454,14 +1464,15 @@ orioledb_predicate_locks(PG_FUNCTION_ARGS)
 	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "datoid", OIDOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "reloid", OIDOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "relnode", OIDOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 4, "oxid", INT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 5, "lock_level", TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 6, "key", JSONBOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 7, "lokey", JSONBOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 8, "key_raw", BYTEAOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 9, "key_format_flags", INT2OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 10, "lokey_raw", BYTEAOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 11, "lokey_format_flags", INT2OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 4, "pid", INT4OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 5, "oxid", INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 6, "lock_level", TEXTOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 7, "key", JSONBOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 8, "lokey", JSONBOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 9, "key_raw", BYTEAOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 10, "key_format_flags", INT2OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 11, "lokey_raw", BYTEAOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 12, "lokey_format_flags", INT2OID, -1, 0);
 
 	randomAccess = (rsinfo->allowedModes & SFRM_Materialize_Random) != 0;
 
