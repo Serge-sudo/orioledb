@@ -298,13 +298,13 @@ predlock_entry_bounds(OPredLockEntry *e, OPredLockKey **lo, OPredLockKey **hi)
 }
 
 /*
- * Return a small positive gap between two raw keys using binary comparison.
+ * Return a small positive gap between two raw keys using lexicographic bytes.
  *
  * Assumes left < right lexicographically.  Uses the first differing byte (or
  * length difference) as a heuristic distance; capped to INT_MAX.
  */
 static int
-binary_key_gap(OPredLockKey *left, OPredLockKey *right)
+lexicographic_key_gap(OPredLockKey *left, OPredLockKey *right)
 {
 	int			cmp;
 	int			distance;
@@ -332,7 +332,7 @@ binary_key_gap(OPredLockKey *left, OPredLockKey *right)
 		distance = Abs(cmp);
 	}
 
-	return distance > INT_MAX ? INT_MAX : distance;
+	return distance;
 }
 
 /*
@@ -417,9 +417,9 @@ get_distance_between(BTreeDescr *desc, OPredLockEntry *a, OPredLockEntry *b)
 			return 0;
 
 		if (cmp_a_hi_b_lo < 0)
-			return binary_key_gap(aHi, bLo);
+			return lexicographic_key_gap(aHi, bLo);
 		else
-			return binary_key_gap(bHi, aLo);
+			return lexicographic_key_gap(bHi, aLo);
 	}
 
 	return 1;
