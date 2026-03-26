@@ -231,6 +231,128 @@ predlock_cmp_stored_keys(BTreeDescr *desc,
 }
 
 static bool
+predlock_key_to_int64(OPredLockKey *key, int64 *out)
+{
+	if (!key->notNull)
+		return false;
+
+	switch (key->len)
+	{
+		case sizeof(int16):
+			{
+				int16		v;
+
+				memcpy(&v, key->data, sizeof(int16));
+				*out = (int64) v;
+				return true;
+			}
+		case sizeof(int32):
+			{
+				int32		v;
+
+				memcpy(&v, key->data, sizeof(int32));
+				*out = (int64) v;
+				return true;
+			}
+		case sizeof(int64):
+			{
+				int64		v;
+
+				memcpy(&v, key->data, sizeof(int64));
+				*out = v;
+				return true;
+			}
+		default:
+			return false;
+	}
+}
+
+static void
+predlock_entry_bounds(OPredLockEntry *e, OPredLockKey **lo, OPredLockKey **hi)
+{
+	if (e->level == OPredLockLevelPage)
+	{
+		*lo = &e->loKey;
+		*hi = &e->key;
+	}
+	else
+	{
+		/* Tuple-level and other granularities use the single key as both ends. */
+		*lo = &e->key;
+		*hi = &e->key;
+	}
+}
+
+/*
+ * Calculate a distance heuristic between two predicate lock entries belonging
+ * to the same transaction and tree.
+ *
+ * For integer-like keys (int2/int4/int8) we use the numeric gap between the
+ * ranges.  Overlapping ranges have distance 0.  For other datatypes we fall
+ * back to comparator-based overlap detection and return 0 for overlapping
+ * ranges or 1 as a minimal positive gap estimate.
+ */
+static int
+get_distance_between(BTreeDescr *desc, OPredLockEntry *a, OPredLockEntry *b)
+{
+	OPredLockKey *aLo,
+			   *aHi,
+			   *bLo,
+			   *bHi;
+	int64		aLoVal,
+				aHiVal,
+				bLoVal,
+				bHiVal;
+	bool		aLoNum,
+				aHiNum,
+				bLoNum,
+				bHiNum;
+
+	if (a->oxid != b->oxid)
+		return INT_MAX;
+	if (!ORelOidsIsEqual(a->oids, b->oids))
+		return INT_MAX;
+	if (a->level == OPredLockLevelTree || b->level == OPredLockLevelTree)
+		return INT_MAX;
+
+	predlock_entry_bounds(a, &aLo, &aHi);
+	predlock_entry_bounds(b, &bLo, &bHi);
+
+	aLoNum = predlock_key_to_int64(aLo, &aLoVal);
+	aHiNum = predlock_key_to_int64(aHi, &aHiVal);
+	bLoNum = predlock_key_to_int64(bLo, &bLoVal);
+	bHiNum = predlock_key_to_int64(bHi, &bHiVal);
+
+	if (aLoNum && aHiNum && bLoNum && bHiNum)
+	{
+		int64		gap;
+
+		/* Normalize ordering to compute the gap. */
+		if (aHiVal >= bLoVal && bHiVal >= aLoVal)
+			gap = 0;			/* overlap */
+		else if (aHiVal < bLoVal)
+			gap = bLoVal - aHiVal;
+		else
+			gap = aLoVal - bHiVal;
+
+		if (gap > (int64) INT_MAX)
+			return INT_MAX;
+		return (int) gap;
+	}
+
+	/*
+	 * Fallback heuristic using key ordering only.  If ranges overlap or touch,
+	 * distance is zero; otherwise use 1 as a minimal positive gap so the
+	 * caller can still prefer closer ranges.
+	 */
+	if (predlock_cmp_stored_keys(desc, aHi, true, bLo, false) >= 0 &&
+		predlock_cmp_stored_keys(desc, bHi, true, aLo, false) >= 0)
+		return 0;
+
+	return 1;
+}
+
+static bool
 page_range_contains(BTreeDescr *desc,
 					OPredLockKey *outerLo, OPredLockKey *outerHi,
 					OPredLockKey *innerLo, OPredLockKey *innerHi)
@@ -401,12 +523,7 @@ merge_closest_page_intervals(BTreeDescr *desc, OPredLocksData *tbl,
 		OPredLockEntry *right = &tbl->entries[idx[i + 1]];
 		int			gapScore;
 
-		if (page_ranges_overlap_or_touch(desc,
-										 &left->loKey, &left->key,
-										 &right->loKey, &right->key))
-			gapScore = 0;
-		else
-			gapScore = 1;
+		gapScore = get_distance_between(desc, left, right);
 
 		if (gapScore < bestGap)
 		{
