@@ -337,7 +337,7 @@ lexicographic_key_gap(OPredLockKey *left, OPredLockKey *right)
 	}
 
 	/* Should not happen, but keep a minimal fallback. */
-	Assert(false);
+	Assert(false && "lexicographic_key_gap: equal keys should not reach here");
 	return 1;
 }
 
