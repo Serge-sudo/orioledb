@@ -1327,7 +1327,7 @@ predlock_snapshot_locks(void)
 			OPredLockEntry *e = &tbl->entries[entry_index];
 			CommitSeqNo csn;
 			OPredLockSnapshotEntry *copy;
-			PGPROC	   *proc;
+			PGPROC	   *backendProc;
 
 			if (!e->valid)
 				continue;
@@ -1337,12 +1337,12 @@ predlock_snapshot_locks(void)
 				continue;
 
 			Assert(backend_index >= 0 && backend_index < MaxBackends);
-			proc = GetPGProcByNumber(backend_index);
+			backendProc = GetPGProcByNumber(backend_index);
 
 			copy = (OPredLockSnapshotEntry *) palloc(sizeof(OPredLockSnapshotEntry));
 			copy->oids = e->oids;
 			copy->oxid = e->oxid;
-			copy->pid = (proc && proc->pid > 0) ? proc->pid : InvalidPid;
+			copy->pid = (backendProc->pid != InvalidPid) ? backendProc->pid : InvalidPid;
 			copy->level = e->level;
 			copy->key = e->key;
 			copy->lokey = e->loKey;
