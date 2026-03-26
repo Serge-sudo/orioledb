@@ -330,9 +330,14 @@ lexicographic_key_gap(OPredLockKey *left, OPredLockKey *right)
 
 	/* Prefix case: all compared bytes match but lengths differ; gap by length. */
 	if (right->len > left->len)
-		return right->len - left->len;
+	{
+		size_t		len_gap = right->len - left->len;
+
+		return len_gap > INT_MAX ? INT_MAX : (int) len_gap;
+	}
 
 	/* Should not happen, but keep a minimal fallback. */
+	Assert(false);
 	return 1;
 }
 
