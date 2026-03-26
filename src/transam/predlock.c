@@ -301,7 +301,8 @@ predlock_entry_bounds(OPredLockEntry *e, OPredLockKey **lo, OPredLockKey **hi)
  * Return a small positive gap between two raw keys using lexicographic bytes.
  *
  * Assumes left < right lexicographically.  Uses the first differing byte (or
- * length difference) as a heuristic distance; capped to INT_MAX.
+ * length difference) as a heuristic distance; capped to INT_MAX.  Returns 0
+ * when keys are identical and INT_MAX when either key is NULL/unknown.
  */
 static int
 lexicographic_key_gap(OPredLockKey *left, OPredLockKey *right)
