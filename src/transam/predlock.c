@@ -298,6 +298,44 @@ predlock_entry_bounds(OPredLockEntry *e, OPredLockKey **lo, OPredLockKey **hi)
 }
 
 /*
+ * Return a small positive gap between two raw keys using binary comparison.
+ *
+ * Assumes left < right lexicographically.  Uses the first differing byte (or
+ * length difference) as a heuristic distance; capped to INT_MAX.
+ */
+static int
+binary_key_gap(OPredLockKey *left, OPredLockKey *right)
+{
+	int			cmp;
+	int			distance;
+	size_t		minlen;
+
+	if (!left->notNull || !right->notNull)
+		return INT_MAX;
+
+	minlen = Min(left->len, right->len);
+	cmp = memcmp(left->data, right->data, minlen);
+
+	if (cmp == 0)
+	{
+		if (left->len == right->len)
+			return 0;
+
+		/* Use first extra byte if available, otherwise treat as minimal gap. */
+		if (right->len > minlen)
+			distance = (unsigned char) right->data[minlen];
+		else
+			distance = 1;
+	}
+	else
+	{
+		distance = Abs(cmp);
+	}
+
+	return distance > INT_MAX ? INT_MAX : distance;
+}
+
+/*
  * Calculate a distance heuristic between two predicate lock entries belonging
  * to the same transaction and tree.
  *
@@ -377,6 +415,11 @@ get_distance_between(BTreeDescr *desc, OPredLockEntry *a, OPredLockEntry *b)
 			return 0;
 		if (cmp_a_hi_b_lo == 0 || cmp_b_hi_a_lo == 0)
 			return 0;
+
+		if (cmp_a_hi_b_lo < 0)
+			return binary_key_gap(aHi, bLo);
+		else
+			return binary_key_gap(bHi, aLo);
 	}
 
 	return 1;
