@@ -351,7 +351,7 @@ get_distance_between(BTreeDescr *desc, OPredLockEntry *a, OPredLockEntry *b)
 		if (aHiVal > bLoVal && bHiVal > aLoVal)
 			gap = 0;			/* overlap */
 		else if (aHiVal == bLoVal || bHiVal == aLoVal)
-			gap = 1;			/* adjacent (touching but non-overlapping) */
+			gap = 0;			/* adjacent (touching but non-overlapping) */
 		else if (aHiVal < bLoVal)
 			gap = bLoVal - aHiVal;
 		else
@@ -374,7 +374,7 @@ get_distance_between(BTreeDescr *desc, OPredLockEntry *a, OPredLockEntry *b)
 		if (cmp_a_hi_b_lo > 0 && cmp_b_hi_a_lo > 0)
 			return 0;
 		if (cmp_a_hi_b_lo == 0 || cmp_b_hi_a_lo == 0)
-			return 1;
+			return 0;
 	}
 
 	return 1;
