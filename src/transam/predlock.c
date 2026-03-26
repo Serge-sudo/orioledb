@@ -230,6 +230,14 @@ predlock_cmp_stored_keys(BTreeDescr *desc,
 	}
 }
 
+/*
+ * Try to interpret a stored predicate lock key as a signed integer value.
+ *
+ * @param key  Stored predicate lock key (must be not-null).
+ * @param out  Set to the decoded int64 value on success.
+ * @return true if the key length matches int16/int32/int64 and was decoded,
+ *         false otherwise.
+ */
 static bool
 predlock_key_to_int64(OPredLockKey *key, int64 *out)
 {
@@ -267,6 +275,12 @@ predlock_key_to_int64(OPredLockKey *key, int64 *out)
 	}
 }
 
+/*
+ * Get the inclusive low and high bounds for a predicate lock entry.
+ *
+ * For page-level locks the range is [loKey, key); for tuple-level entries (or
+ * other granularities) the single key acts as both bounds.
+ */
 static void
 predlock_entry_bounds(OPredLockEntry *e, OPredLockKey **lo, OPredLockKey **hi)
 {
@@ -291,6 +305,12 @@ predlock_entry_bounds(OPredLockEntry *e, OPredLockKey **lo, OPredLockKey **hi)
  * ranges.  Overlapping ranges have distance 0.  For other datatypes we fall
  * back to comparator-based overlap detection and return 0 for overlapping
  * ranges or 1 as a minimal positive gap estimate.
+ *
+ * @param desc  B-tree descriptor for comparisons.
+ * @param a,b   Predicate lock entries to compare (must belong to the same
+ *              tree/transaction to produce a finite result).
+ * @return      INT_MAX if entries are incompatible for merging, otherwise a
+ *              non-negative distance where 0 means overlap/adjacent.
  */
 static int
 get_distance_between(BTreeDescr *desc, OPredLockEntry *a, OPredLockEntry *b)
