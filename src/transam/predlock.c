@@ -351,7 +351,7 @@ get_distance_between(BTreeDescr *desc, OPredLockEntry *a, OPredLockEntry *b)
 		if (aHiVal > bLoVal && bHiVal > aLoVal)
 			gap = 0;			/* overlap */
 		else if (aHiVal == bLoVal || bHiVal == aLoVal)
-			gap = 0;			/* adjacent (touching) */
+			gap = 1;			/* adjacent (touching but non-overlapping) */
 		else if (aHiVal < bLoVal)
 			gap = bLoVal - aHiVal;
 		else
@@ -368,13 +368,13 @@ get_distance_between(BTreeDescr *desc, OPredLockEntry *a, OPredLockEntry *b)
 	 * caller can still prefer closer ranges.
 	 */
 	{
-		int			cmpAhiBlo = predlock_cmp_stored_keys(desc, aHi, true, bLo, false);
-		int			cmpBhiAlo = predlock_cmp_stored_keys(desc, bHi, true, aLo, false);
+		int			cmp_a_hi_b_lo = predlock_cmp_stored_keys(desc, aHi, true, bLo, false);
+		int			cmp_b_hi_a_lo = predlock_cmp_stored_keys(desc, bHi, true, aLo, false);
 
-		if (cmpAhiBlo > 0 && cmpBhiAlo > 0)
+		if (cmp_a_hi_b_lo > 0 && cmp_b_hi_a_lo > 0)
 			return 0;
-		if (cmpAhiBlo == 0 || cmpBhiAlo == 0)
-			return 0;
+		if (cmp_a_hi_b_lo == 0 || cmp_b_hi_a_lo == 0)
+			return 1;
 	}
 
 	return 1;
