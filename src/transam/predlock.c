@@ -1336,7 +1336,7 @@ predlock_snapshot_locks(void)
 			if (!COMMITSEQNO_IS_INPROGRESS(csn))
 				continue;
 
-			Assert(backend_index >= 0 && backend_index < max_procs);
+			Assert(backend_index >= 0 && backend_index < MaxBackends);
 			proc = GetPGProcByNumber(backend_index);
 
 			copy = (OPredLockSnapshotEntry *) palloc(sizeof(OPredLockSnapshotEntry));
