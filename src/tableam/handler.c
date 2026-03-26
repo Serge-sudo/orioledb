@@ -37,6 +37,7 @@
 #include "tuple/slot.h"
 #include "tuple/sort.h"
 #include "utils/compress.h"
+#include "utils/hsearch.h"
 #include "utils/rel.h"
 #include "utils/stopevent.h"
 
@@ -103,7 +104,8 @@ typedef struct OBulkInsertState
 	Oid				relid;			/* hash-table key */
 	OXid			oxid;			/* transaction ID */
 	CommitSeqNo		csn;			/* snapshot CSN */
-	Tuplesortstate *sortstate;		/* primary tuples, sorted by PK */
+	BTreeLocationHint hint;			/* last used leaf */
+	Tuplesortstate *sortstate;		/* unused now, kept for compatibility */
 } OBulkInsertState;
 
 /*
@@ -143,14 +145,37 @@ o_get_or_create_bulk_state(Relation relation, OTableDescr *descr)
 		fill_current_oxid_osnapshot(&state->oxid, &oSnapshot);
 		state->relid = relid;
 		state->csn = oSnapshot.csn;
-		state->sortstate =
-			tuplesort_begin_orioledb_index(primary,
-										   maintenance_work_mem,
-										   false /* randomAccess */ ,
-										   NULL /* coordinate */ );
+		state->hint.blkno = OInvalidInMemoryBlkno;
+		state->hint.pageChangeCount = InvalidOPageChangeCount;
+		state->sortstate = NULL;
 	}
 
 	return state;
+}
+
+static OBulkInsertState *
+o_lookup_bulk_state(Relation relation)
+{
+	bool		found;
+	Oid			relid = RelationGetRelid(relation);
+
+	if (o_bulk_insert_states == NULL)
+		return NULL;
+
+	return (OBulkInsertState *) hash_search(o_bulk_insert_states, &relid,
+											HASH_FIND, &found);
+}
+
+static void
+o_remove_bulk_state(Relation relation)
+{
+	Oid			relid = RelationGetRelid(relation);
+	bool		found;
+
+	if (o_bulk_insert_states == NULL)
+		return;
+
+	hash_search(o_bulk_insert_states, &relid, HASH_REMOVE, &found);
 }
 
 /*
@@ -870,7 +895,17 @@ orioledb_tuple_lock(Relation rel, Datum tupleid, Snapshot snapshot,
 static void
 orioledb_finish_bulk_insert(Relation relation, int options)
 {
-	/* Do nothing here */
+	OBulkInsertState *state;
+
+	state = o_lookup_bulk_state(relation);
+	if (state == NULL)
+		return;
+
+	/* Primary and secondary inserts are already done; just drop state. */
+	if (state->sortstate)
+		tuplesort_end(state->sortstate);
+	state->sortstate = NULL;
+	o_remove_bulk_state(relation);
 }
 
 
@@ -1926,8 +1961,90 @@ orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 {
 	int			i;
 
-	for (i = 0; i < ntuples; i++)
-		orioledb_tuple_insert(relation, slots[i], cid, options, bistate);
+	/* Non-bulk path: keep existing behavior. */
+	if (bistate == NULL)
+	{
+		for (i = 0; i < ntuples; i++)
+			orioledb_tuple_insert(relation, slots[i], cid, options, bistate);
+		return;
+	}
+
+	/* Bulk path: accumulate sorted primary tuples. */
+	{
+		OTableDescr *descr = relation_get_descr(relation);
+		OBulkInsertState *state = o_get_or_create_bulk_state(relation, descr);
+		OIndexDescr *primary = GET_PRIMARY(descr);
+		int			ix;
+
+		o_set_current_command(cid);
+
+		for (i = 0; i < ntuples; i++)
+		{
+			TupleTableSlot *slot = slots[i];
+			OTableSlot *oslot;
+			OTuple		tup;
+
+			if (slot->tts_ops != descr->newTuple->tts_ops ||
+				(((OTableSlot *) slot)->descr != NULL &&
+				 ((OTableSlot *) slot)->descr != descr))
+			{
+				((OTableSlot *) descr->newTuple)->descr = descr;
+				ExecCopySlot(descr->newTuple, slot);
+				slot = descr->newTuple;
+			}
+
+			oslot = (OTableSlot *) slot;
+
+			if (primary->primaryIsCtid)
+			{
+				ItemPointerData iptr;
+
+				o_btree_load_shmem(&primary->desc);
+				iptr = btree_ctid_get_and_inc(&primary->desc);
+				tts_orioledb_set_ctid(slot, &iptr);
+			}
+
+			if (descr->bridge)
+				o_apply_new_bridge_index_ctid(descr, relation, slot, state->csn, true);
+
+			tts_orioledb_toast(slot, descr);
+
+			tup = tts_orioledb_form_tuple(slot, descr);
+			o_btree_check_size_of_tuple(o_tuple_size(tup, &primary->leafSpec),
+										RelationGetRelationName(relation),
+										false);
+
+			/* Insert primary immediately using location hint for bulk speed. */
+			o_tbl_bulk_insert_primary(relation, descr, tup,
+									  state->oxid, state->csn, &state->hint);
+
+			/* Insert secondary indexes. */
+			for (ix = 1; ix < descr->nIndices; ix++)
+			{
+				BTreeModifyCallbackInfo callbackInfo = {
+					.waitCallback = NULL,
+					.modifyDeletedCallback = o_insert_callback,
+					.modifyCallback = NULL,
+					.needsUndoForSelfCreated = true,
+					.arg = slot
+				};
+
+				o_tbl_index_insert(descr, descr->indices[ix], NULL, slot,
+								   state->oxid, state->csn, &callbackInfo,
+								   UNIQUE_CHECK_YES);
+			}
+
+			o_toast_insert_values(relation, descr, slot, state->oxid, state->csn);
+
+			if (tup.data)
+				pfree(tup.data);
+			if (oslot->tuple.data)
+			{
+				pfree(oslot->tuple.data);
+				oslot->tuple.data = NULL;
+			}
+		}
+	}
 }
 
 static void
