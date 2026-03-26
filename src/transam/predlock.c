@@ -1342,7 +1342,7 @@ predlock_snapshot_locks(void)
 			copy = (OPredLockSnapshotEntry *) palloc(sizeof(OPredLockSnapshotEntry));
 			copy->oids = e->oids;
 			copy->oxid = e->oxid;
-			copy->pid = (backendProc->pid != InvalidPid) ? backendProc->pid : InvalidPid;
+			copy->pid = backendProc->pid;
 			copy->level = e->level;
 			copy->key = e->key;
 			copy->lokey = e->loKey;
