@@ -1048,14 +1048,42 @@ o_btree_normal_modify(BTreeDescr *desc, BTreeOperationType action,
 		}
 		ppool_release_reserved(desc->ppool, PPOOL_RESERVE_INSERT);
 		Assert(!have_locked_pages());
+
+		/*
+		 * Fast-path insert: the hint (if any) still points to a valid leaf
+		 * page for the next sequential insert, so we leave it unchanged.
+		 */
 		return OBTreeModifyResultInserted;
 	}
 	Assert(findResult == OFindPageResultSuccess);
 
-	return o_btree_modify_internal(&pageFindContext, action, tuple, tupleType,
-								   key, keyType, opOxid, opCsn,
-								   lockMode, deleted, pageReserveKind,
-								   callbackInfo);
+	{
+		OBTreeModifyResult result;
+
+		result = o_btree_modify_internal(&pageFindContext, action, tuple,
+										 tupleType, key, keyType, opOxid,
+										 opCsn, lockMode, deleted,
+										 pageReserveKind, callbackInfo);
+
+		/*
+		 * Update the caller's hint so that the next operation on a
+		 * sequentially larger key can start from this leaf page instead of
+		 * traversing from the root.  Reading the page's change count without
+		 * holding the lock is intentional: a stale value just causes
+		 * refind_page() to fall back to a root traversal, which is correct.
+		 */
+		if (hint &&
+			OInMemoryBlknoIsValid(pageFindContext.items[pageFindContext.index].blkno))
+		{
+			OInMemoryBlkno leafBlkno =
+				pageFindContext.items[pageFindContext.index].blkno;
+
+			hint->blkno = leafBlkno;
+			hint->pageChangeCount = O_GET_IN_MEMORY_PAGE_CHANGE_COUNT(leafBlkno);
+		}
+
+		return result;
+	}
 }
 
 #include "tableam/descr.h"

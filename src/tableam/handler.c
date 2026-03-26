@@ -35,6 +35,7 @@
 #include "tableam/vacuum.h"
 #include "transam/oxid.h"
 #include "tuple/slot.h"
+#include "tuple/sort.h"
 #include "utils/compress.h"
 #include "utils/rel.h"
 #include "utils/stopevent.h"
@@ -84,6 +85,73 @@ typedef struct OScanDescData
 	ItemPointerData iptr;
 } OScanDescData;
 typedef OScanDescData *OScanDesc;
+
+/* -------------------------------------------------------------------------
+ * Bulk-insert state (used when bistate != NULL, e.g. COPY FROM).
+ *
+ * During multi_insert() we accumulate the pre-formed primary-index leaf
+ * tuples in a Tuplesortstate sorted by primary key.  TOAST chunks and ctids
+ * are written / assigned immediately so the slot is ready for secondary-
+ * index inserts that ExecInsertIndexTuples() performs after multi_insert()
+ * returns.  In finish_bulk_insert() we replay the sorted tuples with a
+ * BTreeLocationHint so that the B-tree traversal starts at the last used
+ * leaf page rather than at the root every time.
+ * -------------------------------------------------------------------------
+ */
+typedef struct OBulkInsertState
+{
+	Oid				relid;			/* hash-table key */
+	OXid			oxid;			/* transaction ID */
+	CommitSeqNo		csn;			/* snapshot CSN */
+	Tuplesortstate *sortstate;		/* primary tuples, sorted by PK */
+} OBulkInsertState;
+
+/*
+ * Per-backend hash table of active bulk-insert states, keyed by relid.
+ * Lives in TopTransactionContext; reset at transaction end.
+ */
+static HTAB *o_bulk_insert_states = NULL;
+
+static OBulkInsertState *
+o_get_or_create_bulk_state(Relation relation, OTableDescr *descr)
+{
+	OBulkInsertState *state;
+	bool		found;
+	Oid			relid = RelationGetRelid(relation);
+
+	if (o_bulk_insert_states == NULL)
+	{
+		HASHCTL		ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.hcxt = TopTransactionContext;
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(OBulkInsertState);
+
+		o_bulk_insert_states = hash_create("OrioleDB bulk insert states",
+										   8, &ctl,
+										   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	state = (OBulkInsertState *) hash_search(o_bulk_insert_states,
+											 &relid, HASH_ENTER, &found);
+	if (!found)
+	{
+		OIndexDescr *primary = GET_PRIMARY(descr);
+		OSnapshot	oSnapshot;
+
+		fill_current_oxid_osnapshot(&state->oxid, &oSnapshot);
+		state->relid = relid;
+		state->csn = oSnapshot.csn;
+		state->sortstate =
+			tuplesort_begin_orioledb_index(primary,
+										   maintenance_work_mem,
+										   false /* randomAccess */ ,
+										   NULL /* coordinate */ );
+	}
+
+	return state;
+}
 
 /*
  * Operation with indices. It does not update TOAST BTree. Implementations

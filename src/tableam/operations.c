@@ -350,6 +350,59 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 	return slot;
 }
 
+/*
+ * Insert a pre-formed primary-index leaf tuple that was accumulated during
+ * a bulk load (COPY).  The tuple's TOAST chunks and ctid (for ctid-primary
+ * tables) must already have been handled by the caller.
+ *
+ * *hint is used as a starting page hint and is updated after the insert so
+ * that the next call can begin its B-tree traversal at the last-used leaf
+ * page rather than at the root.  This provides a significant speedup when
+ * tuples are inserted in primary-key order (which is guaranteed because the
+ * caller sorts them before calling us).
+ */
+void
+o_tbl_bulk_insert_primary(Relation relation,
+						  OTableDescr *descr,
+						  OTuple tup,
+						  OXid oxid, CommitSeqNo csn,
+						  BTreeLocationHint *hint)
+{
+	OIndexDescr *primary = GET_PRIMARY(descr);
+	BTreeDescr *bd = &primary->desc;
+	BTreeModifyCallbackInfo callbackInfo = {
+		.waitCallback = NULL,
+		.modifyDeletedCallback = NULL,
+		.modifyCallback = NULL,
+		.needsUndoForSelfCreated = false,
+		.arg = NULL
+	};
+	OBTreeModifyResult res;
+
+	res = o_btree_modify(bd,
+						 BTreeOperationInsert,
+						 tup, BTreeKeyLeafTuple,
+						 NULL, BTreeKeyNone,
+						 oxid, csn, RowLockUpdate,
+						 hint, &callbackInfo);
+
+	if (res != OBTreeModifyResultInserted)
+	{
+		/*
+		 * Duplicate primary key.  Populate a scratch slot from the tuple so
+		 * that o_report_duplicate() can build a human-readable error message.
+		 */
+		TupleTableSlot *slot = primary->new_leaf_slot;
+
+		tts_orioledb_store_tuple(slot, tup, descr, csn,
+								 PrimaryIndexNumber, false, NULL);
+		o_report_duplicate(relation, primary, slot);
+	}
+
+	if (bd->storageType == BTreeStoragePersistence)
+		o_wal_insert(bd, tup, relation->rd_rel->relreplident, descr->version);
+}
+
 static RowLockMode
 tuple_lock_mode_to_row_lock_mode(LockTupleMode mode)
 {
