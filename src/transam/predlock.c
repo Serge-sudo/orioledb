@@ -302,9 +302,9 @@ predlock_entry_bounds(OPredLockEntry *e, OPredLockKey **lo, OPredLockKey **hi)
  * to the same transaction and tree.
  *
  * For integer-like keys (int2/int4/int8) we use the numeric gap between the
- * ranges.  Overlapping ranges have distance 0.  For other datatypes we fall
- * back to comparator-based overlap detection and return 0 for overlapping
- * ranges or 1 as a minimal positive gap estimate.
+ * ranges.  Overlapping or touching ranges have distance 0 (page ranges are
+ * treated as half-open [lo, hi)).  For other datatypes we fall back to
+ * comparator-based overlap detection with the same semantics.
  *
  * @param desc  B-tree descriptor for comparisons.
  * @param a,b   Predicate lock entries to compare (must belong to the same
@@ -348,10 +348,8 @@ get_distance_between(BTreeDescr *desc, OPredLockEntry *a, OPredLockEntry *b)
 		int64		gap;
 
 		/* Normalize ordering to compute the gap. */
-		if (aHiVal > bLoVal && bHiVal > aLoVal)
-			gap = 0;			/* overlap */
-		else if (aHiVal == bLoVal || bHiVal == aLoVal)
-			gap = 0;			/* adjacent (touching but non-overlapping) */
+		if (aHiVal >= bLoVal && bHiVal >= aLoVal)
+			gap = 0;			/* overlap or touch */
 		else if (aHiVal < bLoVal)
 			gap = bLoVal - aHiVal;
 		else
@@ -371,9 +369,7 @@ get_distance_between(BTreeDescr *desc, OPredLockEntry *a, OPredLockEntry *b)
 		int			cmp_a_hi_b_lo = predlock_cmp_stored_keys(desc, aHi, true, bLo, false);
 		int			cmp_b_hi_a_lo = predlock_cmp_stored_keys(desc, bHi, true, aLo, false);
 
-		if (cmp_a_hi_b_lo > 0 && cmp_b_hi_a_lo > 0)
-			return 0;
-		if (cmp_a_hi_b_lo == 0 || cmp_b_hi_a_lo == 0)
+		if (cmp_a_hi_b_lo >= 0 && cmp_b_hi_a_lo >= 0)
 			return 0;
 	}
 
