@@ -333,7 +333,7 @@ lexicographic_key_gap(OPredLockKey *left, OPredLockKey *right)
 	{
 		size_t		len_diff = right->len - left->len;
 
-		return len_diff > INT_MAX ? INT_MAX : (int) len_diff;
+		return len_diff > (size_t) INT_MAX ? INT_MAX : (int) len_diff;
 	}
 
 	/* Equal-length identical keys: treat as zero additional gap. */
