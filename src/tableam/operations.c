@@ -363,6 +363,9 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 	TupleTableSlot **prepared_slots;
 	int			i;
 	int			reserve_kind;
+	UndoLogType undoType = primary->desc.undoType;
+	bool		undo_reserved = false;
+	bool		page_undo_reserved = false;
 	bool		use_ctid = primary->primaryIsCtid;
 
 	if (ntuples <= 0)
@@ -372,6 +375,23 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 	tuplens = (LocationIndex *) palloc(sizeof(LocationIndex) * ntuples);
 	leaf_headers = (BTreeLeafTuphdr *) palloc(sizeof(BTreeLeafTuphdr) * ntuples);
 	prepared_slots = (TupleTableSlot **) palloc(sizeof(TupleTableSlot *) * ntuples);
+
+	if (undoType != UndoLogNone && !is_recovery_process())
+	{
+		if (GET_PAGE_LEVEL_UNDO_TYPE(undoType) == undoType)
+		{
+			reserve_undo_size(undoType, O_MODIFY_UNDO_RESERVE_SIZE);
+			undo_reserved = true;
+		}
+		else
+		{
+			reserve_undo_size(undoType, 2 * O_UPDATE_MAX_UNDO_SIZE);
+			reserve_undo_size(GET_PAGE_LEVEL_UNDO_TYPE(undoType),
+							  2 * O_MAX_SPLIT_UNDO_IMAGE_SIZE);
+			undo_reserved = true;
+			page_undo_reserved = true;
+		}
+	}
 
 	if (use_ctid)
 		o_btree_load_shmem(&primary->desc);
@@ -446,6 +466,11 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 						 relation->rd_rel->relreplident,
 						 descr->version);
 	}
+
+	if (undo_reserved)
+		release_undo_size(undoType);
+	if (page_undo_reserved)
+		release_undo_size(GET_PAGE_LEVEL_UNDO_TYPE(undoType));
 }
 
 static RowLockMode

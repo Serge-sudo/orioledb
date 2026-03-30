@@ -1627,4 +1627,6 @@ o_btree_insert_tuples_to_leaf_all(BTreeDescr *desc,
 		offset += inserted;
 		remaining -= inserted;
 	}
+
+	ppool_release_reserved(desc->ppool, PPOOL_KIND_GET_MASK(reserve_kind));
 }
