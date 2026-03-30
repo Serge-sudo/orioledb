@@ -1600,10 +1600,10 @@ o_btree_insert_tuples_to_leaf_all(BTreeDescr *desc,
 		o_btree_insert_tuples_to_leaf(&context,
 									   &tuples[offset],
 									   &tuplens[offset],
-								   &leaf_headers[offset],
-								   remaining,
-								   reserve_kind,
-								   &inserted);
+									   &leaf_headers[offset],
+									   remaining,
+									   reserve_kind,
+									   &inserted);
 
 		if (inserted == 0)
 		{
@@ -1627,6 +1627,4 @@ o_btree_insert_tuples_to_leaf_all(BTreeDescr *desc,
 		offset += inserted;
 		remaining -= inserted;
 	}
-
-	ppool_release_reserved(desc->ppool, PPOOL_KIND_GET_MASK(reserve_kind));
 }

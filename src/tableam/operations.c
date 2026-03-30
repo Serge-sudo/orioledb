@@ -357,8 +357,6 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 				   OXid oxid, CommitSeqNo csn)
 {
 	OIndexDescr *primary = GET_PRIMARY(descr);
-	UndoLogType undoType = primary->desc.undoType;
-	UndoLogType pageUndoType = GET_PAGE_LEVEL_UNDO_TYPE(undoType);
 	OTuple	   *tuples;
 	LocationIndex *tuplens;
 	BTreeLeafTuphdr *leaf_headers;
@@ -366,8 +364,6 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 	int			i;
 	int			reserve_kind;
 	bool		use_ctid = primary->primaryIsCtid;
-	bool		undo_reserved = false;
-	bool		page_undo_reserved = false;
 
 	if (ntuples <= 0)
 		return;
@@ -430,47 +426,13 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 	else
 		reserve_kind = PPOOL_RESERVE_INSERT;
 
-	PG_TRY();
-	{
-		if (undoType != UndoLogNone)
-		{
-			if (pageUndoType == undoType)
-			{
-				(void) reserve_undo_size(undoType, O_MODIFY_UNDO_RESERVE_SIZE);
-			}
-			else
-			{
-				(void) reserve_undo_size(undoType, 2 * O_UPDATE_MAX_UNDO_SIZE);
-				(void) reserve_undo_size(pageUndoType, 2 * O_MAX_SPLIT_UNDO_IMAGE_SIZE);
-				page_undo_reserved = true;
-			}
-			undo_reserved = true;
-		}
-
-		o_btree_insert_tuples_to_leaf_all(&primary->desc,
-										  tuples,
-										  tuplens,
-										  leaf_headers,
-										  ntuples,
-										  csn,
-										  reserve_kind);
-	}
-	PG_CATCH();
-	{
-		if (undo_reserved)
-			release_undo_size(undoType);
-		if (page_undo_reserved)
-			release_undo_size(pageUndoType);
-		ppool_release_reserved(primary->desc.ppool,
-							   PPOOL_KIND_GET_MASK(reserve_kind));
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-
-	if (undo_reserved)
-		release_undo_size(undoType);
-	if (page_undo_reserved)
-		release_undo_size(pageUndoType);
+	o_btree_insert_tuples_to_leaf_all(&primary->desc,
+									  tuples,
+									  tuplens,
+									  leaf_headers,
+									  ntuples,
+									  csn,
+									  reserve_kind);
 
 	pgstat_count_heap_insert(relation, ntuples);
 
