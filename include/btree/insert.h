@@ -30,6 +30,10 @@ extern int o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 										  OTuple *tuples, LocationIndex *tuplens,
 										  BTreeLeafTuphdr *leaf_headers, int ntuples,
 										  int reserve_kind, int *inserted_count);
+extern void o_btree_insert_tuples_to_leaf_all(BTreeDescr *desc,
+											   OTuple *tuples, LocationIndex *tuplens,
+											   BTreeLeafTuphdr *leaf_headers, int ntuples,
+											   CommitSeqNo csn, int reserve_kind);
 extern bool o_btree_split_is_incomplete(OInMemoryBlkno left_blkno,
 										uint32 pageChangeCount,
 										bool *relocked);

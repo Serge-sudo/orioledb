@@ -1550,3 +1550,62 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 
 	return inserted;
 }
+
+/*
+ * Insert all tuples to leaf pages, finding new pages as needed.
+ *
+ * This is a convenience wrapper around o_btree_insert_tuples_to_leaf()
+ * that handles the page finding loop automatically. It will keep calling
+ * find_page() and o_btree_insert_tuples_to_leaf() until all tuples are
+ * inserted.
+ *
+ * Parameters:
+ *  - desc: B-tree descriptor
+ *  - tuples: array of tuples to insert
+ *  - tuplens: array of tuple lengths
+ *  - leaf_headers: array of leaf tuple headers
+ *  - ntuples: number of tuples in the arrays
+ *  - csn: commit sequence number
+ *  - reserve_kind: page pool reservation kind
+ *
+ * All tuples will be inserted successfully or the function will error out.
+ */
+void
+o_btree_insert_tuples_to_leaf_all(BTreeDescr *desc,
+								   OTuple *tuples, LocationIndex *tuplens,
+								   BTreeLeafTuphdr *leaf_headers, int ntuples,
+								   CommitSeqNo csn, int reserve_kind)
+{
+	int			remaining = ntuples;
+	int			offset = 0;
+
+	if (ntuples <= 0)
+		return;
+
+	while (remaining > 0)
+	{
+		OBTreeFindPageContext context;
+		int			inserted;
+
+		/* Reserve pages for potential splits */
+		ppool_reserve_pages(desc->ppool, reserve_kind, 2);
+
+		/* Find page for the next tuple */
+		init_page_find_context(&context, desc, csn,
+							   BTREE_PAGE_FIND_MODIFY | BTREE_PAGE_FIND_FIX_LEAF_SPLIT);
+
+		find_page(&context, &tuples[offset], BTreeKeyLeafTuple, 0);
+
+		/* Insert as many tuples as fit on this page */
+		o_btree_insert_tuples_to_leaf(&context,
+									   &tuples[offset],
+									   &tuplens[offset],
+									   &leaf_headers[offset],
+									   remaining,
+									   reserve_kind,
+									   &inserted);
+
+		offset += inserted;
+		remaining -= inserted;
+	}
+}
