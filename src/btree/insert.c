@@ -1605,6 +1605,25 @@ o_btree_insert_tuples_to_leaf_all(BTreeDescr *desc,
 									   reserve_kind,
 									   &inserted);
 
+		if (inserted == 0)
+		{
+			/*
+			 * Fall back to the single-tuple insert path to allow the regular
+			 * insertion logic (including splits and compaction) to make
+			 * progress when the batch insert cannot fit the first tuple.
+			 */
+			find_page(&context, &tuples[offset], BTreeKeyLeafTuple, 0);
+			o_btree_insert_tuple_to_leaf(&context,
+										 tuples[offset],
+										 tuplens[offset],
+										 &leaf_headers[offset],
+										 false,
+										 reserve_kind);
+			offset++;
+			remaining--;
+			continue;
+		}
+
 		offset += inserted;
 		remaining -= inserted;
 	}

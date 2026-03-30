@@ -16,6 +16,7 @@
 #include "orioledb.h"
 
 #include "btree/btree.h"
+#include "btree/insert.h"
 #include "btree/iterator.h"
 #include "btree/modify.h"
 #include "btree/undo.h"
@@ -348,6 +349,103 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 		o_wal_insert(&primary->desc, tup, relation->rd_rel->relreplident, descr->version);
 
 	return slot;
+}
+
+void
+o_tbl_multi_insert(OTableDescr *descr, Relation relation,
+				   TupleTableSlot **slots, int ntuples,
+				   OXid oxid, CommitSeqNo csn)
+{
+	OIndexDescr *primary = GET_PRIMARY(descr);
+	OTuple	   *tuples;
+	LocationIndex *tuplens;
+	BTreeLeafTuphdr *leaf_headers;
+	TupleTableSlot **prepared_slots;
+	int			i;
+	int			reserve_kind;
+	bool		use_ctid = primary->primaryIsCtid;
+
+	if (ntuples <= 0)
+		return;
+
+	tuples = (OTuple *) palloc(sizeof(OTuple) * ntuples);
+	tuplens = (LocationIndex *) palloc(sizeof(LocationIndex) * ntuples);
+	leaf_headers = (BTreeLeafTuphdr *) palloc(sizeof(BTreeLeafTuphdr) * ntuples);
+	prepared_slots = (TupleTableSlot **) palloc(sizeof(TupleTableSlot *) * ntuples);
+
+	if (use_ctid)
+		o_btree_load_shmem(&primary->desc);
+
+	for (i = 0; i < ntuples; i++)
+	{
+		TupleTableSlot *slot = slots[i];
+
+		if (slot->tts_ops != descr->newTuple->tts_ops ||
+			(((OTableSlot *) slot)->descr != NULL &&
+			 ((OTableSlot *) slot)->descr != descr))
+		{
+			((OTableSlot *) descr->newTuple)->descr = descr;
+			ExecCopySlot(descr->newTuple, slot);
+			slot = descr->newTuple;
+		}
+
+		prepared_slots[i] = slot;
+
+		if (use_ctid)
+		{
+			ItemPointerData iptr;
+
+			iptr = btree_ctid_get_and_inc(&primary->desc);
+			tts_orioledb_set_ctid(slot, &iptr);
+		}
+
+		if (descr->bridge)
+			o_apply_new_bridge_index_ctid(descr, relation, slot, csn, true);
+
+		tts_orioledb_toast(slot, descr);
+
+		tuples[i] = tts_orioledb_form_tuple(slot, descr);
+		o_btree_check_size_of_tuple(o_tuple_size(tuples[i], &primary->leafSpec),
+									RelationGetRelationName(relation),
+									false);
+		tuplens[i] = o_btree_len(&primary->desc, tuples[i], OTupleLength);
+
+		leaf_headers[i].deleted = BTreeLeafTupleNonDeleted;
+		leaf_headers[i].formatFlags = 0;
+		leaf_headers[i].chainHasLocks = false;
+		leaf_headers[i].undoLocation = InvalidUndoLocation;
+		if (primary->desc.undoType != UndoLogNone && !is_recovery_process())
+			leaf_headers[i].undoLocation |= current_command_get_undo_location();
+		leaf_headers[i].xactInfo = OXID_GET_XACT_INFO(oxid,
+													  RowLockUpdate,
+													  false);
+	}
+
+	if (OIDS_EQ_SYS_TREE(primary->desc.oids, SYS_TREES_SHARED_ROOT_INFO))
+		reserve_kind = PPOOL_RESERVE_SHARED_INFO_INSERT;
+	else
+		reserve_kind = PPOOL_RESERVE_INSERT;
+
+	o_btree_insert_tuples_to_leaf_all(&primary->desc,
+									  tuples,
+									  tuplens,
+									  leaf_headers,
+									  ntuples,
+									  csn,
+									  reserve_kind);
+
+	pgstat_count_heap_insert(relation, ntuples);
+
+	for (i = 0; i < ntuples; i++)
+	{
+		o_toast_insert_values(relation, descr, prepared_slots[i], oxid, csn);
+
+		if (primary->desc.storageType == BTreeStoragePersistence)
+			o_wal_insert(&primary->desc,
+						 tuples[i],
+						 relation->rd_rel->relreplident,
+						 descr->version);
+	}
 }
 
 static RowLockMode
