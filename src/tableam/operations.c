@@ -376,6 +376,27 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 	if (use_ctid)
 		o_btree_load_shmem(&primary->desc);
 
+	/*
+	 * Reserve undo space before calling current_command_get_undo_location()
+	 * in the loop below. current_command_get_undo_location() internally
+	 * calls get_undo_record() which requires undo space to be reserved.
+	 */
+	if (primary->desc.undoType != UndoLogNone && !is_recovery_process())
+	{
+		UndoLogType undoType = primary->desc.undoType;
+		UndoLogType pageUndoType = GET_PAGE_LEVEL_UNDO_TYPE(undoType);
+
+		if (pageUndoType == undoType)
+		{
+			(void) reserve_undo_size(undoType, O_MODIFY_UNDO_RESERVE_SIZE);
+		}
+		else
+		{
+			(void) reserve_undo_size(undoType, 2 * O_UPDATE_MAX_UNDO_SIZE);
+			(void) reserve_undo_size(pageUndoType, 2 * O_MAX_SPLIT_UNDO_IMAGE_SIZE);
+		}
+	}
+
 	for (i = 0; i < ntuples; i++)
 	{
 		TupleTableSlot *slot = slots[i];
@@ -426,13 +447,62 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 	else
 		reserve_kind = PPOOL_RESERVE_INSERT;
 
-	o_btree_insert_tuples_to_leaf_all(&primary->desc,
-									  tuples,
-									  tuplens,
-									  leaf_headers,
-									  ntuples,
-									  csn,
-									  reserve_kind);
+	/*
+	 * Reserve undo space before calling o_btree_insert_tuples_to_leaf_all.
+	 * current_command_get_undo_location() was already called during leaf
+	 * header initialization above, but the batch insert may need additional
+	 * undo for page splits and modifications.
+	 */
+	if (primary->desc.undoType != UndoLogNone)
+	{
+		UndoLogType undoType = primary->desc.undoType;
+		UndoLogType pageUndoType = GET_PAGE_LEVEL_UNDO_TYPE(undoType);
+
+		if (pageUndoType == undoType)
+		{
+			(void) reserve_undo_size(undoType, O_MODIFY_UNDO_RESERVE_SIZE);
+		}
+		else
+		{
+			(void) reserve_undo_size(undoType, 2 * O_UPDATE_MAX_UNDO_SIZE);
+			(void) reserve_undo_size(pageUndoType, 2 * O_MAX_SPLIT_UNDO_IMAGE_SIZE);
+		}
+	}
+
+	PG_TRY();
+	{
+		o_btree_insert_tuples_to_leaf_all(&primary->desc,
+										  tuples,
+										  tuplens,
+										  leaf_headers,
+										  ntuples,
+										  csn,
+										  reserve_kind);
+	}
+	PG_CATCH();
+	{
+		if (primary->desc.undoType != UndoLogNone)
+		{
+			UndoLogType undoType = primary->desc.undoType;
+			UndoLogType pageUndoType = GET_PAGE_LEVEL_UNDO_TYPE(undoType);
+
+			release_undo_size(undoType);
+			if (pageUndoType != undoType)
+				release_undo_size(pageUndoType);
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (primary->desc.undoType != UndoLogNone)
+	{
+		UndoLogType undoType = primary->desc.undoType;
+		UndoLogType pageUndoType = GET_PAGE_LEVEL_UNDO_TYPE(undoType);
+
+		release_undo_size(undoType);
+		if (pageUndoType != undoType)
+			release_undo_size(pageUndoType);
+	}
 
 	pgstat_count_heap_insert(relation, ntuples);
 
