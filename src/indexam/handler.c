@@ -639,9 +639,9 @@ orioledb_aminsert(Relation rel, Datum *values, bool *isnull,
 
 	fill_current_oxid_osnapshot(&oxid, &o_snapshot);
 
-	iresult = o_tbl_index_insert(descr, descr->indices[ix_num], &tuple, slot,
+iresult = o_tbl_index_insert(descr, descr->indices[ix_num], &tuple, slot,
 								 oxid, o_snapshot.csn, &callbackInfo,
-								 checkUnique);
+								 checkUnique, NULL);
 
 	if (checkUnique != UNIQUE_CHECK_EXISTING)
 		success = (iresult == OBTreeModifyResultInserted);

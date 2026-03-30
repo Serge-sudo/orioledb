@@ -48,6 +48,38 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
+
+typedef struct
+{
+	TupleTableSlot *slot;
+	BTreeLocationHint *hint;
+} OMultiInsertHintArg;
+
+static OBTreeModifyCallbackAction
+o_multi_insert_callback(BTreeDescr *descr, OTuple tup, OTuple *newtup,
+						OXid oxid, OTupleXactInfo xactInfo,
+						BTreeLeafTupleDeletedStatus deleted,
+						UndoLocation location, RowLockMode *lock_mode,
+						BTreeLocationHint *hint, void *arg)
+{
+	OMultiInsertHintArg *cbarg = (OMultiInsertHintArg *) arg;
+
+	if (descr->type == oIndexPrimary &&
+		XACT_INFO_OXID_IS_CURRENT(xactInfo))
+	{
+		OIndexDescr *id = (OIndexDescr *) descr->arg;
+
+		o_tuple_set_version(&id->leafSpec, newtup,
+							o_tuple_get_version(tup) + 1);
+		if (cbarg->slot)
+			((OTableSlot *) cbarg->slot)->tuple = *newtup;
+	}
+
+	if (cbarg->hint && hint)
+		*cbarg->hint = *hint;
+
+	return OBTreeCallbackActionUpdate;
+}
 #include "catalog/pg_collation.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
@@ -1871,6 +1903,15 @@ orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 	if (GET_PRIMARY(descr)->primaryIsCtid)
 	{
+		BTreeLocationHint hint = {OInvalidInMemoryBlkno, 0};
+		BTreeModifyCallbackInfo cbinfo = {
+			.waitCallback = NULL,
+			.modifyDeletedCallback = o_multi_insert_callback,
+			.modifyCallback = NULL,
+			.needsUndoForSelfCreated = false,
+			.arg = NULL
+		};
+		OMultiInsertHintArg cbarg = {NULL, &hint};
 		/*
 		 * For ctid tables, reserve all ctids atomically in a single operation
 		 * instead of N separate atomic increments.  Then pre-assign each slot
@@ -1892,7 +1933,10 @@ orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			 * correct (possibly-copied) slot.
 			 */
 			slots[i]->tts_tid = iptr;
-			o_tbl_insert(descr, relation, slots[i], oxid, oSnapshot.csn, true);
+			cbarg.slot = slots[i];
+			cbinfo.arg = &cbarg;
+			o_tbl_insert_with_hint(descr, relation, slots[i], oxid,
+								   oSnapshot.csn, true, &hint, &cbinfo);
 		}
 	}
 	else
