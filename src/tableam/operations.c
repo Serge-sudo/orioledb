@@ -223,7 +223,8 @@ o_apply_new_bridge_index_ctid(OTableDescr *descr, Relation relation,
 		fill_current_oxid_osnapshot(&oxid, &o_snapshot);
 
 		success = (o_tbl_index_insert(descr, descr->bridge, &tuple, bridge_slot,
-									  oxid, o_snapshot.csn, &callbackInfo, UNIQUE_CHECK_YES) == OBTreeModifyResultInserted);
+									  oxid, o_snapshot.csn, &callbackInfo,
+									  UNIQUE_CHECK_YES, NULL) == OBTreeModifyResultInserted);
 
 		if (!success && !overflow)
 			o_report_duplicate(relation, descr->bridge, bridge_slot);
@@ -280,14 +281,18 @@ delete_old_bridge_index_ctid(OTableDescr *descr, Relation relation,
 							   tss_orioledb_print_idx_key(bridge_slot, descr->bridge))));
 }
 
-TupleTableSlot *
-o_tbl_insert(OTableDescr *descr, Relation relation,
-			 TupleTableSlot *slot, OXid oxid, CommitSeqNo csn)
+static TupleTableSlot *
+o_tbl_insert_internal(OTableDescr *descr, Relation relation,
+					  TupleTableSlot *slot, OXid oxid, CommitSeqNo csn,
+					  bool ctid_already_assigned,
+					  BTreeModifyCallbackInfo *primary_callback,
+					  BTreeLocationHint *primary_hint)
 {
 	OTableModifyResult mres;
 	OTuple		tup;
 	OIndexDescr *primary = GET_PRIMARY(descr);
-	BTreeModifyCallbackInfo callbackInfo =
+	ItemPointerData saved_ctid;
+	BTreeModifyCallbackInfo callbackInfoLocal =
 	{
 		.waitCallback = NULL,
 		.modifyDeletedCallback = o_insert_callback,
@@ -295,8 +300,18 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 		.needsUndoForSelfCreated = false,
 		.arg = slot
 	};
+	BTreeModifyCallbackInfo *callbackInfo;
 
 	CheckCmdReplicaIdentity(relation, CMD_INSERT);
+
+	callbackInfo = primary_callback ? primary_callback : &callbackInfoLocal;
+
+	/*
+	 * Save the pre-assigned ctid before a potential slot copy, since the copy
+	 * may not preserve tts_tid (e.g. when copying from a non-OrioleDB slot).
+	 */
+	if (primary->primaryIsCtid && ctid_already_assigned)
+		saved_ctid = slot->tts_tid;
 
 	if (slot->tts_ops != descr->newTuple->tts_ops ||
 		(((OTableSlot *) slot)->descr != NULL &&
@@ -307,12 +322,19 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 		slot = descr->newTuple;
 	}
 
-	if (GET_PRIMARY(descr)->primaryIsCtid)
+	if (primary->primaryIsCtid)
 	{
 		ItemPointerData iptr;
 
-		o_btree_load_shmem(&primary->desc);
-		iptr = btree_ctid_get_and_inc(&primary->desc);
+		if (ctid_already_assigned)
+		{
+			iptr = saved_ctid;
+		}
+		else
+		{
+			o_btree_load_shmem(&primary->desc);
+			iptr = btree_ctid_get_and_inc(&primary->desc);
+		}
 		tts_orioledb_set_ctid(slot, &iptr);
 	}
 
@@ -327,7 +349,8 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 								false);
 
 	mres.success = (o_tbl_index_insert(descr, descr->indices[0], NULL, slot,
-									   oxid, csn, &callbackInfo, UNIQUE_CHECK_YES) == OBTreeModifyResultInserted);
+									   oxid, csn, callbackInfo,
+									   UNIQUE_CHECK_YES, primary_hint) == OBTreeModifyResultInserted);
 	if (!mres.success)
 	{
 		mres.failedIxNum = 0;
@@ -348,6 +371,26 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 		o_wal_insert(&primary->desc, tup, relation->rd_rel->relreplident, descr->version);
 
 	return slot;
+}
+
+TupleTableSlot *
+o_tbl_insert(OTableDescr *descr, Relation relation,
+			 TupleTableSlot *slot, OXid oxid, CommitSeqNo csn,
+			 bool ctid_already_assigned)
+{
+	return o_tbl_insert_internal(descr, relation, slot, oxid, csn,
+								 ctid_already_assigned, NULL, NULL);
+}
+
+TupleTableSlot *
+o_tbl_insert_with_hint(OTableDescr *descr, Relation relation,
+					   TupleTableSlot *slot, OXid oxid, CommitSeqNo csn,
+					   bool ctid_already_assigned,
+					   BTreeLocationHint *primary_hint,
+					   BTreeModifyCallbackInfo *primary_callback)
+{
+	return o_tbl_insert_internal(descr, relation, slot, oxid, csn,
+								 ctid_already_assigned, primary_callback, primary_hint);
 }
 
 static RowLockMode
@@ -672,7 +715,8 @@ o_tbl_insert_with_arbiter(Relation rel,
 			ioc_arg.conflictIxNum = i;
 			result = o_tbl_index_insert(descr, descr->indices[i], NULL, slot,
 										oxid, csn, &callbackInfo,
-										descr->indices[i]->desc.type == oIndexExclusion ? UNIQUE_CHECK_NO : UNIQUE_CHECK_YES);
+										descr->indices[i]->desc.type == oIndexExclusion ? UNIQUE_CHECK_NO : UNIQUE_CHECK_YES,
+										NULL);
 			if (result != OBTreeModifyResultInserted)
 			{
 				success = false;
@@ -913,7 +957,8 @@ o_tbl_insert_with_arbiter(Relation rel,
 
 			ioc_arg.conflictIxNum = InvalidIndexNumber;
 			result = o_tbl_index_insert(descr, descr->indices[i], NULL, slot,
-										oxid, csn, &callbackInfo, UNIQUE_CHECK_YES);
+										oxid, csn, &callbackInfo, UNIQUE_CHECK_YES,
+										NULL);
 
 			if (result != OBTreeModifyResultInserted)
 			{
@@ -1798,7 +1843,8 @@ o_tbl_index_insert(OTableDescr *descr,
 				   TupleTableSlot *slot,
 				   OXid oxid, CommitSeqNo csn,
 				   BTreeModifyCallbackInfo *callbackInfo,
-				   IndexUniqueCheck checkUnique)
+				   IndexUniqueCheck checkUnique,
+				   BTreeLocationHint *hint)
 {
 	BTreeDescr *bd = &id->desc;
 	OTuple		tup;
@@ -1834,12 +1880,12 @@ o_tbl_index_insert(OTableDescr *descr,
 								tup, BTreeKeyLeafTuple,
 								(Pointer) &knew, BTreeKeyBound,
 								oxid, csn, RowLockUpdate,
-								NULL, callbackInfo);
+								hint, callbackInfo);
 	else
 		result = o_btree_insert_unique(bd, tup, BTreeKeyLeafTuple,
 									   (Pointer) &knew, BTreeKeyBound,
 									   oxid, csn, RowLockUpdate,
-									   NULL, callbackInfo, checkUnique);
+									   hint, callbackInfo, checkUnique);
 
 	((OTableSlot *) slot)->version = o_tuple_get_version(tup);
 

@@ -2063,7 +2063,8 @@ transientrel_receive(TupleTableSlot *slot, DestReceiver *self)
 {
 	DR_transientrel *myState = (DR_transientrel *) self;
 
-	o_tbl_insert(myState->descr, myState->rel, slot, myState->oxid, myState->csn);
+	o_tbl_insert(myState->descr, myState->rel, slot, myState->oxid, myState->csn,
+				 false);
 
 	/* We know this is a newly created relation, so there are no indexes */
 
@@ -2396,7 +2397,7 @@ rewrite_table(Relation rel, OTable *old_o_table, OTable *new_o_table)
 			}
 		}
 
-		o_tbl_insert(descr, rel, new_slot, oxid, oSnapshot.csn);
+		o_tbl_insert(descr, rel, new_slot, oxid, oSnapshot.csn, false);
 
 		ExecClearTuple(old_slot);
 		ExecClearTuple(new_slot);

@@ -48,6 +48,38 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
+
+typedef struct
+{
+	TupleTableSlot *slot;
+	BTreeLocationHint *hint;
+} OMultiInsertHintArg;
+
+static OBTreeModifyCallbackAction
+o_multi_insert_callback(BTreeDescr *descr, OTuple tup, OTuple *newtup,
+						OXid oxid, OTupleXactInfo xactInfo,
+						BTreeLeafTupleDeletedStatus deleted,
+						UndoLocation location, RowLockMode *lock_mode,
+						BTreeLocationHint *hint, void *arg)
+{
+	OMultiInsertHintArg *cbarg = (OMultiInsertHintArg *) arg;
+
+	if (descr->type == oIndexPrimary &&
+		XACT_INFO_OXID_IS_CURRENT(xactInfo))
+	{
+		OIndexDescr *id = (OIndexDescr *) descr->arg;
+
+		o_tuple_set_version(&id->leafSpec, newtup,
+							o_tuple_get_version(tup) + 1);
+		if (cbarg->slot)
+			((OTableSlot *) cbarg->slot)->tuple = *newtup;
+	}
+
+	if (cbarg->hint && hint)
+		*cbarg->hint = *hint;
+
+	return OBTreeCallbackActionUpdate;
+}
 #include "catalog/pg_collation.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
@@ -463,7 +495,7 @@ orioledb_tuple_insert(Relation relation, TupleTableSlot *slot,
 
 	descr = relation_get_descr(relation);
 	fill_current_oxid_osnapshot(&oxid, &oSnapshot);
-	return o_tbl_insert(descr, relation, slot, oxid, oSnapshot.csn);
+	return o_tbl_insert(descr, relation, slot, oxid, oSnapshot.csn, false);
 }
 
 static TupleTableSlot *
@@ -1856,10 +1888,62 @@ static void
 orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 					  CommandId cid, int options, BulkInsertState bistate)
 {
+	OTableDescr *descr;
+	OSnapshot	oSnapshot;
+	OXid		oxid;
 	int			i;
 
-	for (i = 0; i < ntuples; i++)
-		orioledb_tuple_insert(relation, slots[i], cid, options, bistate);
+	if (OidIsValid(relation->rd_rel->relrewrite))
+		return;
+
+	o_set_current_command(cid);
+
+	descr = relation_get_descr(relation);
+	fill_current_oxid_osnapshot(&oxid, &oSnapshot);
+
+	if (GET_PRIMARY(descr)->primaryIsCtid)
+	{
+		BTreeLocationHint hint = {OInvalidInMemoryBlkno, 0};
+		BTreeModifyCallbackInfo cbinfo = {
+			.waitCallback = NULL,
+			.modifyDeletedCallback = o_multi_insert_callback,
+			.modifyCallback = NULL,
+			.needsUndoForSelfCreated = false,
+			.arg = NULL
+		};
+		OMultiInsertHintArg cbarg = {NULL, &hint};
+		/*
+		 * For ctid tables, reserve all ctids atomically in a single operation
+		 * instead of N separate atomic increments.  Then pre-assign each slot
+		 * a sequential ctid before inserting.
+		 */
+		OIndexDescr *primary = GET_PRIMARY(descr);
+		uint64		base_ctid;
+
+		o_btree_load_shmem(&primary->desc);
+		base_ctid = btree_ctid_batch_reserve(&primary->desc, ntuples);
+
+		for (i = 0; i < ntuples; i++)
+		{
+			ItemPointerData iptr = btree_ctid_make_iptr(base_ctid + i);
+
+			/*
+			 * Set tts_tid directly — safe for any slot type.  o_tbl_insert
+			 * will pick up the value and call tts_orioledb_set_ctid on the
+			 * correct (possibly-copied) slot.
+			 */
+			slots[i]->tts_tid = iptr;
+			cbarg.slot = slots[i];
+			cbinfo.arg = &cbarg;
+			o_tbl_insert_with_hint(descr, relation, slots[i], oxid,
+								   oSnapshot.csn, true, &hint, &cbinfo);
+		}
+	}
+	else
+	{
+		for (i = 0; i < ntuples; i++)
+			o_tbl_insert(descr, relation, slots[i], oxid, oSnapshot.csn, false);
+	}
 }
 
 static void

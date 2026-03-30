@@ -390,6 +390,8 @@ extern void o_btree_init(BTreeDescr *descr);
 extern void o_btree_cleanup_pages(OInMemoryBlkno root, OInMemoryBlkno metaPageBlkno,
 								  uint32 rootPageChangeCount);
 extern ItemPointerData btree_ctid_get_and_inc(BTreeDescr *desc);
+extern uint64 btree_ctid_batch_reserve(BTreeDescr *desc, int ntuples);
+extern ItemPointerData btree_ctid_make_iptr(uint64 ctid);
 extern ItemPointerData btree_bridge_ctid_get_and_inc(BTreeDescr *desc, bool *overflow);
 extern void btree_ctid_update_if_needed(BTreeDescr *desc, ItemPointerData ctid);
 extern void btree_desc_stopevent_params_internal(BTreeDescr *desc,

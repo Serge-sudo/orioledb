@@ -1048,6 +1048,21 @@ SELECT * FROM fktable;
 DROP TABLE fktable;
 DROP TABLE pktable;
 
+-- Bulk insert (COPY) for ctid table exercises orioledb_multi_insert
+CREATE TABLE o_test_bulk_insert (val int, txt text) USING orioledb;
+COPY o_test_bulk_insert (val, txt) FROM stdin;
+1	one
+2	two
+3	three
+4	four
+5	five
+\.
+SELECT * FROM o_test_bulk_insert ORDER BY val;
+-- Also verify a secondary index works correctly after bulk insert
+CREATE INDEX o_test_bulk_insert_val ON o_test_bulk_insert (val);
+SELECT val FROM o_test_bulk_insert WHERE val > 2 ORDER BY val;
+DROP TABLE o_test_bulk_insert;
+
 DROP EXTENSION orioledb CASCADE;
 DROP SCHEMA tableam CASCADE;
 RESET search_path;

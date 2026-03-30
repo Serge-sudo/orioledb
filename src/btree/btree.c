@@ -278,6 +278,49 @@ btree_ctid_get_and_inc(BTreeDescr *desc)
 	return result;
 }
 
+/*
+ * Reserve a batch of ntuples ctids at once with a single atomic operation.
+ * Returns the base ctid value (before the reservation).  Use
+ * btree_ctid_make_iptr() to convert individual sequential values to
+ * ItemPointerData.
+ */
+uint64
+btree_ctid_batch_reserve(BTreeDescr *desc, int ntuples)
+{
+	BTreeMetaPage *metaPageBlkno = BTREE_GET_META(desc);
+	uint64		base;
+
+	Assert(ORootPageIsValid(desc) && OMetaPageIsValid(desc));
+	Assert(ntuples > 0);
+
+	base = pg_atomic_fetch_add_u64(&metaPageBlkno->ctid, (uint64) ntuples);
+
+	/*
+	 * Guard against overflow: the atomic counter was incremented by ntuples,
+	 * so verify that base + ntuples itself won't overflow uint64, and that
+	 * the last ctid in the batch falls within a valid block number.
+	 */
+	Assert(base <= UINT64_MAX - (uint64) ntuples);
+	Assert((base + (uint64) (ntuples - 1)) / (MaxOffsetNumber - FirstOffsetNumber) < InvalidBlockNumber);
+
+	return base;
+}
+
+/*
+ * Convert a raw uint64 ctid value (as returned by btree_ctid_batch_reserve)
+ * to an ItemPointerData.
+ */
+ItemPointerData
+btree_ctid_make_iptr(uint64 ctid)
+{
+	ItemPointerData result;
+
+	ItemPointerSet(&result,
+				   (uint32) (ctid / (MaxOffsetNumber - FirstOffsetNumber)),
+				   (OffsetNumber) (ctid % (MaxOffsetNumber - FirstOffsetNumber) + FirstOffsetNumber));
+	return result;
+}
+
 void
 btree_ctid_update_if_needed(BTreeDescr *desc, ItemPointerData ctid)
 {
