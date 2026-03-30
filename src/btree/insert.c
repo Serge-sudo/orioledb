@@ -1394,3 +1394,131 @@ o_btree_insert_tuple_to_leaf(OBTreeFindPageContext *context,
 		MemoryContextResetOnly(btree_insert_context);
 	}
 }
+
+/*
+ * Insert multiple tuples to a leaf page at once.
+ *
+ * Tries to insert as many tuples as will fit on the current page.
+ * Returns the number of tuples inserted successfully. If not all
+ * tuples fit, the caller should find a new location for the remaining
+ * tuples and call this function again.
+ *
+ * Parameters:
+ *  - context: page find context with the target page already located
+ *  - tuples: array of tuples to insert
+ *  - tuplens: array of tuple lengths
+ *  - leaf_headers: array of leaf tuple headers
+ *  - ntuples: number of tuples in the arrays
+ *  - reserve_kind: page pool reservation kind
+ *  - inserted_count: output parameter, set to number of tuples inserted
+ *
+ * Returns: number of tuples successfully inserted (may be less than ntuples
+ *          if page runs out of space)
+ */
+int
+o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
+							   OTuple *tuples, LocationIndex *tuplens,
+							   BTreeLeafTuphdr *leaf_headers, int ntuples,
+							   int reserve_kind, int *inserted_count)
+{
+	BTreeDescr *desc = context->desc;
+	OInMemoryBlkno blkno;
+	Page		p;
+	BTreePageHeader *header;
+	BTreePageItemLocator loc;
+	MemoryContext prev_context;
+	bool		nested_call;
+	int			i;
+	int			inserted = 0;
+	CommitSeqNo csn;
+
+	if (ntuples <= 0)
+	{
+		*inserted_count = 0;
+		return 0;
+	}
+
+	nested_call = CurrentMemoryContext == btree_insert_context;
+	if (!nested_call)
+		prev_context = MemoryContextSwitchTo(btree_insert_context);
+
+	context->flags &= ~(BTREE_PAGE_FIND_FIX_LEAF_SPLIT);
+
+	blkno = context->items[context->index].blkno;
+	Assert(OInMemoryBlknoIsValid(blkno));
+	Assert(page_is_locked(blkno));
+
+	p = O_GET_IN_MEMORY_PAGE(blkno);
+	header = (BTreePageHeader *) p;
+	csn = pg_atomic_read_u64(&TRANSAM_VARIABLES->nextCommitSeqNo);
+
+	/*
+	 * Try to insert each tuple in sequence. Stop when we run out of space
+	 * or encounter a tuple that doesn't fit.
+	 */
+	for (i = 0; i < ntuples; i++)
+	{
+		LocationIndex newItemSize;
+		BTreeItemPageFitType fit;
+		Pointer		ptr;
+		LocationIndex keyLen;
+
+		/* Search for the appropriate location for this tuple */
+		btree_page_search(desc, p, (Pointer) &tuples[i],
+						  BTreeKeyLeafTuple, NULL, &loc);
+
+		newItemSize = MAXALIGN(tuplens[i]) + BTreeLeafTuphdrSize;
+
+		/* Check if this tuple fits on the current page */
+		fit = page_locator_fits_item(desc, p, &loc, newItemSize, false, csn);
+
+		if (fit != BTreeItemPageFitAsIs)
+		{
+			/* No more space on this page, stop here */
+			break;
+		}
+
+		/* Insert this tuple */
+		START_CRIT_SECTION();
+		page_block_reads(blkno);
+
+		page_locator_insert_item(p, &loc, newItemSize);
+		header->prevInsertOffset = BTREE_PAGE_LOCATOR_GET_OFFSET(p, &loc);
+
+		keyLen = MAXALIGN(o_btree_len(desc, tuples[i], OTupleKeyLengthNoVersion));
+		header->maxKeyLen = Max(header->maxKeyLen, keyLen);
+
+		/* Copy tuple header and data */
+		ptr = BTREE_PAGE_LOCATOR_GET_ITEM(p, &loc);
+		memcpy(ptr, &leaf_headers[i], BTreeLeafTuphdrSize);
+		ptr += BTreeLeafTuphdrSize;
+		memcpy(ptr, tuples[i].data, tuplens[i]);
+		BTREE_PAGE_SET_ITEM_FLAGS(p, &loc, tuples[i].formatFlags);
+
+		if (!(tuples[i].formatFlags & O_TUPLE_FLAGS_FIXED_FORMAT))
+			header->chunkDesc[loc.chunkOffset].chunkKeysFixed = 0;
+
+		page_split_chunk_if_needed(desc, p, &loc);
+
+		END_CRIT_SECTION();
+
+		inserted++;
+	}
+
+	if (inserted > 0)
+	{
+		MARK_DIRTY(desc, blkno);
+	}
+
+	unlock_page(blkno);
+
+	*inserted_count = inserted;
+
+	if (!nested_call)
+	{
+		MemoryContextSwitchTo(prev_context);
+		MemoryContextResetOnly(btree_insert_context);
+	}
+
+	return inserted;
+}
