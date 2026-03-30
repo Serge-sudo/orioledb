@@ -1403,9 +1403,37 @@ o_btree_insert_tuple_to_leaf(OBTreeFindPageContext *context,
  * tuples fit, the caller should find a new location for the remaining
  * tuples and call this function again.
  *
+ * This function expects the page to already be locked via the find_page
+ * mechanism. It will unlock the page before returning.
+ *
+ * The function processes tuples in order, inserting each one that fits.
+ * Once a tuple doesn't fit, it stops and returns the count of successfully
+ * inserted tuples. The caller is responsible for:
+ * 1. Finding a new page location for the remaining tuples
+ * 2. Calling this function again with the remaining tuples
+ *
+ * Example usage:
+ *   int remaining = ntuples;
+ *   int offset = 0;
+ *   while (remaining > 0) {
+ *       int inserted;
+ *       // Find page for the next tuple
+ *       find_page(context, &tuples[offset], BTreeKeyLeafTuple, 0);
+ *       // Insert as many as fit
+ *       o_btree_insert_tuples_to_leaf(context,
+ *                                      &tuples[offset],
+ *                                      &tuplens[offset],
+ *                                      &headers[offset],
+ *                                      remaining,
+ *                                      reserve_kind,
+ *                                      &inserted);
+ *       offset += inserted;
+ *       remaining -= inserted;
+ *   }
+ *
  * Parameters:
- *  - context: page find context with the target page already located
- *  - tuples: array of tuples to insert
+ *  - context: page find context with the target page already located and locked
+ *  - tuples: array of tuples to insert (should be sorted if needed)
  *  - tuplens: array of tuple lengths
  *  - leaf_headers: array of leaf tuple headers
  *  - ntuples: number of tuples in the arrays
@@ -1456,6 +1484,9 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 	 * Try to insert each tuple in sequence. Stop when we run out of space
 	 * or encounter a tuple that doesn't fit.
 	 */
+	START_CRIT_SECTION();
+	page_block_reads(blkno);
+
 	for (i = 0; i < ntuples; i++)
 	{
 		LocationIndex newItemSize;
@@ -1479,9 +1510,6 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 		}
 
 		/* Insert this tuple */
-		START_CRIT_SECTION();
-		page_block_reads(blkno);
-
 		page_locator_insert_item(p, &loc, newItemSize);
 		header->prevInsertOffset = BTREE_PAGE_LOCATOR_GET_OFFSET(p, &loc);
 
@@ -1500,8 +1528,6 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 
 		page_split_chunk_if_needed(desc, p, &loc);
 
-		END_CRIT_SECTION();
-
 		inserted++;
 	}
 
@@ -1511,6 +1537,8 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 	}
 
 	unlock_page(blkno);
+
+	END_CRIT_SECTION();
 
 	*inserted_count = inserted;
 
