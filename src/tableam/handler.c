@@ -463,7 +463,7 @@ orioledb_tuple_insert(Relation relation, TupleTableSlot *slot,
 
 	descr = relation_get_descr(relation);
 	fill_current_oxid_osnapshot(&oxid, &oSnapshot);
-	return o_tbl_insert(descr, relation, slot, oxid, oSnapshot.csn);
+	return o_tbl_insert(descr, relation, slot, oxid, oSnapshot.csn, false);
 }
 
 static TupleTableSlot *
@@ -1856,10 +1856,50 @@ static void
 orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 					  CommandId cid, int options, BulkInsertState bistate)
 {
+	OTableDescr *descr;
+	OSnapshot	oSnapshot;
+	OXid		oxid;
 	int			i;
 
-	for (i = 0; i < ntuples; i++)
-		orioledb_tuple_insert(relation, slots[i], cid, options, bistate);
+	if (OidIsValid(relation->rd_rel->relrewrite))
+		return;
+
+	o_set_current_command(cid);
+
+	descr = relation_get_descr(relation);
+	fill_current_oxid_osnapshot(&oxid, &oSnapshot);
+
+	if (GET_PRIMARY(descr)->primaryIsCtid)
+	{
+		/*
+		 * For ctid tables, reserve all ctids atomically in a single operation
+		 * instead of N separate atomic increments.  Then pre-assign each slot
+		 * a sequential ctid before inserting.
+		 */
+		OIndexDescr *primary = GET_PRIMARY(descr);
+		uint64		base_ctid;
+
+		o_btree_load_shmem(&primary->desc);
+		base_ctid = btree_ctid_batch_reserve(&primary->desc, ntuples);
+
+		for (i = 0; i < ntuples; i++)
+		{
+			ItemPointerData iptr = btree_ctid_make_iptr(base_ctid + i);
+
+			/*
+			 * Set tts_tid directly — safe for any slot type.  o_tbl_insert
+			 * will pick up the value and call tts_orioledb_set_ctid on the
+			 * correct (possibly-copied) slot.
+			 */
+			slots[i]->tts_tid = iptr;
+			o_tbl_insert(descr, relation, slots[i], oxid, oSnapshot.csn, true);
+		}
+	}
+	else
+	{
+		for (i = 0; i < ntuples; i++)
+			o_tbl_insert(descr, relation, slots[i], oxid, oSnapshot.csn, false);
+	}
 }
 
 static void

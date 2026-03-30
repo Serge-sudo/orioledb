@@ -282,11 +282,13 @@ delete_old_bridge_index_ctid(OTableDescr *descr, Relation relation,
 
 TupleTableSlot *
 o_tbl_insert(OTableDescr *descr, Relation relation,
-			 TupleTableSlot *slot, OXid oxid, CommitSeqNo csn)
+			 TupleTableSlot *slot, OXid oxid, CommitSeqNo csn,
+			 bool ctid_already_assigned)
 {
 	OTableModifyResult mres;
 	OTuple		tup;
 	OIndexDescr *primary = GET_PRIMARY(descr);
+	ItemPointerData saved_ctid;
 	BTreeModifyCallbackInfo callbackInfo =
 	{
 		.waitCallback = NULL,
@@ -298,6 +300,13 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 
 	CheckCmdReplicaIdentity(relation, CMD_INSERT);
 
+	/*
+	 * Save the pre-assigned ctid before a potential slot copy, since the copy
+	 * may not preserve tts_tid (e.g. when copying from a non-OrioleDB slot).
+	 */
+	if (primary->primaryIsCtid && ctid_already_assigned)
+		saved_ctid = slot->tts_tid;
+
 	if (slot->tts_ops != descr->newTuple->tts_ops ||
 		(((OTableSlot *) slot)->descr != NULL &&
 		 ((OTableSlot *) slot)->descr != descr))
@@ -307,12 +316,19 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 		slot = descr->newTuple;
 	}
 
-	if (GET_PRIMARY(descr)->primaryIsCtid)
+	if (primary->primaryIsCtid)
 	{
 		ItemPointerData iptr;
 
-		o_btree_load_shmem(&primary->desc);
-		iptr = btree_ctid_get_and_inc(&primary->desc);
+		if (ctid_already_assigned)
+		{
+			iptr = saved_ctid;
+		}
+		else
+		{
+			o_btree_load_shmem(&primary->desc);
+			iptr = btree_ctid_get_and_inc(&primary->desc);
+		}
 		tts_orioledb_set_ctid(slot, &iptr);
 	}
 
