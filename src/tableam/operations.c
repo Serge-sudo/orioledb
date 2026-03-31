@@ -446,13 +446,13 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 	else
 		reserve_kind = PPOOL_RESERVE_INSERT;
 
-	o_btree_insert_items_list(&primary->desc,
-							  tuples,
-							  tuplens,
-							  leaf_headers,
-							  ntuples,
-							  csn,
-							  reserve_kind);
+	o_btree_insert_tuples_to_leaf_all(&primary->desc,
+									  tuples,
+									  tuplens,
+									  leaf_headers,
+									  ntuples,
+									  csn,
+									  reserve_kind);
 
 	pgstat_count_heap_insert(relation, ntuples);
 
