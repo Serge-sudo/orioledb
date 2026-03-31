@@ -361,6 +361,7 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 	LocationIndex *tuplens;
 	BTreeLeafTuphdr *leaf_headers;
 	TupleTableSlot **prepared_slots;
+	OBTreeKeyBound *key_bounds;
 	int			i;
 	int			reserve_kind;
 	UndoLogType undoType = primary->desc.undoType;
@@ -371,21 +372,11 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 	if (ntuples <= 0)
 		return;
 
-	/*
-	 * Primary index is unique; fall back to per-tuple insert path to honor
-	 * uniqueness checks and error semantics.
-	 */
-	if (primary->unique)
-	{
-		for (i = 0; i < ntuples; i++)
-			o_tbl_insert(descr, relation, slots[i], oxid, csn);
-		return;
-	}
-
 	tuples = (OTuple *) palloc(sizeof(OTuple) * ntuples);
 	tuplens = (LocationIndex *) palloc(sizeof(LocationIndex) * ntuples);
 	leaf_headers = (BTreeLeafTuphdr *) palloc(sizeof(BTreeLeafTuphdr) * ntuples);
 	prepared_slots = (TupleTableSlot **) palloc(sizeof(TupleTableSlot *) * ntuples);
+	key_bounds = (OBTreeKeyBound *) palloc(sizeof(OBTreeKeyBound) * ntuples);
 
 	if (undoType != UndoLogNone && !is_recovery_process())
 	{
@@ -450,6 +441,52 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 		leaf_headers[i].xactInfo = OXID_GET_XACT_INFO(oxid,
 													  RowLockUpdate,
 													  false);
+
+		tts_orioledb_fill_key_bound(slot, primary, &key_bounds[i]);
+	}
+
+	if (primary->unique)
+	{
+		OSnapshot	oSnapshot;
+		bool		deleted;
+
+		O_LOAD_SNAPSHOT_CSN(&oSnapshot, csn);
+
+		/* In-batch duplicates */
+		for (i = 0; i < ntuples; i++)
+		{
+			int			j;
+
+			for (j = i + 1; j < ntuples; j++)
+			{
+				if (o_btree_cmp(&primary->desc,
+								&key_bounds[i], BTreeKeyBound,
+								&key_bounds[j], BTreeKeyBound) == 0)
+					o_report_duplicate(relation, primary, prepared_slots[j]);
+			}
+		}
+
+		/* Existing duplicates */
+		for (i = 0; i < ntuples; i++)
+		{
+			OTuple		found;
+
+			found = o_btree_find_tuple_by_key_cb(&primary->desc,
+												 (Pointer) &key_bounds[i],
+												 BTreeKeyBound,
+												 &oSnapshot,
+												 NULL,
+												 CurrentMemoryContext,
+												 NULL,
+												 &deleted,
+												 NULL,
+												 NULL);
+			if (!O_TUPLE_IS_NULL(found))
+			{
+				pfree(found.data);
+				o_report_duplicate(relation, primary, prepared_slots[i]);
+			}
+		}
 	}
 
 	if (OIDS_EQ_SYS_TREE(primary->desc.oids, SYS_TREES_SHARED_ROOT_INFO))
