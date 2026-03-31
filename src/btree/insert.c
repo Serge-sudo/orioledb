@@ -1461,6 +1461,8 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 	int			inserted = 0;
 	int			dup_idx = -1;
 	CommitSeqNo csn;
+	bool		loc_initialized = false;
+	bool		append_hint = false;
 
 	if (dup_idx_out)
 		*dup_idx_out = -1;
@@ -1516,9 +1518,22 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 				break;
 		}
 
-		/* Search for the appropriate location for this tuple */
-		btree_page_search(desc, p, (Pointer) &tuples[i],
-						  BTreeKeyLeafTuple, NULL, &loc);
+		/*
+		 * Search for the appropriate location for this tuple.  When we know
+		 * the tuples are already in order and there are no existing items
+		 * after the previous insert position on this page, we can append to
+		 * the tail without calling btree_page_search() again.
+		 */
+		if (loc_initialized && append_hint)
+		{
+			BTREE_PAGE_LOCATOR_TAIL(p, &loc);
+		}
+		else
+		{
+			btree_page_search(desc, p, (Pointer) &tuples[i],
+							  BTreeKeyLeafTuple, NULL, &loc);
+			loc_initialized = true;
+		}
 
 		/*
 		 * Check for a duplicate key on this page (handles both existing page
@@ -1531,20 +1546,49 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 		 * longer occupies the unique key space and may be reused by a new
 		 * insertion without violation.
 		 */
-		if (check_unique && BTREE_PAGE_LOCATOR_IS_VALID(p, &loc))
+		if (check_unique)
 		{
-			BTreeLeafTuphdr *existingHdr;
-			OTuple		existingTup;
-
-			BTREE_PAGE_READ_LEAF_ITEM(existingHdr, existingTup, p, &loc);
-
-			if (existingHdr->deleted == BTreeLeafTupleNonDeleted &&
-				o_btree_cmp(desc,
-							&tuples[i], BTreeKeyLeafTuple,
-							&existingTup, BTreeKeyLeafTuple) == 0)
+			if (BTREE_PAGE_LOCATOR_IS_VALID(p, &loc))
 			{
-				dup_idx = i;
-				break;
+				BTreeLeafTuphdr *existingHdr;
+				OTuple		existingTup;
+
+				BTREE_PAGE_READ_LEAF_ITEM(existingHdr, existingTup, p, &loc);
+
+				if (existingHdr->deleted == BTreeLeafTupleNonDeleted &&
+					o_btree_cmp(desc,
+								&tuples[i], BTreeKeyLeafTuple,
+								&existingTup, BTreeKeyLeafTuple) == 0)
+				{
+					dup_idx = i;
+					break;
+				}
+			}
+			else if (loc.chunk != NULL && loc.itemOffset == loc.chunkItemsCount)
+			{
+				/*
+				 * We're appending to the end of the page.  Check the previous
+				 * tuple only, since keys are sorted and any duplicate would be
+				 * adjacent.
+				 */
+				BTreePageItemLocator prev_loc = loc;
+
+				if (BTREE_PAGE_LOCATOR_PREV(p, &prev_loc))
+				{
+					BTreeLeafTuphdr *existingHdr;
+					OTuple		existingTup;
+
+					BTREE_PAGE_READ_LEAF_ITEM(existingHdr, existingTup, p, &prev_loc);
+
+					if (existingHdr->deleted == BTreeLeafTupleNonDeleted &&
+						o_btree_cmp(desc,
+									&tuples[i], BTreeKeyLeafTuple,
+									&existingTup, BTreeKeyLeafTuple) == 0)
+					{
+						dup_idx = i;
+						break;
+					}
+				}
 			}
 		}
 
@@ -1579,6 +1623,17 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 		page_split_chunk_if_needed(desc, p, &loc);
 
 		inserted++;
+
+		/*
+		 * Prepare a hint for the next tuple: if there are no items after the
+		 * current insertion point on this page, the next tuple (which is
+		 * greater or equal) can be appended without an additional page search.
+		 */
+		{
+			BTreePageItemLocator next_loc = loc;
+
+			append_hint = !BTREE_PAGE_LOCATOR_NEXT(p, &next_loc);
+		}
 	}
 
 	if (inserted > 0)
