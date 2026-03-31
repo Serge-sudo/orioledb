@@ -1499,6 +1499,23 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 		Pointer		ptr;
 		LocationIndex keyLen;
 
+		/*
+		 * For index-organized tables the tuples are sorted, so stop as soon
+		 * as we hit a tuple whose key is >= the page high key — it belongs on
+		 * the next page.  The outer wrapper will call find_page() for this
+		 * tuple and restart the batch there.  For ctid (heap-organized) tables
+		 * the page is usually rightmost, so this check is a no-op.
+		 */
+		if (!O_PAGE_IS(p, RIGHTMOST))
+		{
+			OTuple		hikey;
+
+			BTREE_PAGE_GET_HIKEY(hikey, p);
+			if (o_btree_cmp(desc, &tuples[i], BTreeKeyLeafTuple,
+							&hikey, BTreeKeyNonLeafKey) >= 0)
+				break;
+		}
+
 		/* Search for the appropriate location for this tuple */
 		btree_page_search(desc, p, (Pointer) &tuples[i],
 						  BTreeKeyLeafTuple, NULL, &loc);

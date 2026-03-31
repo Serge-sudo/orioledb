@@ -392,6 +392,41 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 	if (ntuples <= 0)
 		return;
 
+	/*
+	 * For index-organized (non-ctid) tables the batch insert path requires
+	 * the input to be ordered by the primary key so that each page only
+	 * receives the tuples that belong there (determined by the page high key).
+	 * Check sortedness up-front using key bounds derived from the slots.  If
+	 * the input is not sorted, fall through to per-tuple inserts which handle
+	 * arbitrary order correctly without any pre-conditions.
+	 */
+	if (!use_ctid && ntuples > 1)
+	{
+		bool		sorted = true;
+		int			j;
+
+		for (j = 0; j < ntuples - 1 && sorted; j++)
+		{
+			OBTreeKeyBound kb1,
+						kb2;
+
+			tts_orioledb_fill_key_bound(slots[j], primary, &kb1);
+			tts_orioledb_fill_key_bound(slots[j + 1], primary, &kb2);
+			if (o_btree_cmp(&primary->desc,
+							&kb1, BTreeKeyBound,
+							&kb2, BTreeKeyBound) > 0)
+				sorted = false;
+		}
+
+		if (!sorted)
+		{
+			/* Input is unsorted: use per-tuple inserts (handles own undo). */
+			for (j = 0; j < ntuples; j++)
+				o_tbl_insert(descr, relation, slots[j], oxid, csn);
+			return;
+		}
+	}
+
 	tuples = (OTuple *) palloc(sizeof(OTuple) * ntuples);
 	tuplens = (LocationIndex *) palloc(sizeof(LocationIndex) * ntuples);
 	leaf_headers = (BTreeLeafTuphdr *) palloc(sizeof(BTreeLeafTuphdr) * ntuples);
