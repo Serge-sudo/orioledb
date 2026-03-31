@@ -1447,7 +1447,8 @@ int
 o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 							   OTuple *tuples, LocationIndex *tuplens,
 							   BTreeLeafTuphdr *leaf_headers, int ntuples,
-							   int reserve_kind, int *inserted_count)
+							   int reserve_kind, int *inserted_count,
+							   bool check_unique, int *dup_idx_out)
 {
 	BTreeDescr *desc = context->desc;
 	OInMemoryBlkno blkno;
@@ -1458,7 +1459,11 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 	bool		nested_call;
 	int			i;
 	int			inserted = 0;
+	int			dup_idx = -1;
 	CommitSeqNo csn;
+
+	if (dup_idx_out)
+		*dup_idx_out = -1;
 
 	if (ntuples <= 0)
 	{
@@ -1481,8 +1486,8 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 	csn = pg_atomic_read_u64(&TRANSAM_VARIABLES->nextCommitSeqNo);
 
 	/*
-	 * Try to insert each tuple in sequence. Stop when we run out of space
-	 * or encounter a tuple that doesn't fit.
+	 * Try to insert each tuple in sequence. Stop when we run out of space,
+	 * encounter a tuple that doesn't fit, or find a duplicate key.
 	 */
 	START_CRIT_SECTION();
 	page_block_reads(blkno);
@@ -1497,6 +1502,34 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 		/* Search for the appropriate location for this tuple */
 		btree_page_search(desc, p, (Pointer) &tuples[i],
 						  BTreeKeyLeafTuple, NULL, &loc);
+
+		/*
+		 * Check for a duplicate key on this page (handles both existing page
+		 * tuples and in-batch tuples already inserted in this critical
+		 * section).  We look at the item at the found location: if it has the
+		 * same key and is not deleted, it is a conflict.
+		 *
+		 * Deleted tuples (deleted != BTreeLeafTupleNonDeleted) are intentionally
+		 * excluded: a key whose only on-page representation is a tombstone no
+		 * longer occupies the unique key space and may be reused by a new
+		 * insertion without violation.
+		 */
+		if (check_unique && BTREE_PAGE_LOCATOR_IS_VALID(p, &loc))
+		{
+			BTreeLeafTuphdr *existingHdr;
+			OTuple		existingTup;
+
+			BTREE_PAGE_READ_LEAF_ITEM(existingHdr, existingTup, p, &loc);
+
+			if (existingHdr->deleted == BTreeLeafTupleNonDeleted &&
+				o_btree_cmp(desc,
+							&tuples[i], BTreeKeyLeafTuple,
+							&existingTup, BTreeKeyLeafTuple) == 0)
+			{
+				dup_idx = i;
+				break;
+			}
+		}
 
 		newItemSize = MAXALIGN(tuplens[i]) + BTreeLeafTuphdrSize;
 
@@ -1541,6 +1574,8 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
 	END_CRIT_SECTION();
 
 	*inserted_count = inserted;
+	if (dup_idx_out)
+		*dup_idx_out = dup_idx;
 
 	if (!nested_call)
 	{
@@ -1559,6 +1594,12 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
  * find_page() and o_btree_insert_tuples_to_leaf() until all tuples are
  * inserted.
  *
+ * If on_duplicate is non-NULL, duplicate-key detection is enabled.  When a
+ * duplicate is found the callback is called with the absolute index of the
+ * offending tuple (relative to the original tuples[] array) and the caller-
+ * supplied duplicate_arg.  The callback is expected to call ereport(ERROR) or
+ * similar to abort the operation.
+ *
  * Parameters:
  *  - desc: B-tree descriptor
  *  - tuples: array of tuples to insert
@@ -1567,6 +1608,8 @@ o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
  *  - ntuples: number of tuples in the arrays
  *  - csn: commit sequence number
  *  - reserve_kind: page pool reservation kind
+ *  - on_duplicate: optional callback invoked on duplicate key (may be NULL)
+ *  - duplicate_arg: opaque argument forwarded to on_duplicate
  *
  * All tuples will be inserted successfully or the function will error out.
  */
@@ -1574,10 +1617,13 @@ void
 o_btree_insert_tuples_to_leaf_all(BTreeDescr *desc,
 								   OTuple *tuples, LocationIndex *tuplens,
 								   BTreeLeafTuphdr *leaf_headers, int ntuples,
-								   CommitSeqNo csn, int reserve_kind)
+								   CommitSeqNo csn, int reserve_kind,
+								   OBTreeBatchDuplicateCallback on_duplicate,
+								   void *duplicate_arg)
 {
 	int			remaining = ntuples;
 	int			offset = 0;
+	bool		check_unique = (on_duplicate != NULL);
 
 	if (ntuples <= 0)
 		return;
@@ -1586,6 +1632,7 @@ o_btree_insert_tuples_to_leaf_all(BTreeDescr *desc,
 	{
 		OBTreeFindPageContext context;
 		int			inserted;
+		int			dup_idx;
 
 		/* Reserve pages for potential splits */
 		ppool_reserve_pages(desc->ppool, reserve_kind, 2);
@@ -1603,7 +1650,16 @@ o_btree_insert_tuples_to_leaf_all(BTreeDescr *desc,
 									   &leaf_headers[offset],
 									   remaining,
 									   reserve_kind,
-									   &inserted);
+									   &inserted,
+									   check_unique,
+									   &dup_idx);
+
+		/* Report duplicate if detected (callback is expected to ereport) */
+		if (dup_idx >= 0)
+		{
+			Assert(on_duplicate != NULL);
+			on_duplicate(offset + dup_idx, duplicate_arg);
+		}
 
 		if (inserted == 0)
 		{

@@ -351,6 +351,25 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 	return slot;
 }
 
+/*
+ * Callback context for reporting duplicate key violations during batch insert.
+ */
+typedef struct
+{
+	Relation	relation;
+	OIndexDescr *primary;
+	TupleTableSlot **slots;
+} OBatchInsertDupArg;
+
+static void
+o_batch_insert_dup_callback(int tuple_idx, void *arg)
+{
+	OBatchInsertDupArg *cbarg = (OBatchInsertDupArg *) arg;
+
+	Assert(tuple_idx >= 0);
+	o_report_duplicate(cbarg->relation, cbarg->primary, cbarg->slots[tuple_idx]);
+}
+
 void
 o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 				   TupleTableSlot **slots, int ntuples,
@@ -361,13 +380,14 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 	LocationIndex *tuplens;
 	BTreeLeafTuphdr *leaf_headers;
 	TupleTableSlot **prepared_slots;
-	OBTreeKeyBound *key_bounds;
 	int			i;
 	int			reserve_kind;
 	UndoLogType undoType = primary->desc.undoType;
 	bool		undo_reserved = false;
 	bool		page_undo_reserved = false;
 	bool		use_ctid = primary->primaryIsCtid;
+	OBatchInsertDupArg dup_arg;
+	OBTreeBatchDuplicateCallback dup_cb = NULL;
 
 	if (ntuples <= 0)
 		return;
@@ -376,7 +396,6 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 	tuplens = (LocationIndex *) palloc(sizeof(LocationIndex) * ntuples);
 	leaf_headers = (BTreeLeafTuphdr *) palloc(sizeof(BTreeLeafTuphdr) * ntuples);
 	prepared_slots = (TupleTableSlot **) palloc(sizeof(TupleTableSlot *) * ntuples);
-	key_bounds = (OBTreeKeyBound *) palloc(sizeof(OBTreeKeyBound) * ntuples);
 
 	if (undoType != UndoLogNone && !is_recovery_process())
 	{
@@ -441,52 +460,6 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 		leaf_headers[i].xactInfo = OXID_GET_XACT_INFO(oxid,
 													  RowLockUpdate,
 													  false);
-
-		tts_orioledb_fill_key_bound(slot, primary, &key_bounds[i]);
-	}
-
-	if (primary->unique)
-	{
-		OSnapshot	oSnapshot;
-		bool		deleted;
-
-		O_LOAD_SNAPSHOT_CSN(&oSnapshot, csn);
-
-		/* In-batch duplicates */
-		for (i = 0; i < ntuples; i++)
-		{
-			int			j;
-
-			for (j = i + 1; j < ntuples; j++)
-			{
-				if (o_btree_cmp(&primary->desc,
-								&key_bounds[i], BTreeKeyBound,
-								&key_bounds[j], BTreeKeyBound) == 0)
-					o_report_duplicate(relation, primary, prepared_slots[j]);
-			}
-		}
-
-		/* Existing duplicates */
-		for (i = 0; i < ntuples; i++)
-		{
-			OTuple		found;
-
-			found = o_btree_find_tuple_by_key_cb(&primary->desc,
-												 (Pointer) &key_bounds[i],
-												 BTreeKeyBound,
-												 &oSnapshot,
-												 NULL,
-												 CurrentMemoryContext,
-												 NULL,
-												 &deleted,
-												 NULL,
-												 NULL);
-			if (!O_TUPLE_IS_NULL(found))
-			{
-				pfree(found.data);
-				o_report_duplicate(relation, primary, prepared_slots[i]);
-			}
-		}
 	}
 
 	if (OIDS_EQ_SYS_TREE(primary->desc.oids, SYS_TREES_SHARED_ROOT_INFO))
@@ -494,13 +467,28 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 	else
 		reserve_kind = PPOOL_RESERVE_INSERT;
 
+	/*
+	 * For unique primary indexes, wire up a duplicate-reporting callback so
+	 * that the batch insert path can detect conflicts on the page and report
+	 * them via the usual error path.
+	 */
+	if (primary->unique)
+	{
+		dup_arg.relation = relation;
+		dup_arg.primary = primary;
+		dup_arg.slots = prepared_slots;
+		dup_cb = o_batch_insert_dup_callback;
+	}
+
 	o_btree_insert_tuples_to_leaf_all(&primary->desc,
 									  tuples,
 									  tuplens,
 									  leaf_headers,
 									  ntuples,
 									  csn,
-									  reserve_kind);
+									  reserve_kind,
+									  dup_cb,
+									  primary->unique ? &dup_arg : NULL);
 
 	pgstat_count_heap_insert(relation, ntuples);
 
