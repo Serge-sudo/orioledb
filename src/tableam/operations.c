@@ -371,6 +371,17 @@ o_tbl_multi_insert(OTableDescr *descr, Relation relation,
 	if (ntuples <= 0)
 		return;
 
+	/*
+	 * Primary index is unique; fall back to per-tuple insert path to honor
+	 * uniqueness checks and error semantics.
+	 */
+	if (primary->unique)
+	{
+		for (i = 0; i < ntuples; i++)
+			o_tbl_insert(descr, relation, slots[i], oxid, csn);
+		return;
+	}
+
 	tuples = (OTuple *) palloc(sizeof(OTuple) * ntuples);
 	tuplens = (LocationIndex *) palloc(sizeof(LocationIndex) * ntuples);
 	leaf_headers = (BTreeLeafTuphdr *) palloc(sizeof(BTreeLeafTuphdr) * ntuples);
