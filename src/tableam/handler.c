@@ -1858,6 +1858,11 @@ orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 {
 	int			i;
 
+	/*
+	 * For now, use the simple loop-based approach.
+	 * Batch insert optimization would require sorting tuples and handling
+	 * all index inserts in batch mode, which is more complex.
+	 */
 	for (i = 0; i < ntuples; i++)
 		orioledb_tuple_insert(relation, slots[i], cid, options, bistate);
 }

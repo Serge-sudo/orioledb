@@ -30,4 +30,10 @@ extern bool o_btree_split_is_incomplete(OInMemoryBlkno left_blkno,
 										uint32 pageChangeCount,
 										bool *relocked);
 
+/* Batch insert support */
+extern void o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
+										  OTupleListItem *tuple_list,
+										  bool replace,
+										  int reserve_kind);
+
 #endif							/* __BTREE_INSERT_H__ */

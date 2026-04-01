@@ -78,6 +78,8 @@ init_page_find_context(OBTreeFindPageContext *context, BTreeDescr *desc,
 	context->parentImg = NULL;
 	O_TUPLE_SET_NULL(context->insertTuple);
 	O_TUPLE_SET_NULL(context->lokey.tuple);
+	context->tupleList = NULL;
+	context->currentTuple = NULL;
 }
 
 
@@ -1765,4 +1767,121 @@ btree_page_search_items(BTreeDescr *desc, Page p, Pointer key,
 	}
 
 	locator->itemOffset = low;
+}
+
+/*
+ * find_page_batch_insert - Extended find_page for batch insert
+ *
+ * This function locates the appropriate leaf page for the first tuple in the
+ * context's tuple list, then checks which additional tuples from the sorted
+ * list can also be inserted into the same page by comparing their keys with
+ * the page's highkey.
+ *
+ * Parameters:
+ *   context - Find page context with tupleList initialized
+ *   tuples_for_page - Output parameter: receives linked list of tuples that
+ *                     can be inserted into the found page
+ *   keyType - Type of key being searched
+ *
+ * Returns: Number of tuples that can be inserted into the found page
+ *
+ * The tuples in context->tupleList must be sorted in ascending order.
+ */
+int
+find_page_batch_insert(OBTreeFindPageContext *context,
+					   OTupleListItem **tuples_for_page,
+					   BTreeKeyType keyType)
+{
+	BTreeDescr *desc = context->desc;
+	OFindPageResult result;
+	OTuple		hikey;
+	Page		p;
+	OTupleListItem *current;
+	OTupleListItem *last_valid = NULL;
+	int			count = 0;
+
+	/* Must have at least one tuple in the list */
+	if (context->tupleList == NULL)
+	{
+		*tuples_for_page = NULL;
+		return 0;
+	}
+
+	/* Set the first tuple as the search key */
+	context->insertTuple = context->tupleList->tuple;
+	context->currentTuple = context->tupleList;
+
+	/* Find the page for the first tuple */
+	result = find_page(context, &context->tupleList->tuple, keyType, 0);
+
+	if (result != OFindPageResultSuccess)
+	{
+		*tuples_for_page = NULL;
+		return 0;
+	}
+
+	/* Get the current page */
+	p = O_GET_IN_MEMORY_PAGE(context->items[context->index].blkno);
+
+	/* Get the high key of the current page */
+	if (O_PAGE_IS(p, RIGHTMOST))
+	{
+		/* Rightmost page has no upper bound - all remaining tuples can go here */
+		*tuples_for_page = context->tupleList;
+		current = context->tupleList;
+		while (current != NULL)
+		{
+			count++;
+			last_valid = current;
+			current = current->next;
+		}
+		/* Update tupleList to NULL since all tuples are assigned */
+		context->tupleList = NULL;
+		return count;
+	}
+
+	BTREE_PAGE_GET_HIKEY(hikey, p);
+
+	/*
+	 * Iterate through the sorted tuple list and check which tuples can fit
+	 * into this page by comparing with highkey
+	 */
+	*tuples_for_page = context->tupleList;
+	current = context->tupleList;
+
+	while (current != NULL)
+	{
+		int			cmp;
+
+		/* Compare current tuple with page's highkey */
+		cmp = o_btree_cmp(desc, &current->tuple, BTreeKeyLeafTuple,
+						  &hikey, BTreeKeyNonLeafKey);
+
+		/*
+		 * If tuple's key is >= highkey, it doesn't fit on this page
+		 * We need to stop here
+		 */
+		if (cmp >= 0)
+			break;
+
+		/* This tuple can be inserted into this page */
+		count++;
+		last_valid = current;
+		current = current->next;
+	}
+
+	/* Update the tuple list to point to remaining tuples */
+	if (last_valid != NULL)
+	{
+		context->tupleList = last_valid->next;
+		last_valid->next = NULL;	/* Terminate the list for this page */
+	}
+	else
+	{
+		/* No tuples can fit on this page (shouldn't happen for first tuple) */
+		*tuples_for_page = NULL;
+		count = 0;
+	}
+
+	return count;
 }

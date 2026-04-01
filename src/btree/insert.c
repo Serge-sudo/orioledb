@@ -1394,3 +1394,68 @@ o_btree_insert_tuple_to_leaf(OBTreeFindPageContext *context,
 		MemoryContextResetOnly(btree_insert_context);
 	}
 }
+
+/*
+ * o_btree_insert_tuples_to_leaf - Insert multiple sorted tuples into a leaf page
+ *
+ * This function inserts multiple tuples from a linked list into the same leaf page.
+ * All tuples in the list must have keys that fit within the page's key range
+ * (i.e., less than the page's highkey).
+ *
+ * Parameters:
+ *   context - Find page context with the target page locked
+ *   tuple_list - Linked list of sorted tuples to insert
+ *   replace - Whether this is a replace operation
+ *   reserve_kind - Page pool reservation kind
+ *
+ * The function processes each tuple in the list sequentially, calling
+ * o_btree_insert_tuple_to_leaf for each one.
+ */
+void
+o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
+							  OTupleListItem *tuple_list,
+							  bool replace,
+							  int reserve_kind)
+{
+	OTupleListItem *current;
+	MemoryContext prev_context;
+	bool		nested_call;
+
+	if (tuple_list == NULL)
+		return;
+
+	nested_call = CurrentMemoryContext == btree_insert_context;
+	if (!nested_call)
+		prev_context = MemoryContextSwitchTo(btree_insert_context);
+
+	/*
+	 * Iterate through all tuples in the list and insert them one by one
+	 * The page should already be locked by find_page_batch_insert
+	 */
+	current = tuple_list;
+	while (current != NULL)
+	{
+		BTreeInsertStackItem insert_item;
+
+		context->flags &= ~(BTREE_PAGE_FIND_FIX_LEAF_SPLIT);
+		insert_item.next = NULL;
+		insert_item.context = context;
+		insert_item.tuple = current->tuple;
+		insert_item.tuplen = current->tuplen;
+		insert_item.tupheader = (Pointer) &current->tuphdr;
+		insert_item.level = 0;
+		insert_item.replace = replace;
+		insert_item.rightBlkno = OInvalidInMemoryBlkno;
+		insert_item.refind = false;
+
+		o_btree_insert_item(&insert_item, reserve_kind);
+
+		current = current->next;
+	}
+
+	if (!nested_call)
+	{
+		MemoryContextSwitchTo(prev_context);
+		MemoryContextResetOnly(btree_insert_context);
+	}
+}

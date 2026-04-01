@@ -24,6 +24,15 @@ typedef struct
 	BTreePageItemLocator locator;
 } OBtreePageFindItem;
 
+/* Linked list of tuples for batch insert */
+typedef struct OTupleListItem
+{
+	struct OTupleListItem *next;	/* Next tuple in the list */
+	OTuple		tuple;			/* The tuple */
+	BTreeLeafTuphdr tuphdr;		/* Tuple header */
+	LocationIndex tuplen;		/* Tuple length */
+} OTupleListItem;
+
 struct PartialPageState
 {
 	Page		src;
@@ -63,6 +72,14 @@ typedef struct
 	 */
 	OFixedKey	undoLokey;
 	uint16		flags;
+
+	/*
+	 * Batch insert support: linked list of sorted tuples for multi-insert
+	 * When tupleList is not NULL, find_page will check which tuples can be
+	 * inserted into the same page by comparing with highkey
+	 */
+	OTupleListItem *tupleList;	/* Linked list of tuples for batch insert */
+	OTupleListItem *currentTuple;	/* Current tuple being processed */
 } OBTreeFindPageContext;
 
 /* OBTreeFindPageContext flags */
@@ -78,6 +95,7 @@ typedef struct
 #define BTREE_PAGE_FIND_IMAGE			(0x0200)
 #define BTREE_PAGE_FIND_DOWNLINK_LOCATION (0x0400)
 #define BTREE_PAGE_FIND_READ_CSN		(0x0800)
+#define BTREE_PAGE_FIND_BATCH_INSERT	(0x1000)
 
 #define BTREE_PAGE_FIND_SET(context, flag) ((context)->flags |= BTREE_PAGE_FIND_##flag)
 #define BTREE_PAGE_FIND_UNSET(context, flag) ((context)->flags &= ~(BTREE_PAGE_FIND_##flag))
@@ -110,5 +128,10 @@ extern void btree_find_context_from_modify_to_read(OBTreeFindPageContext *contex
 												   Pointer key,
 												   BTreeKeyType keyType,
 												   uint16 level);
+
+/* Batch insert support functions */
+extern int find_page_batch_insert(OBTreeFindPageContext *context,
+								   OTupleListItem **tuples_for_page,
+								   BTreeKeyType keyType);
 
 #endif							/* __BTREE_FIND_H__ */
