@@ -15,6 +15,7 @@
 #define __BTREE_MODIFY_H__
 
 #include "btree.h"
+#include "btree/find.h"
 
 typedef struct BTreeModifyCallbackInfo
 {
@@ -65,6 +66,11 @@ extern OBTreeModifyResult o_btree_modify(BTreeDescr *desc,
 										 RowLockMode lockMode,
 										 BTreeLocationHint *hint,
 										 BTreeModifyCallbackInfo *callbackInfo);
+extern OBTreeModifyResult o_btree_modify_batch(BTreeDescr *desc,
+											   OBTreeInsertListItem *tuples,
+											   OXid oxid, CommitSeqNo csn,
+											   RowLockMode lockMode,
+											   BTreeModifyCallbackInfo *callbackInfo);
 extern OBTreeModifyResult o_btree_delete_moved_partitions(BTreeDescr *desc,
 														  Pointer key,
 														  BTreeKeyType keyType,

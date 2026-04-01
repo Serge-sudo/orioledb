@@ -52,6 +52,8 @@ static ReadPageResult btree_find_try_read_page(OBTreeFindPageContext *context,
 											   void *key, BTreeKeyType keyType,
 											   PartialPageState *partial,
 											   bool loadHikeysChunk);
+static void btree_find_trim_batch_to_page(OBTreeFindPageContext *context,
+										  Page page);
 
 static OffsetNumber btree_page_binary_search_chunks(BTreeDescr *desc, Page p,
 													Pointer key,
@@ -78,6 +80,49 @@ init_page_find_context(OBTreeFindPageContext *context, BTreeDescr *desc,
 	context->parentImg = NULL;
 	O_TUPLE_SET_NULL(context->insertTuple);
 	O_TUPLE_SET_NULL(context->lokey.tuple);
+	context->batch = NULL;
+	context->batchRest = NULL;
+}
+
+static void
+btree_find_trim_batch_to_page(OBTreeFindPageContext *context, Page page)
+{
+	OBTreeInsertListItem *cur,
+			   *prev = NULL;
+	OTuple		hikey;
+
+	if (!context->batch)
+		return;
+
+	if (O_PAGE_IS(page, RIGHTMOST))
+		return;
+
+	BTREE_PAGE_GET_HIKEY(hikey, page);
+
+	cur = context->batch;
+	while (cur != NULL)
+	{
+		if (o_btree_cmp(context->desc,
+						&cur->tuple, BTreeKeyLeafTuple,
+						&hikey, BTreeKeyNonLeafKey) < 0)
+		{
+			prev = cur;
+			cur = cur->next;
+		}
+		else
+		{
+			break;
+		}
+	}
+
+	if (cur == NULL)
+		return;
+
+	context->batchRest = cur;
+	if (prev)
+		prev->next = NULL;
+	else
+		context->batch = NULL;
 }
 
 
@@ -417,6 +462,7 @@ find_page(OBTreeFindPageContext *context, void *key, BTreeKeyType keyType,
 	context->imgUndoLoc = InvalidUndoLocation;
 	context->partial.isPartial = false;
 	context->index = 0;
+	context->batchRest = NULL;
 
 	if (!tryFlag)
 	{
@@ -718,6 +764,11 @@ find_page(OBTreeFindPageContext *context, void *key, BTreeKeyType keyType,
 
 		if (level == targetLevel || (imageFlag && level <= targetLevel))
 		{
+			if (modifyFlag && !imageFlag && level == 0)
+			{
+				btree_find_trim_batch_to_page(context, intCxt.pagePtr);
+			}
+
 			if (intCxt.haveLock)
 			{
 				if (!modifyFlag)

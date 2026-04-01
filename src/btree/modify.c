@@ -100,7 +100,9 @@ static OBTreeModifyResult o_btree_normal_modify(BTreeDescr *desc,
 												RowLockMode lockMode,
 												BTreeLocationHint *hint,
 												BTreeLeafTupleDeletedStatus deleted,
-												BTreeModifyCallbackInfo *callbackInfo);
+												BTreeModifyCallbackInfo *callbackInfo,
+												OBTreeInsertListItem *batch,
+												OBTreeInsertListItem **batchRest);
 
 /*
  * Perform modification of btree leaf tuple, when page is alredy located
@@ -990,12 +992,15 @@ o_btree_normal_modify(BTreeDescr *desc, BTreeOperationType action,
 					  OXid opOxid, CommitSeqNo opCsn,
 					  RowLockMode lockMode, BTreeLocationHint *hint,
 					  BTreeLeafTupleDeletedStatus deleted,
-					  BTreeModifyCallbackInfo *callbackInfo)
+					  BTreeModifyCallbackInfo *callbackInfo,
+					  OBTreeInsertListItem *batch,
+					  OBTreeInsertListItem **batchRest)
 {
 	OBTreeFindPageContext pageFindContext;
 	int			pageReserveKind;
 	Jsonb	   *params = NULL;
 	OFindPageResult findResult;
+	OBTreeModifyResult result;
 
 	if (STOPEVENTS_ENABLED())
 		params = prepare_modify_start_params(desc);
@@ -1021,6 +1026,12 @@ o_btree_normal_modify(BTreeDescr *desc, BTreeOperationType action,
 	init_page_find_context(&pageFindContext, desc, COMMITSEQNO_INPROGRESS,
 						   BTREE_PAGE_FIND_MODIFY | BTREE_PAGE_FIND_FIX_LEAF_SPLIT);
 
+	pageFindContext.batch = batch;
+	pageFindContext.batchRest = NULL;
+
+	if (batch)
+		Assert(action == BTreeOperationInsert && tupleType == BTreeKeyLeafTuple);
+
 	if (action == BTreeOperationInsert && tupleType == BTreeKeyLeafTuple)
 	{
 		pageFindContext.insertTuple = tuple;
@@ -1040,6 +1051,9 @@ o_btree_normal_modify(BTreeDescr *desc, BTreeOperationType action,
 		Assert(action == BTreeOperationInsert);
 		Assert(tupleType == BTreeKeyLeafTuple);
 
+		if (batchRest)
+			*batchRest = pageFindContext.batchRest;
+
 		if (desc->undoType != UndoLogNone)
 		{
 			release_undo_size(desc->undoType);
@@ -1052,10 +1066,15 @@ o_btree_normal_modify(BTreeDescr *desc, BTreeOperationType action,
 	}
 	Assert(findResult == OFindPageResultSuccess);
 
-	return o_btree_modify_internal(&pageFindContext, action, tuple, tupleType,
-								   key, keyType, opOxid, opCsn,
-								   lockMode, deleted, pageReserveKind,
-								   callbackInfo);
+	result = o_btree_modify_internal(&pageFindContext, action, tuple, tupleType,
+									 key, keyType, opOxid, opCsn,
+									 lockMode, deleted, pageReserveKind,
+									 callbackInfo);
+
+	if (batchRest)
+		*batchRest = pageFindContext.batchRest;
+
+	return result;
 }
 
 #include "tableam/descr.h"
@@ -1463,7 +1482,40 @@ o_btree_modify(BTreeDescr *desc, BTreeOperationType action,
 {
 	return o_btree_normal_modify(desc, action, tuple, tupleType,
 								 key, keyType, oxid, csn, lockMode,
-								 hint, BTreeLeafTupleNonDeleted, callbackInfo);
+								 hint, BTreeLeafTupleNonDeleted, callbackInfo,
+								 NULL, NULL);
+}
+
+OBTreeModifyResult
+o_btree_modify_batch(BTreeDescr *desc,
+					 OBTreeInsertListItem *tuples,
+					 OXid oxid, CommitSeqNo csn,
+					 RowLockMode lockMode,
+					 BTreeModifyCallbackInfo *callbackInfo)
+{
+	OBTreeInsertListItem *current = tuples;
+	OBTreeModifyResult result = OBTreeModifyResultInserted;
+
+	while (current != NULL)
+	{
+		OBTreeInsertListItem *nextBatch = current->next;
+		OBTreeInsertListItem *batchRest = NULL;
+
+		result = o_btree_normal_modify(desc, BTreeOperationInsert,
+									   current->tuple, BTreeKeyLeafTuple,
+									   (Pointer) &current->tuple, BTreeKeyLeafTuple,
+									   oxid, csn, lockMode,
+									   NULL, BTreeLeafTupleNonDeleted,
+									   callbackInfo,
+									   nextBatch, &batchRest);
+
+		if (result != OBTreeModifyResultInserted)
+			return result;
+
+		current = batchRest;
+	}
+
+	return result;
 }
 
 OBTreeModifyResult
@@ -1481,7 +1533,8 @@ o_btree_delete_moved_partitions(BTreeDescr *desc, Pointer key,
 								 nullTup, BTreeKeyNone,
 								 key, keyType, oxid, csn, RowLockUpdate,
 								 hint, BTreeLeafTupleMovedPartitions,
-								 callbackInfo);
+								 callbackInfo,
+								 NULL, NULL);
 }
 
 OBTreeModifyResult
@@ -1499,7 +1552,8 @@ o_btree_delete_pk_changed(BTreeDescr *desc, Pointer key,
 								 nullTup, BTreeKeyNone,
 								 key, keyType, oxid, csn, RowLockUpdate,
 								 hint, BTreeLeafTuplePKChanged,
-								 callbackInfo);
+								 callbackInfo,
+								 NULL, NULL);
 }
 
 bool
@@ -1520,7 +1574,8 @@ o_btree_autonomous_insert(BTreeDescr *desc, OTuple tuple)
 										   COMMITSEQNO_INPROGRESS,
 										   RowLockUpdate,
 										   NULL, BTreeLeafTupleNonDeleted,
-										   &nullCallbackInfo);
+										   &nullCallbackInfo,
+										   NULL, NULL);
 			/* no version is necessary here for system trees other than OTable */
 			o_wal_insert(desc, tuple, REPLICA_IDENTITY_DEFAULT, O_TABLE_INVALID_VERSION);
 		}
@@ -1541,7 +1596,8 @@ o_btree_autonomous_insert(BTreeDescr *desc, OTuple tuple)
 									   COMMITSEQNO_INPROGRESS,
 									   RowLockUpdate,
 									   NULL, BTreeLeafTupleNonDeleted,
-									   &nullCallbackInfo);
+									   &nullCallbackInfo,
+									   NULL, NULL);
 	}
 
 	return (result == OBTreeModifyResultInserted);
@@ -1567,7 +1623,8 @@ o_btree_autonomous_delete(BTreeDescr *desc, OTuple key, BTreeKeyType keyType,
 										   get_current_oxid(), COMMITSEQNO_INPROGRESS,
 										   RowLockUpdate,
 										   hint, BTreeLeafTupleNonDeleted,
-										   &nullCallbackInfo);
+										   &nullCallbackInfo,
+										   NULL, NULL);
 			Assert(IS_SYS_TREE_OIDS(desc->oids));
 			/* no version is necessary here for system trees other than OTable */
 			if (keyType == BTreeKeyLeafTuple)
@@ -1591,7 +1648,8 @@ o_btree_autonomous_delete(BTreeDescr *desc, OTuple key, BTreeKeyType keyType,
 									   InvalidOXid, COMMITSEQNO_INPROGRESS,
 									   RowLockUpdate,
 									   hint, BTreeLeafTupleNonDeleted,
-									   &nullCallbackInfo);
+									   &nullCallbackInfo,
+									   NULL, NULL);
 	}
 
 	return (result == OBTreeModifyResultDeleted);

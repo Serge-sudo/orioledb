@@ -20,6 +20,7 @@
 #include "btree/split.h"
 #include "btree/page_contents.h"
 #include "btree/page_chunks.h"
+#include "btree/page_state.h"
 #include "btree/undo.h"
 #include "checkpoint/checkpoint.h"
 #include "recovery/recovery.h"
@@ -430,6 +431,7 @@ typedef struct
 	int			index;
 	int			pgprocno;
 	bool		inserted;
+	bool		localBatch;
 } TupleWaiterInfo;
 
 /*
@@ -463,10 +465,78 @@ get_tuple_waiter_infos(BTreeDescr *desc,
 		tupleWaiterInfo->pgprocno = tupleWaiterProcnums[i];
 		tupleWaiterInfo->index = i;
 		tupleWaiterInfo->inserted = false;
+		tupleWaiterInfo->localBatch = false;
 		totalSize += tupleWaiterInfo->item.size;
 	}
 
 	return totalSize;
+}
+
+static int
+append_batch_tuple_infos(OBTreeFindPageContext *context,
+						 OBTreeInsertListItem *batch,
+						 TupleWaiterInfo tupleWaiterInfos[BTREE_PAGE_MAX_SPLIT_ITEMS],
+						 int startIndex,
+						 int *totalSize)
+{
+	BTreeDescr *desc = context->desc;
+	OBTreeInsertListItem *lastInserted = NULL;
+	int			index = startIndex;
+
+	while (batch != NULL && index < BTREE_PAGE_MAX_SPLIT_ITEMS)
+	{
+		Size		tuplen = o_btree_len(desc, batch->tuple, OTupleLength);
+		Size		size = BTreeLeafTuphdrSize + MAXALIGN(tuplen);
+		BTreeLeafTuphdr *tuphdr;
+		Pointer		data;
+
+		data = palloc(size);
+		tuphdr = (BTreeLeafTuphdr *) data;
+
+		tuphdr->deleted = false;
+		tuphdr->undoLocation = InvalidUndoLocation;
+		tuphdr->formatFlags = 0;
+		tuphdr->chainHasLocks = false;
+		tuphdr->xactInfo = context->insertXactInfo;
+
+		memcpy(data + BTreeLeafTuphdrSize, batch->tuple.data, tuplen);
+		if (tuplen != MAXALIGN(tuplen))
+			memset(data + BTreeLeafTuphdrSize + tuplen, 0,
+				   MAXALIGN(tuplen) - tuplen);
+
+		tupleWaiterInfos[index].item.flags = batch->tuple.formatFlags;
+		tupleWaiterInfos[index].item.data = data;
+		tupleWaiterInfos[index].item.size = size;
+		tupleWaiterInfos[index].pgprocno = PAGE_STATE_INVALID_PROCNO;
+		tupleWaiterInfos[index].index = index;
+		tupleWaiterInfos[index].inserted = false;
+		tupleWaiterInfos[index].localBatch = true;
+
+		if (totalSize)
+			*totalSize += size;
+
+		index++;
+		lastInserted = batch;
+		batch = batch->next;
+	}
+
+	if (batch != NULL)
+	{
+		OBTreeInsertListItem *restHead = batch;
+		OBTreeInsertListItem *restTail = restHead;
+
+		while (restTail->next)
+			restTail = restTail->next;
+
+		restTail->next = context->batchRest;
+		context->batchRest = restHead;
+		if (lastInserted)
+			lastInserted->next = NULL;
+		else
+			context->batch = NULL;
+	}
+
+	return index;
 }
 
 static int
@@ -820,7 +890,8 @@ static bool
 o_btree_insert_item_with_waiters(BTreeInsertStackItem *insert_item,
 								 int reserve_kind,
 								 int tupleWaiterProcnums[BTREE_PAGE_MAX_SPLIT_ITEMS],
-								 int tupleWaitersCount)
+								 int tupleWaitersCount,
+								 OBTreeInsertListItem *batch)
 {
 	BTreeDescr *desc = insert_item->context->desc;
 	OBTreeFindPageContext *curContext = insert_item->context;
@@ -828,6 +899,7 @@ o_btree_insert_item_with_waiters(BTreeInsertStackItem *insert_item,
 	BTreeSplitItems newItems;
 	int			i,
 				waitersWakeupCount = 0;
+	int			localBatchInserted = 0;
 	CommitSeqNo csn;
 	bool		needsUndo;
 	OffsetNumber offset;
@@ -842,6 +914,11 @@ o_btree_insert_item_with_waiters(BTreeInsertStackItem *insert_item,
 									   tupleWaiterProcnums,
 									   tupleWaiterInfos,
 									   tupleWaitersCount);
+	tupleWaitersCount = append_batch_tuple_infos(curContext,
+												 batch,
+												 tupleWaiterInfos,
+												 tupleWaitersCount,
+												 &totalSize);
 
 	blkno = curContext->items[curContext->index].blkno;
 	Assert(OInMemoryBlknoIsValid(blkno));
@@ -875,8 +952,6 @@ o_btree_insert_item_with_waiters(BTreeInsertStackItem *insert_item,
 			else
 			{
 				TupleWaiterInfo *waiterInfo = &tupleWaiterInfos[i - 1];
-				OPageWaiterShmemState *lockerState = &lockerStates[waiterInfo->pgprocno];
-
 				tuple.formatFlags = waiterInfo->item.flags;
 				tuple.data = waiterInfo->item.data + BTreeLeafTuphdrSize;
 				tuphdr = *((BTreeLeafTuphdr *) waiterInfo->item.data);
@@ -909,15 +984,22 @@ o_btree_insert_item_with_waiters(BTreeInsertStackItem *insert_item,
 				}
 
 				START_CRIT_SECTION();
-				if (desc->undoType != UndoLogNone)
+				if (desc->undoType != UndoLogNone && !waiterInfo->localBatch)
 				{
+					OPageWaiterShmemState *lockerState = &lockerStates[waiterInfo->pgprocno];
+
 					steal_reserved_undo_size(desc->undoType,
 											 lockerState->reservedUndoSize);
 					make_waiter_undo_record(desc, blkno,
 											waiterInfo->pgprocno,
 											lockerState);
 				}
-				lockerState->inserted = true;
+				if (!waiterInfo->localBatch)
+				{
+					OPageWaiterShmemState *lockerState = &lockerStates[waiterInfo->pgprocno];
+
+					lockerState->inserted = true;
+				}
 			}
 
 			page_locator_insert_item(p, &loc, MAXALIGN(tuplen) + BTreeLeafTuphdrSize);
@@ -980,22 +1062,29 @@ o_btree_insert_item_with_waiters(BTreeInsertStackItem *insert_item,
 	{
 		if (tupleWaiterInfos[i].inserted)
 		{
-			OPageWaiterShmemState *lockerState = &lockerStates[tupleWaiterInfos[i].pgprocno];
-
-			tupleWaiterProcnums[waitersWakeupCount++] = tupleWaiterInfos[i].pgprocno;
-
-			if (desc->undoType != UndoLogNone)
+			if (tupleWaiterInfos[i].localBatch)
 			{
-				steal_reserved_undo_size(desc->undoType,
-										 lockerState->reservedUndoSize);
-				make_waiter_undo_record(desc, blkno,
-										tupleWaiterInfos[i].pgprocno,
-										lockerState);
+				localBatchInserted++;
+			}
+			else
+			{
+				OPageWaiterShmemState *lockerState = &lockerStates[tupleWaiterInfos[i].pgprocno];
+
+				tupleWaiterProcnums[waitersWakeupCount++] = tupleWaiterInfos[i].pgprocno;
+
+				if (desc->undoType != UndoLogNone)
+				{
+					steal_reserved_undo_size(desc->undoType,
+											 lockerState->reservedUndoSize);
+					make_waiter_undo_record(desc, blkno,
+											tupleWaiterInfos[i].pgprocno,
+											lockerState);
+				}
 			}
 		}
 	}
 
-	Assert(items.itemsCount + waitersWakeupCount == newItems.itemsCount);
+	Assert(items.itemsCount + waitersWakeupCount + localBatchInserted == newItems.itemsCount);
 
 	if (!split)
 	{
@@ -1247,7 +1336,7 @@ o_btree_insert_item(BTreeInsertStackItem *insert_item, int reserve_kind)
 		OBTreeFindPageContext *curContext = insert_item->context;
 		bool		next = false;
 		int			tupleWaiterProcnums[BTREE_PAGE_MAX_SPLIT_ITEMS];
-		int			tupleWaitersCount;
+		int			tupleWaitersCount = 0;
 
 		Assert(desc->ppool->numPagesReserved[reserve_kind] >= 2);
 
@@ -1338,16 +1427,22 @@ o_btree_insert_item(BTreeInsertStackItem *insert_item, int reserve_kind)
 
 		if (insert_item->level == 0 && !insert_item->replace)
 		{
-			tupleWaitersCount = get_waiters_with_tuples(desc, blkno, tupleWaiterProcnums);
-		}
-		else
-			tupleWaitersCount = 0;
+			bool		hasBatch = curContext->batch != NULL;
 
-		if (tupleWaitersCount > 0)
-			next = o_btree_insert_item_with_waiters(insert_item,
-													reserve_kind,
-													tupleWaiterProcnums,
-													tupleWaitersCount);
+			tupleWaitersCount = get_waiters_with_tuples(desc, blkno, tupleWaiterProcnums);
+
+			if (tupleWaitersCount > 0 || hasBatch)
+				next = o_btree_insert_item_with_waiters(insert_item,
+														reserve_kind,
+														tupleWaiterProcnums,
+														tupleWaitersCount,
+														curContext->batch);
+			else
+				next = o_btree_insert_item_no_waiters(insert_item,
+													  reserve_kind);
+
+			curContext->batch = NULL;
+		}
 		else
 			next = o_btree_insert_item_no_waiters(insert_item,
 												  reserve_kind);

@@ -32,6 +32,12 @@ struct PartialPageState
 	bool		chunkIsLoaded[BTREE_PAGE_MAX_CHUNKS];
 };
 
+typedef struct OBTreeInsertListItem
+{
+	OTuple		tuple;
+	struct OBTreeInsertListItem *next;
+} OBTreeInsertListItem;
+
 typedef struct
 {
 	BTreeDescr *desc;
@@ -47,6 +53,8 @@ typedef struct
 	OBtreePageFindItem items[ORIOLEDB_MAX_DEPTH];
 	OTupleXactInfo insertXactInfo;
 	OTuple		insertTuple;
+	OBTreeInsertListItem *batch;
+	OBTreeInsertListItem *batchRest;
 
 	/*
 	 * When BTREE_PAGE_FIND_LOKEY_SIBLING is not set, then lokey contains
