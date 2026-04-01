@@ -1924,13 +1924,187 @@ orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	else
 	{
 		/*
-		 * Tuples are sorted - process them as a batch.
-		 * For now, we still call orioledb_tuple_insert for each tuple,
-		 * but we've verified they are sorted which could enable future
-		 * optimizations.
+		 * Tuples are sorted - use batch insert optimization.
+		 * We still need to handle each tuple's preparation (CTID, bridge,
+		 * TOAST) individually, but we can batch the primary index insertions.
 		 */
+		OSnapshot	oSnapshot;
+		OXid		oxid;
+		OIndexDescr *primary = GET_PRIMARY(descr);
+		OTupleListItem *tuple_list_head = NULL;
+		OTupleListItem *tuple_list_tail = NULL;
+		OBTreeFindPageContext context;
+		MemoryContext batch_context;
+		MemoryContext old_context;
+		bool		all_success = true;
+
+		fill_current_oxid_osnapshot(&oxid, &oSnapshot);
+		CheckCmdReplicaIdentity(relation, CMD_INSERT);
+
+		/* Create temporary memory context for batch operations */
+		batch_context = AllocSetContextCreate(CurrentMemoryContext,
+											  "OrioleDB batch insert context",
+											  ALLOCSET_DEFAULT_SIZES);
+		old_context = MemoryContextSwitchTo(batch_context);
+
+		/* Prepare all tuples and build linked list */
 		for (i = 0; i < ntuples; i++)
-			orioledb_tuple_insert(relation, slots[i], cid, options, bistate);
+		{
+			TupleTableSlot *slot = slots[i];
+			OTupleListItem *item;
+			OTuple		tup;
+
+			/* Prepare the slot */
+			if (slot->tts_ops != descr->newTuple->tts_ops ||
+				(((OTableSlot *) slot)->descr != NULL &&
+				 ((OTableSlot *) slot)->descr != descr))
+			{
+				((OTableSlot *) descr->newTuple)->descr = descr;
+				ExecCopySlot(descr->newTuple, slot);
+				slot = descr->newTuple;
+				slots[i] = slot;	/* Update array with prepared slot */
+			}
+
+			/* Handle CTID generation if needed */
+			if (primary->primaryIsCtid)
+			{
+				ItemPointerData iptr;
+
+				o_btree_load_shmem(&primary->desc);
+				iptr = btree_ctid_get_and_inc(&primary->desc);
+				tts_orioledb_set_ctid(slot, &iptr);
+			}
+
+			/* Handle bridge index if needed */
+			if (descr->bridge)
+				o_apply_new_bridge_index_ctid(descr, relation, slot, oSnapshot.csn, true);
+
+			/* Toast the tuple */
+			tts_orioledb_toast(slot, descr);
+
+			/* Form the tuple and create list item */
+			tup = tts_orioledb_form_tuple(slot, descr);
+			o_btree_check_size_of_tuple(o_tuple_size(tup, &primary->leafSpec),
+										RelationGetRelationName(relation),
+										false);
+
+			item = (OTupleListItem *) MemoryContextAlloc(batch_context,
+														  sizeof(OTupleListItem));
+			item->tuple = tup;
+			item->tuplen = o_tuple_size(tup, &primary->leafSpec);
+			memset(&item->tuphdr, 0, sizeof(BTreeLeafTuphdr));
+			item->tuphdr.deleted = BTreeLeafTupleNonDeleted;
+			item->next = NULL;
+
+			/* Add to list */
+			if (tuple_list_head == NULL)
+			{
+				tuple_list_head = item;
+				tuple_list_tail = item;
+			}
+			else
+			{
+				tuple_list_tail->next = item;
+				tuple_list_tail = item;
+			}
+		}
+
+		/* Initialize find page context for batch insert */
+		init_page_find_context(&context, &primary->desc, oSnapshot.csn,
+							   BTREE_PAGE_FIND_MODIFY | BTREE_PAGE_FIND_BATCH_INSERT);
+		context.tupleList = tuple_list_head;
+
+		/* Process batches by page */
+		while (context.tupleList != NULL && all_success)
+		{
+			OTupleListItem *page_tuples;
+			int			count;
+
+			/* Find page and group tuples that fit */
+			count = find_page_batch_insert(&context, &page_tuples,
+										   BTreeKeyLeafTuple);
+
+			if (count > 0 && page_tuples != NULL)
+			{
+				/* Insert all tuples for this page */
+				o_btree_insert_tuples_to_leaf(&context, page_tuples, false,
+											  PPOOL_RESERVE_INSERT);
+
+				/* Unlock the page */
+				unlock_page(context.items[context.index].blkno);
+			}
+			else
+			{
+				/* Shouldn't happen with sorted tuples */
+				elog(WARNING, "Batch insert failed to group tuples");
+				all_success = false;
+				break;
+			}
+		}
+
+		/* Clean up batch context */
+		MemoryContextSwitchTo(old_context);
+		MemoryContextDelete(batch_context);
+
+		if (!all_success)
+		{
+			/* Fall back to single inserts if batch failed */
+			for (i = 0; i < ntuples; i++)
+				orioledb_tuple_insert(relation, slots[i], cid, options, bistate);
+		}
+		else
+		{
+			/* Success - handle secondary indexes, TOAST values, and WAL */
+			for (i = 0; i < ntuples; i++)
+			{
+				TupleTableSlot *slot = slots[i];
+				OTuple		tup;
+
+				/* Insert into secondary indexes */
+				if (descr->nIndices > 1)
+				{
+					int			j;
+
+					for (j = 1; j < descr->nIndices; j++)
+					{
+						OBTreeModifyResult result;
+						BTreeModifyCallbackInfo callbackInfo =
+						{
+							.waitCallback = NULL,
+							.modifyDeletedCallback = o_insert_callback,
+							.modifyCallback = NULL,
+							.needsUndoForSelfCreated = false,
+							.arg = slot
+						};
+
+						result = o_tbl_index_insert(descr, descr->indices[j], NULL, slot,
+													oxid, oSnapshot.csn, &callbackInfo,
+													UNIQUE_CHECK_YES);
+						if (result != OBTreeModifyResultInserted)
+						{
+							/* Handle uniqueness violation in secondary index */
+							o_report_duplicate(relation, descr->indices[j], slot);
+						}
+					}
+				}
+
+				/* Handle TOAST values */
+				o_toast_insert_values(relation, descr, slot, oxid, oSnapshot.csn);
+
+				/* WAL logging */
+				tup = tts_orioledb_form_tuple(slot, descr);
+				if (primary->desc.storageType == BTreeStoragePersistence)
+					o_wal_insert(&primary->desc, tup,
+								 relation->rd_rel->relreplident, descr->version);
+			}
+
+			/* Flush WAL if needed */
+			if (primary->desc.storageType == BTreeStoragePersistence)
+				flush_local_wal(false, false);
+
+			/* Update statistics */
+			pgstat_count_heap_insert(relation, ntuples);
+		}
 	}
 }
 
