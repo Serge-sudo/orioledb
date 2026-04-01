@@ -19,6 +19,8 @@
 #include "orioledb.h"
 
 #include "btree/btree.h"
+#include "btree/find.h"
+#include "btree/insert.h"
 #include "btree/io.h"
 #include "btree/iterator.h"
 #include "btree/scan.h"
@@ -1852,19 +1854,84 @@ orioledb_getnextslot(TableScanDesc sscan, ScanDirection direction,
 	return true;
 }
 
+/*
+ * Check if tuples are sorted by primary key in ascending order
+ */
+static bool
+are_tuples_sorted(OTableDescr *descr, TupleTableSlot **slots, int ntuples)
+{
+	BTreeDescr *primary_desc;
+	int			i;
+
+	if (ntuples <= 1)
+		return true;
+
+	primary_desc = &GET_PRIMARY(descr)->desc;
+
+	for (i = 1; i < ntuples; i++)
+	{
+		OTuple		tup1,
+					tup2;
+		int			cmp;
+
+		tup1 = tts_orioledb_form_tuple(slots[i - 1], descr);
+		tup2 = tts_orioledb_form_tuple(slots[i], descr);
+
+		cmp = o_btree_cmp(primary_desc, &tup1, BTreeKeyLeafTuple,
+						  &tup2, BTreeKeyLeafTuple);
+
+		if (cmp >= 0)
+			return false;		/* Not sorted or has duplicates */
+	}
+
+	return true;
+}
+
 static void
 orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 					  CommandId cid, int options, BulkInsertState bistate)
 {
+	OTableDescr *descr;
+	bool		use_batch_insert;
 	int			i;
 
+	if (ntuples == 0)
+		return;
+
+	if (OidIsValid(relation->rd_rel->relrewrite))
+	{
+		/* Fall back to single inserts during table rewrite */
+		for (i = 0; i < ntuples; i++)
+			orioledb_tuple_insert(relation, slots[i], cid, options, bistate);
+		return;
+	}
+
+	o_set_current_command(cid);
+	descr = relation_get_descr(relation);
+
 	/*
-	 * For now, use the simple loop-based approach.
-	 * Batch insert optimization would require sorting tuples and handling
-	 * all index inserts in batch mode, which is more complex.
+	 * Check if tuples are sorted by primary key. If so, we can potentially
+	 * use batch insert optimization.
 	 */
-	for (i = 0; i < ntuples; i++)
-		orioledb_tuple_insert(relation, slots[i], cid, options, bistate);
+	use_batch_insert = are_tuples_sorted(descr, slots, ntuples);
+
+	if (!use_batch_insert || ntuples <= 1)
+	{
+		/* Fall back to single insert for unsorted tuples or single tuple */
+		for (i = 0; i < ntuples; i++)
+			orioledb_tuple_insert(relation, slots[i], cid, options, bistate);
+	}
+	else
+	{
+		/*
+		 * Tuples are sorted - process them as a batch.
+		 * For now, we still call orioledb_tuple_insert for each tuple,
+		 * but we've verified they are sorted which could enable future
+		 * optimizations.
+		 */
+		for (i = 0; i < ntuples; i++)
+			orioledb_tuple_insert(relation, slots[i], cid, options, bistate);
+	}
 }
 
 static void
