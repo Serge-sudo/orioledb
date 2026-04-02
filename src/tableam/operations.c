@@ -63,6 +63,10 @@ static OTableModifyResult o_tbl_indices_delete(OTableDescr *descr,
 											   OXid oxid, CommitSeqNo csn,
 											   BTreeLocationHint *hint,
 											   OModifyCallbackArg *arg);
+static void o_tbl_insert_indices(OTableDescr *descr, Relation relation,
+								 TupleTableSlot *slot, OXid oxid, CommitSeqNo csn);
+static void o_tbl_insert_after_indices(OTableDescr *descr, Relation relation,
+									   TupleTableSlot *slot, OXid oxid, CommitSeqNo csn);
 static void o_reserve_undo_for_modification(UndoLogType undoType, int nmodifications);
 static void o_toast_insert_values(Relation rel, OTableDescr *descr,
 								  TupleTableSlot *slot, OXid oxid, CommitSeqNo csn);
@@ -285,17 +289,8 @@ TupleTableSlot *
 o_tbl_insert(OTableDescr *descr, Relation relation,
 			 TupleTableSlot *slot, OXid oxid, CommitSeqNo csn)
 {
-	OTableModifyResult mres;
 	OTuple		tup;
 	OIndexDescr *primary = GET_PRIMARY(descr);
-	BTreeModifyCallbackInfo callbackInfo =
-	{
-		.waitCallback = NULL,
-		.modifyDeletedCallback = o_insert_callback,
-		.modifyCallback = NULL,
-		.needsUndoForSelfCreated = false,
-		.arg = slot
-	};
 
 	CheckCmdReplicaIdentity(relation, CMD_INSERT);
 
@@ -327,6 +322,26 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 								RelationGetRelationName(relation),
 								false);
 
+	o_tbl_insert_indices(descr, relation, slot, oxid, csn);
+	o_tbl_insert_after_indices(descr, relation, slot, oxid, csn);
+
+	return slot;
+}
+
+static void
+o_tbl_insert_indices(OTableDescr *descr, Relation relation,
+					 TupleTableSlot *slot, OXid oxid, CommitSeqNo csn)
+{
+	OTableModifyResult mres;
+	BTreeModifyCallbackInfo callbackInfo =
+	{
+		.waitCallback = NULL,
+		.modifyDeletedCallback = o_insert_callback,
+		.modifyCallback = NULL,
+		.needsUndoForSelfCreated = false,
+		.arg = slot
+	};
+
 	mres.success = (o_tbl_index_insert(descr, descr->indices[0], NULL, slot,
 									   oxid, csn, &callbackInfo, UNIQUE_CHECK_YES) == OBTreeModifyResultInserted);
 	if (!mres.success)
@@ -337,9 +352,16 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 
 		o_report_duplicate(relation, descr->indices[mres.failedIxNum], slot);
 	}
-	else
-		pgstat_count_heap_insert(relation, 1);
+}
 
+static void
+o_tbl_insert_after_indices(OTableDescr *descr, Relation relation,
+						   TupleTableSlot *slot, OXid oxid, CommitSeqNo csn)
+{
+	OTuple		tup;
+	OIndexDescr *primary = GET_PRIMARY(descr);
+
+	pgstat_count_heap_insert(relation, 1);
 	o_toast_insert_values(relation, descr, slot, oxid, csn);
 
 	/* Tuple might be changed in the callback */
@@ -348,8 +370,6 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 	if (primary->desc.storageType == BTreeStoragePersistence &&
 		!orioledb_multi_insert_needs_wal())
 		o_wal_insert(&primary->desc, tup, relation->rd_rel->relreplident, descr->version);
-
-	return slot;
 }
 
 static void
@@ -382,6 +402,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 
 	o_btree_ensure_initialized(&primary->desc);
 	o_reserve_undo_for_modification(desc->undoType, ntuples);
+	CheckCmdReplicaIdentity(relation, CMD_INSERT);
 
 	if (OIDS_EQ_SYS_TREE(desc->oids, SYS_TREES_SHARED_ROOT_INFO))
 		pageReserveKind = PPOOL_RESERVE_SHARED_INFO_INSERT;
@@ -444,7 +465,8 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 		slot = orioledb_multi_insert_get_slot();
 		if (!slot)
 			break;
-		o_tbl_insert(descr, relation, slot, oxid, csn);
+		o_tbl_insert_indices(descr, relation, slot, oxid, csn);
+		o_tbl_insert_after_indices(descr, relation, slot, oxid, csn);
 	}
 }
 
