@@ -417,6 +417,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 		TupleTableSlot *slot = slots[i];
 		OBatchInsertState *state = (OBatchInsertState *) palloc0(sizeof(OBatchInsertState));
 
+		state->slot = slot;
 		state->needs_wal = (primary->desc.storageType == BTreeStoragePersistence);
 		state->relreplident = relation->rd_rel->relreplident;
 		state->version = descr->version;
@@ -462,15 +463,15 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	while (true)
 	{
 		TupleTableSlot *slot;
-		bool		wal_already_done;
+		bool		skip_wal;
 
 		slot = orioledb_multi_insert_get_slot();
 		if (!slot)
 			break;
-		wal_already_done = orioledb_multi_insert_needs_wal();
+		skip_wal = orioledb_multi_insert_needs_wal();
 		o_tbl_insert_indices(descr, relation, slot, oxid, csn);
 		o_tbl_insert_after_indices(descr, relation, slot, oxid, csn,
-								   wal_already_done);
+								   skip_wal);
 	}
 }
 
