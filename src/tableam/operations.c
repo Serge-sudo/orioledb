@@ -63,6 +63,8 @@ static OTableModifyResult o_tbl_indices_delete(OTableDescr *descr,
 											   OXid oxid, CommitSeqNo csn,
 											   BTreeLocationHint *hint,
 											   OModifyCallbackArg *arg);
+static bool o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples);
+static void o_reserve_undo_for_modification(UndoLogType undoType, int nmodifications);
 static void o_toast_insert_values(Relation rel, OTableDescr *descr,
 								  TupleTableSlot *slot, OXid oxid, CommitSeqNo csn);
 static inline bool o_callback_is_modified(OXid oxid, CommitSeqNo csn, OTupleXactInfo xactInfo);
@@ -349,6 +351,125 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 		o_wal_insert(&primary->desc, tup, relation->rd_rel->relreplident, descr->version);
 
 	return slot;
+}
+
+static bool
+o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples)
+{
+	OIndexDescr *primary = GET_PRIMARY(descr);
+	bool		use_ctid = primary->primaryIsCtid;
+
+	if (!use_ctid && ntuples > 1)
+	{
+		int			j;
+
+		for (j = 0; j < ntuples - 1; j++)
+		{
+			OBTreeKeyBound kb1,
+						kb2;
+
+			tts_orioledb_fill_key_bound(slots[j], primary, &kb1);
+			tts_orioledb_fill_key_bound(slots[j + 1], primary, &kb2);
+			if (o_btree_cmp(&primary->desc,
+							&kb1, BTreeKeyBound,
+							&kb2, BTreeKeyBound) > 0)
+				return false;
+		}
+	}
+
+	return true;
+}
+
+static void
+o_reserve_undo_for_modification(UndoLogType undoType, int nmodifications)
+{
+	if (undoType == UndoLogNone)
+		return;
+
+	if (GET_PAGE_LEVEL_UNDO_TYPE(undoType) == undoType)
+	{
+		(void) reserve_undo_size(undoType, nmodifications * O_MODIFY_UNDO_RESERVE_SIZE);
+	}
+	else
+	{
+		(void) reserve_undo_size(undoType, nmodifications * 2 * O_UPDATE_MAX_UNDO_SIZE);
+		(void) reserve_undo_size(GET_PAGE_LEVEL_UNDO_TYPE(undoType), 2 * O_MAX_SPLIT_UNDO_IMAGE_SIZE);
+	}
+}
+
+bool
+o_tbl_batch_insert(OTableDescr *descr, Relation relation,
+				   TupleTableSlot **slots, int ntuples,
+				   OXid oxid, CommitSeqNo csn)
+{
+	OIndexDescr *primary = GET_PRIMARY(descr);
+	BTreeDescr *desc = &primary->desc;
+	bool		use_ctid = primary->primaryIsCtid;
+	int			i;
+	int			pageReserveKind;
+
+	if (!o_can_batch_slots(descr, slots, ntuples))
+		return false;
+
+	o_btree_ensure_initialized(&primary->desc);
+	o_reserve_undo_for_modification(desc->undoType, ntuples);
+
+	if (OIDS_EQ_SYS_TREE(desc->oids, SYS_TREES_SHARED_ROOT_INFO))
+		pageReserveKind = PPOOL_RESERVE_SHARED_INFO_INSERT;
+	else
+		pageReserveKind = PPOOL_RESERVE_INSERT;
+
+	(*desc->ppool->ops->reserve_pages) (desc->ppool, pageReserveKind, 2);
+
+	for (i = ntuples - 1; i >= 0; i--)
+	{
+		TupleTableSlot *slot = slots[i];
+		OBatchInsertState *cur = (OBatchInsertState *) palloc0(sizeof(OBatchInsertState));
+
+		cur->slot = slot;
+		cur->needs_wal = (primary->desc.storageType == BTreeStoragePersistence);
+		cur->relreplident = relation->rd_rel->relreplident;
+		cur->version = descr->version;
+		cur->next = batch;
+		batch = cur;
+
+		if (slot->tts_ops != descr->newTuple->tts_ops ||
+			(((OTableSlot *) slot)->descr != NULL &&
+			 ((OTableSlot *) slot)->descr != descr))
+		{
+			((OTableSlot *) descr->newTuple)->descr = descr;
+			ExecCopySlot(descr->newTuple, slot);
+			slot = descr->newTuple;
+		}
+
+		if (use_ctid)
+		{
+			ItemPointerData iptr;
+
+			iptr = btree_ctid_get_and_inc(&primary->desc);
+			tts_orioledb_set_ctid(slot, &iptr);
+		}
+
+		if (descr->bridge)
+			o_apply_new_bridge_index_ctid(descr, relation, slot, csn, true);
+		tts_orioledb_toast(slot, descr);
+		cur->tuple = tts_orioledb_form_tuple(slot, descr);
+		o_btree_check_size_of_tuple(o_tuple_size(cur->tuple, &primary->leafSpec),
+									RelationGetRelationName(relation),
+									false);
+		cur->tuplen = o_btree_len(&primary->desc, cur->tuple, OTupleLength);
+		cur->leaf_header.deleted = BTreeLeafTupleNonDeleted;
+		cur->leaf_header.formatFlags = 0;
+		cur->leaf_header.chainHasLocks = false;
+		cur->leaf_header.undoLocation = InvalidUndoLocation;
+		if (primary->desc.undoType == UndoLogRegular && !is_recovery_process())
+			cur->leaf_header.undoLocation |= current_command_get_undo_location();
+		cur->leaf_header.xactInfo = OXID_GET_XACT_INFO(oxid,
+													  RowLockUpdate,
+													  false);
+	}
+
+	return true;
 }
 
 static RowLockMode

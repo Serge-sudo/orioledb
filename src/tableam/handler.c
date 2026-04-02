@@ -1852,18 +1852,6 @@ orioledb_getnextslot(TableScanDesc sscan, ScanDirection direction,
 	return true;
 }
 
-typedef struct OBatchInsertState
-{
-	OTuple tuple;
-	BTreeLeafTuphdr leaf_header;
-	LocationIndex tuplen;
-	TupleTableSlot *slot;
-	bool needs_wal;
-	char relreplident;
-	uint32 version;
-	struct OBatchInsertState * next;
-} OBatchInsertState;
-
 OBatchInsertState * batch = NULL;
 
 TupleTableSlot *
@@ -1954,139 +1942,6 @@ orioledb_multi_insert_next(void)
 		batch = batch->next;
 }
 
-static bool
-orioledb_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples)
-{
-	OIndexDescr *primary = GET_PRIMARY(descr);
-	bool		use_ctid = primary->primaryIsCtid;
-
-	/*
-	 * For index-organized (non-ctid) tables the batch insert path requires
-	 * the input to be ordered by the primary key so that each page only
-	 * receives the tuples that belong there (determined by the page high key).
-	 * Check sortedness up-front using key bounds derived from the slots.  If
-	 * the input is not sorted, fall through to per-tuple inserts which handle
-	 * arbitrary order correctly without any pre-conditions.
-	 */
-	if (!use_ctid && ntuples > 1)
-	{
-		bool		sorted = true;
-		int			j;
-
-		for (j = 0; j < ntuples - 1 && sorted; j++)
-		{
-			OBTreeKeyBound kb1,
-						kb2;
-
-			tts_orioledb_fill_key_bound(slots[j], primary, &kb1);
-			tts_orioledb_fill_key_bound(slots[j + 1], primary, &kb2);
-			if (o_btree_cmp(&primary->desc,
-							&kb1, BTreeKeyBound,
-							&kb2, BTreeKeyBound) > 0)
-				return false;
-		}
-	}
-
-	return true;
-}
-
-static void
-reserve_undo_for_modification(UndoLogType undoType, int nmodifications)
-{
-	if (undoType == UndoLogNone)
-		return;
-
-	if (GET_PAGE_LEVEL_UNDO_TYPE(undoType) == undoType)
-	{
-		(void) reserve_undo_size(undoType, nmodifications * O_MODIFY_UNDO_RESERVE_SIZE);
-	}
-	else
-	{
-		(void) reserve_undo_size(undoType, nmodifications * 2 * O_UPDATE_MAX_UNDO_SIZE);
-		(void) reserve_undo_size(GET_PAGE_LEVEL_UNDO_TYPE(undoType), 2 * O_MAX_SPLIT_UNDO_IMAGE_SIZE);
-	}
-}
-
-static void
-create_batch_list (OTableDescr *descr, Relation relation,
-				   TupleTableSlot **slots, int ntuples,
-				   OXid oxid, CommitSeqNo csn)
-{
-	OIndexDescr *primary = GET_PRIMARY(descr);
-	int			i;
-	bool		use_ctid = primary->primaryIsCtid;
-	bool		needs_wal = (primary->desc.storageType == BTreeStoragePersistence);
-	char		relreplident = relation->rd_rel->relreplident;
-	uint32		version = descr->version;
-	OBatchInsertState * cur = NULL, * prev = NULL;
-	BTreeDescr * desc = &primary->desc;
-	int			pageReserveKind;
-
-	if (ntuples <= 0)
-		return;
-
-	o_btree_ensure_initialized(&primary->desc);
-
-	reserve_undo_for_modification(desc->undoType, ntuples);
-
-	if (OIDS_EQ_SYS_TREE(desc->oids, SYS_TREES_SHARED_ROOT_INFO))
-		pageReserveKind = PPOOL_RESERVE_SHARED_INFO_INSERT;
-	else
-		pageReserveKind = PPOOL_RESERVE_INSERT;
-
-	(*desc->ppool->ops->reserve_pages) (desc->ppool, pageReserveKind, 2);
-
-	for (i = ntuples - 1; i >= 0; i--)
-	{
-		TupleTableSlot *slot = slots[i];
-		cur = (OBatchInsertState *) palloc0(sizeof(OBatchInsertState));
-
-		cur->slot = slot;
-		cur->needs_wal = needs_wal;
-		cur->relreplident = relreplident;
-		cur->version = version;
-		cur->next = prev;
-		prev = cur;
-
-		if (slot->tts_ops != descr->newTuple->tts_ops ||
-			(((OTableSlot *) slot)->descr != NULL &&
-			 ((OTableSlot *) slot)->descr != descr))
-		{
-			((OTableSlot *) descr->newTuple)->descr = descr;
-			ExecCopySlot(descr->newTuple, slot);
-			slot = descr->newTuple;
-		}
-
-		if (use_ctid)
-		{
-			ItemPointerData iptr;
-
-			iptr = btree_ctid_get_and_inc(&primary->desc);
-			tts_orioledb_set_ctid(slot, &iptr);
-		}
-
-		if (descr->bridge)
-			o_apply_new_bridge_index_ctid(descr, relation, slot, csn, true);
-		tts_orioledb_toast(slot, descr);
-		cur->tuple = tts_orioledb_form_tuple(slot, descr);
-		o_btree_check_size_of_tuple(o_tuple_size(cur->tuple, &primary->leafSpec),
-									RelationGetRelationName(relation),
-									false);
-		cur->tuplen = o_btree_len(&primary->desc, cur->tuple, OTupleLength);
-		cur->leaf_header.deleted = BTreeLeafTupleNonDeleted;
-		cur->leaf_header.formatFlags = 0;
-		cur->leaf_header.chainHasLocks = false;
-		cur->leaf_header.undoLocation = InvalidUndoLocation;
-		if (primary->desc.undoType == UndoLogRegular && !is_recovery_process())
-			cur->leaf_header.undoLocation |= current_command_get_undo_location();
-		cur->leaf_header.xactInfo = OXID_GET_XACT_INFO(oxid,
-													  RowLockUpdate,
-													  false);
-	}
-
-	batch = cur;
-}
-
 static void
 orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 					  CommandId cid, int options, BulkInsertState bistate)
@@ -2104,13 +1959,11 @@ orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 	descr = relation_get_descr(relation);
 	batch = NULL;
+	fill_current_oxid_osnapshot(&oxid, &oSnapshot);
+	o_set_current_command(cid);
 
-	if (orioledb_can_batch_slots(descr, slots, ntuples))
+	if (o_tbl_batch_insert(descr, relation, slots, ntuples, oxid, oSnapshot.csn))
 	{
-		fill_current_oxid_osnapshot(&oxid, &oSnapshot);
-		o_set_current_command(cid);
-		create_batch_list(descr, relation, slots, ntuples, oxid, oSnapshot.csn);
-
 		while (batch)
 			orioledb_tuple_insert(relation, orioledb_multi_insert_get_slot(), cid, options, bistate);
 		return;
