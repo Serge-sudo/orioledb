@@ -66,7 +66,8 @@ static OTableModifyResult o_tbl_indices_delete(OTableDescr *descr,
 static void o_tbl_insert_indices(OTableDescr *descr, Relation relation,
 								 TupleTableSlot *slot, OXid oxid, CommitSeqNo csn);
 static void o_tbl_insert_after_indices(OTableDescr *descr, Relation relation,
-									   TupleTableSlot *slot, OXid oxid, CommitSeqNo csn);
+									   TupleTableSlot *slot, OXid oxid, CommitSeqNo csn,
+									   bool wal_already_done);
 static void o_reserve_undo_for_modification(UndoLogType undoType, int nmodifications);
 static void o_toast_insert_values(Relation rel, OTableDescr *descr,
 								  TupleTableSlot *slot, OXid oxid, CommitSeqNo csn);
@@ -323,7 +324,7 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 								false);
 
 	o_tbl_insert_indices(descr, relation, slot, oxid, csn);
-	o_tbl_insert_after_indices(descr, relation, slot, oxid, csn);
+	o_tbl_insert_after_indices(descr, relation, slot, oxid, csn, false);
 
 	return slot;
 }
@@ -356,7 +357,8 @@ o_tbl_insert_indices(OTableDescr *descr, Relation relation,
 
 static void
 o_tbl_insert_after_indices(OTableDescr *descr, Relation relation,
-						   TupleTableSlot *slot, OXid oxid, CommitSeqNo csn)
+						   TupleTableSlot *slot, OXid oxid, CommitSeqNo csn,
+						   bool wal_already_done)
 {
 	OTuple		tup;
 	OIndexDescr *primary = GET_PRIMARY(descr);
@@ -368,7 +370,7 @@ o_tbl_insert_after_indices(OTableDescr *descr, Relation relation,
 	tup = tts_orioledb_form_tuple(slot, descr);
 
 	if (primary->desc.storageType == BTreeStoragePersistence &&
-		!orioledb_multi_insert_needs_wal())
+		!wal_already_done)
 		o_wal_insert(&primary->desc, tup, relation->rd_rel->relreplident, descr->version);
 }
 
@@ -460,12 +462,15 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	while (true)
 	{
 		TupleTableSlot *slot;
+		bool		wal_already_done;
 
 		slot = orioledb_multi_insert_get_slot();
 		if (!slot)
 			break;
+		wal_already_done = orioledb_multi_insert_needs_wal();
 		o_tbl_insert_indices(descr, relation, slot, oxid, csn);
-		o_tbl_insert_after_indices(descr, relation, slot, oxid, csn);
+		o_tbl_insert_after_indices(descr, relation, slot, oxid, csn,
+								   wal_already_done);
 	}
 }
 
