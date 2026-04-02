@@ -1957,10 +1957,9 @@ o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples)
 
 	if (!use_ctid && ntuples > 1)
 	{
-		bool		sorted = true;
 		int			j;
 
-		for (j = 0; j < ntuples - 1 && sorted; j++)
+		for (j = 0; j < ntuples - 1; j++)
 		{
 			OBTreeKeyBound kb1,
 						kb2;
@@ -1970,11 +1969,8 @@ o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples)
 			if (o_btree_cmp(&primary->desc,
 							&kb1, BTreeKeyBound,
 							&kb2, BTreeKeyBound) > 0)
-				sorted = false;
+				return false;
 		}
-
-		if (!sorted)
-			return false;
 	}
 
 	return true;
