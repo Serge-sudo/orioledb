@@ -1870,11 +1870,186 @@ orioledb_getnextslot(TableScanDesc sscan, ScanDirection direction,
 	return true;
 }
 
+
+OBatchInsertState *batch_head = NULL;
+OBatchInsertState *batch_tail = NULL;
+
+TupleTableSlot *
+orioledb_multi_insert_get_slot(void)
+{
+	OBatchInsertState * cur = batch_head;
+
+	if (cur)
+	{
+		return cur->slot;
+	}
+
+	return NULL;
+}
+
+TupleTableSlot *
+orioledb_multi_insert_get_orig_slot(void)
+{
+	OBatchInsertState * cur = batch_head;
+
+	if (cur)
+	{
+		return cur->orig_slot;
+	}
+
+	return NULL;
+}
+
+OBatchInsertState *
+orioledb_multi_insert_push(OBatchInsertState *state)
+{
+	if (!batch_head)
+	{
+		batch_head = state;
+		batch_tail = state;
+		batch_head->nitems = 1;
+	}
+	else
+	{
+		int num = batch_tail->nitems + 1;
+		batch_tail->next = state;
+		batch_tail = state;
+		batch_tail->nitems = num;
+	}
+
+	return batch_head;
+}
+
+void
+orioledb_multi_insert_reset_head(void)
+{
+	batch_head = NULL;
+	batch_tail = NULL;
+}
+
+void
+orioledb_multi_insert_set_head(OBatchInsertState *state)
+{
+	batch_head = state;
+}
+
+int
+orioledb_multi_insert_get_nitems(void)
+{
+	if (batch_tail)
+		return Min(batch_tail->nitems, 100);
+
+	return 0;
+}
+
+OTuple
+orioledb_multi_insert_get_tuple(void)
+{
+	OBatchInsertState * cur = batch_head;
+	OTuple		tuple;
+
+	if (cur)
+	{
+		return cur->tuple;
+	}
+
+	O_TUPLE_SET_NULL(tuple);
+	return tuple;
+}
+
+bool
+orioledb_multi_insert_is_finished(void)
+{
+	return batch_head == NULL;
+}
+
+LocationIndex
+orioledb_multi_insert_get_tuplen(void)
+{
+	OBatchInsertState * cur = batch_head;
+
+	if (cur)
+	{
+		return cur->tuplen;
+	}
+
+	return 0;
+}
+
+BTreeLeafTuphdr
+orioledb_multi_insert_get_leaf_header(void)
+{
+	OBatchInsertState * cur = batch_head;
+
+	if (cur)
+	{
+		return cur->leaf_header;
+	}
+
+	BTreeLeafTuphdr result = {0};
+	return result;
+}
+
+void
+orioledb_multi_insert_next(void)
+{
+	if (batch_head)
+		batch_head = batch_head->next;
+}
+
+static bool
+o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples)
+{
+	OIndexDescr *primary = GET_PRIMARY(descr);
+	bool		use_ctid = primary->primaryIsCtid;
+
+	if (!use_ctid && ntuples > 1)
+	{
+		int			j;
+
+		for (j = 0; j < ntuples - 1; j++)
+		{
+			OBTreeKeyBound kb1,
+						kb2;
+
+			tts_orioledb_fill_key_bound(slots[j], primary, &kb1);
+			tts_orioledb_fill_key_bound(slots[j + 1], primary, &kb2);
+			if (o_btree_cmp(&primary->desc,
+							&kb1, BTreeKeyBound,
+							&kb2, BTreeKeyBound) > 0)
+				return false;
+		}
+	}
+
+	return true;
+}
+
 static void
 orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 					  CommandId cid, int options, BulkInsertState bistate)
 {
 	int			i;
+	OTableDescr *descr;
+	OSnapshot	oSnapshot;
+	OXid		oxid;
+
+	if (ntuples <= 0)
+		return;
+
+	if (OidIsValid(relation->rd_rel->relrewrite))
+		return;
+
+	descr = relation_get_descr(relation);
+	batch_head = NULL;
+	batch_tail = NULL;
+
+	if (o_can_batch_slots(descr, slots, ntuples))
+	{
+		fill_current_oxid_osnapshot(&oxid, &oSnapshot);
+		o_set_current_command(cid);
+		o_tbl_batch_insert(descr, relation, slots, ntuples, oxid, oSnapshot.csn);
+		return;
+	}
 
 	for (i = 0; i < ntuples; i++)
 		orioledb_tuple_insert(relation, slots[i], cid, options, bistate);

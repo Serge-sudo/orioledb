@@ -31,6 +31,7 @@
 #include "transam/undo.h"
 #include "tuple/slot.h"
 #include "utils/stopevent.h"
+#include "utils/page_pool.h"
 
 #include "access/heapam.h"
 #include "access/tableam.h"
@@ -63,6 +64,8 @@ static OTableModifyResult o_tbl_indices_delete(OTableDescr *descr,
 											   OXid oxid, CommitSeqNo csn,
 											   BTreeLocationHint *hint,
 											   OModifyCallbackArg *arg);
+static void o_tbl_insert_single_batch(OTableDescr *descr, Relation relation,
+									  TupleTableSlot *orig_slot, TupleTableSlot *slot, OXid oxid, CommitSeqNo csn);
 static void o_toast_insert_values(Relation rel, OTableDescr *descr,
 								  TupleTableSlot *slot, OXid oxid, CommitSeqNo csn);
 static inline bool o_callback_is_modified(OXid oxid, CommitSeqNo csn, OTupleXactInfo xactInfo);
@@ -351,6 +354,123 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 		o_wal_insert(&primary->desc, tup, relation->rd_rel->relreplident, descr->version);
 
 	return slot;
+}
+
+static void
+o_tbl_insert_single_batch(OTableDescr *descr, Relation relation,
+						  TupleTableSlot *orig_slot, TupleTableSlot *slot, OXid oxid, CommitSeqNo csn)
+{
+	OTableModifyResult mres;
+	BTreeModifyCallbackInfo callbackInfo =
+	{
+		.waitCallback = NULL,
+		.modifyDeletedCallback = o_insert_callback,
+		.modifyCallback = NULL,
+		.needsUndoForSelfCreated = false,
+		.arg = orig_slot
+	};
+
+	mres.success = (o_tbl_index_insert(descr, descr->indices[0], NULL, slot,
+									   oxid, csn, &callbackInfo, UNIQUE_CHECK_YES) == OBTreeModifyResultInserted);
+	if (!mres.success)
+	{
+		mres.failedIxNum = 0;
+		mres.action = BTreeOperationInsert;
+		mres.oldTuple = NULL;
+
+		o_report_duplicate(relation, descr->indices[mres.failedIxNum], slot);
+	}
+}
+
+void
+o_tbl_batch_insert(OTableDescr *descr, Relation relation,
+				   TupleTableSlot **slots, int ntuples,
+				   OXid oxid, CommitSeqNo csn)
+{
+	OIndexDescr *primary = GET_PRIMARY(descr);
+	bool		use_ctid = primary->primaryIsCtid;
+	int			i;
+	OBatchInsertState *batch_state = NULL;
+	TupleTableSlot *slot;
+
+	o_btree_ensure_initialized(&primary->desc);
+
+	reserve_undo_size(UndoLogRegular, MAXIMUM_ALIGNOF);
+	orioledb_multi_insert_reset_head();
+
+	for (i = 0; i < ntuples; i++)
+	{
+		slot = slots[i];
+		OBatchInsertState *state = (OBatchInsertState *) palloc0(sizeof(OBatchInsertState));
+
+		state->orig_slot = slot;
+
+		if (slot->tts_ops != descr->newTuple->tts_ops ||
+			(((OTableSlot *) slot)->descr != NULL &&
+			 ((OTableSlot *) slot)->descr != descr))
+		{
+			((OTableSlot *) descr->newTuple)->descr = descr;
+			ExecCopySlot(descr->newTuple, slot);
+			slot = descr->newTuple;
+		}
+
+		state->slot = slot;
+
+		if (use_ctid)
+		{
+			ItemPointerData iptr;
+
+			iptr = btree_ctid_get_and_inc(&primary->desc);
+			tts_orioledb_set_ctid(slot, &iptr);
+		}
+
+		if (descr->bridge)
+			o_apply_new_bridge_index_ctid(descr, relation, slot, csn, true);
+		tts_orioledb_toast(slot, descr);
+		state->tuple = tts_orioledb_form_tuple(slot, descr);
+		o_btree_check_size_of_tuple(o_tuple_size(state->tuple, &primary->leafSpec),
+									RelationGetRelationName(relation),
+									false);
+		state->tuplen = o_btree_len(&primary->desc, state->tuple, OTupleLength);
+		state->leaf_header.deleted = BTreeLeafTupleNonDeleted;
+		state->leaf_header.formatFlags = 0;
+		state->leaf_header.chainHasLocks = false;
+		state->leaf_header.undoLocation = InvalidUndoLocation;
+		if (primary->desc.undoType == UndoLogRegular && !is_recovery_process())
+			state->leaf_header.undoLocation |= current_command_get_undo_location();
+		state->leaf_header.xactInfo = OXID_GET_XACT_INFO(oxid,
+													  RowLockUpdate,
+													  false);
+		batch_state = orioledb_multi_insert_push(state);
+	}
+
+	while ((slot = orioledb_multi_insert_get_slot()) != NULL)
+	{
+		TupleTableSlot *orig_slot = orioledb_multi_insert_get_orig_slot();
+		o_tbl_insert_single_batch(descr, relation, orig_slot, slot, oxid, csn);
+	}
+
+	pgstat_count_heap_insert(relation, ntuples);
+
+	orioledb_multi_insert_set_head(batch_state);
+	while ((slot = orioledb_multi_insert_get_orig_slot()) != NULL)
+	{
+		OTuple tup;
+		o_toast_insert_values(relation, descr, slot, oxid, csn);
+
+		/* Tuple might be changed in the callback */
+		tup = tts_orioledb_form_tuple(slot, descr);
+
+		if (primary->desc.storageType == BTreeStoragePersistence)
+			o_wal_insert(&primary->desc,
+						 tup,
+						 relation->rd_rel->relreplident,
+						 descr->version);
+
+		orioledb_multi_insert_next();
+	}
+
+	orioledb_multi_insert_reset_head();
 }
 
 static RowLockMode

@@ -27,6 +27,7 @@
 #include "recovery/wal.h"
 #include "transam/undo.h"
 #include "transam/oxid.h"
+#include "tableam/handler.h"
 #include "utils/page_pool.h"
 #include "utils/stopevent.h"
 
@@ -967,18 +968,18 @@ prepare_modify_start_params(BTreeDescr *desc)
 }
 
 static void
-reserve_undo_for_modification(UndoLogType undoType)
+reserve_undo_for_modification(UndoLogType undoType, int tupleCount)
 {
 	if (undoType == UndoLogNone)
 		return;
 
 	if (GET_PAGE_LEVEL_UNDO_TYPE(undoType) == undoType)
 	{
-		(void) reserve_undo_size(undoType, O_MODIFY_UNDO_RESERVE_SIZE);
+		(void) reserve_undo_size(undoType, tupleCount * O_MODIFY_UNDO_RESERVE_SIZE);
 	}
 	else
 	{
-		(void) reserve_undo_size(undoType, 2 * O_UPDATE_MAX_UNDO_SIZE);
+		(void) reserve_undo_size(undoType, tupleCount * 2 * O_UPDATE_MAX_UNDO_SIZE);
 		(void) reserve_undo_size(GET_PAGE_LEVEL_UNDO_TYPE(undoType), 2 * O_MAX_SPLIT_UNDO_IMAGE_SIZE);
 	}
 }
@@ -1008,7 +1009,11 @@ o_btree_normal_modify(BTreeDescr *desc, BTreeOperationType action,
 		keyType = tupleType;
 	}
 
-	reserve_undo_for_modification(desc->undoType);
+	/* if we are doing multi-insert, reserve undo for all items at once */
+	if (orioledb_multi_insert_get_nitems() > 0)
+		reserve_undo_for_modification(desc->undoType, orioledb_multi_insert_get_nitems());
+	else
+		reserve_undo_for_modification(desc->undoType, 1);
 
 	if (OIDS_EQ_SYS_TREE(desc->oids, SYS_TREES_SHARED_ROOT_INFO))
 		pageReserveKind = PPOOL_RESERVE_SHARED_INFO_INSERT;
@@ -1186,7 +1191,7 @@ o_btree_insert_unique(BTreeDescr *desc, OTuple tuple, BTreeKeyType tupleType,
 
 	Assert(key != NULL && keyType == BTreeKeyBound);
 
-	reserve_undo_for_modification(desc->undoType);
+	reserve_undo_for_modification(desc->undoType, 1);
 
 	if (OIDS_EQ_SYS_TREE(desc->oids, SYS_TREES_SHARED_ROOT_INFO))
 		pageReserveKind = PPOOL_RESERVE_SHARED_INFO_INSERT;
