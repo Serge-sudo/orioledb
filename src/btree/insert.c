@@ -23,6 +23,7 @@
 #include "btree/undo.h"
 #include "checkpoint/checkpoint.h"
 #include "recovery/recovery.h"
+#include "tableam/handler.h"
 #include "transam/undo.h"
 #include "tuple/format.h"
 #include "utils/page_pool.h"
@@ -1218,6 +1219,125 @@ o_btree_insert_item_no_waiters(BTreeInsertStackItem *insert_item,
 	}
 }
 
+static bool
+o_btree_insert_item_with_batch(BTreeInsertStackItem *insert_item,
+								int reserve_kind)
+{
+	BTreeDescr *desc = insert_item->context->desc;
+	OBTreeFindPageContext *curContext = insert_item->context;
+	OInMemoryBlkno blkno;
+	Page		p;
+	BTreePageItemLocator loc;
+	bool first = true;
+
+	blkno = curContext->items[curContext->index].blkno;
+	Assert(OInMemoryBlknoIsValid(blkno));
+	p = O_GET_IN_MEMORY_PAGE(blkno);
+
+	// elog(WARNING, "Trying batch insert for page %u %u %u %u %u", blkno, (int)BTREE_PAGE_ITEMS_COUNT(p),(int) MAXALIGN(insert_item->tuplen),(int) BTreeLeafTuphdrSize, (int)BTREE_PAGE_FREE_SPACE(p));
+
+	if (!(1 <= BTREE_PAGE_ITEMS_COUNT(p) &&
+		MAXALIGN(insert_item->tuplen) + BTreeLeafTuphdrSize + MAXALIGN(sizeof(LocationIndex)) <= BTREE_PAGE_FREE_SPACE(p)))
+	{
+		bool res =  o_btree_insert_item_no_waiters(insert_item, reserve_kind);
+		// elog(WARNING, "Batch insert failed for page %u. Fallback to non-batch insert.", blkno);
+		orioledb_multi_insert_next();
+		return res;
+	}
+
+	page_block_reads(blkno);
+
+	while(true)
+	{
+		LocationIndex tuplen;
+		LocationIndex keyLen;
+		BTreePageHeader *header = (BTreePageHeader *) p;
+		BTreeLeafTuphdr tuphdr;
+		OTuple		tuple;
+		Pointer		ptr;
+
+		// elog(WARNING, "new insert");
+		if (first)
+		{
+			loc = curContext->items[curContext->index].locator;
+			tuple = insert_item->tuple;
+			tuplen = insert_item->tuplen;
+			tuphdr = *((BTreeLeafTuphdr *) insert_item->tupheader);
+			first = false;
+			START_CRIT_SECTION();
+		}
+		else
+		{
+			tuple.formatFlags = orioledb_multi_insert_get_tuple().formatFlags;
+			memcpy(tuple.data, orioledb_multi_insert_get_tuple().data, orioledb_multi_insert_get_tuplen());
+			tuphdr = orioledb_multi_insert_get_leaf_header();
+			tuplen = orioledb_multi_insert_get_tuplen();
+
+			if (!O_PAGE_IS(p, RIGHTMOST))
+			{
+				OTuple		hikey;
+
+				hikey = page_get_hikey(p);
+				if (o_btree_cmp(desc, &tuple, BTreeKeyLeafTuple, &hikey, BTreeKeyNonLeafKey) >= 0)
+					break;
+
+			}
+
+			/*
+			 * Search for the appropriate location for this tuple.  When we know
+			 * the tuples are already in order and there are no existing items
+			 * after the previous insert position on this page, we can append to
+			 * the tail without calling btree_page_search() again.
+			 */
+			btree_page_search(desc, p, (Pointer) &tuple,
+								BTreeKeyLeafTuple, NULL, &loc);
+
+			if (!page_locator_fits_new_item(p, &loc, orioledb_multi_insert_get_tuplen() + BTreeLeafTuphdrSize))
+				break;
+
+			if (BTREE_PAGE_LOCATOR_IS_VALID(p, &loc))
+			{
+				OTuple		existingTup;
+
+				BTREE_PAGE_READ_LEAF_TUPLE(existingTup, p, &loc);
+
+				if (o_btree_cmp(desc, &tuple, BTreeKeyLeafTuple, &existingTup, BTreeKeyLeafTuple) == 0)
+					break;
+			}
+
+			START_CRIT_SECTION();
+
+			if (desc->undoType != UndoLogNone)
+				make_undo_record(desc, tuple, true,
+							 	 BTreeOperationInsert, blkno,
+								 O_PAGE_GET_CHANGE_COUNT(p),
+								 NULL);
+		}
+
+		page_locator_insert_item(p, &loc, MAXALIGN(tuplen) + BTreeLeafTuphdrSize);
+		header->prevInsertOffset = BTREE_PAGE_LOCATOR_GET_OFFSET(p, &loc);
+		keyLen = MAXALIGN(o_btree_len(desc, tuple, OTupleKeyLengthNoVersion));
+		header->maxKeyLen = Max(header->maxKeyLen, keyLen);
+
+		/* Copy new tuple and header */
+		ptr = BTREE_PAGE_LOCATOR_GET_ITEM(p, &loc);
+		memcpy(ptr, &tuphdr, BTreeLeafTuphdrSize);
+		ptr += BTreeLeafTuphdrSize;
+		memcpy(ptr, tuple.data, tuplen);
+		BTREE_PAGE_SET_ITEM_FLAGS(p, &loc, tuple.formatFlags);
+
+		if (!(tuple.formatFlags & O_TUPLE_FLAGS_FIXED_FORMAT))
+			header->chunkDesc[loc.chunkOffset].chunkKeysFixed = 0;
+		MARK_DIRTY(desc, blkno);
+
+		END_CRIT_SECTION();
+		orioledb_multi_insert_next();
+	}
+	unlock_page(blkno);
+
+	return true;
+}
+
 static void
 o_btree_insert_item(BTreeInsertStackItem *insert_item, int reserve_kind)
 {
@@ -1343,7 +1463,9 @@ o_btree_insert_item(BTreeInsertStackItem *insert_item, int reserve_kind)
 		else
 			tupleWaitersCount = 0;
 
-		if (tupleWaitersCount > 0)
+		if (insert_item->level == 0 && orioledb_multi_insert_get_slot())
+			next = o_btree_insert_item_with_batch(insert_item, reserve_kind);
+		else if (tupleWaitersCount > 0)
 			next = o_btree_insert_item_with_waiters(insert_item,
 													reserve_kind,
 													tupleWaiterProcnums,

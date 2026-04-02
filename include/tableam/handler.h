@@ -223,4 +223,10 @@ typedef ParallelOScanDescData *ParallelOScanDesc;
 
 extern bool in_nontransactional_truncate;
 
+extern TupleTableSlot * orioledb_multi_insert_get_slot(void);
+extern void orioledb_multi_insert_next(void);
+extern OTuple orioledb_multi_insert_get_tuple(void);
+extern LocationIndex orioledb_multi_insert_get_tuplen(void);
+extern BTreeLeafTuphdr orioledb_multi_insert_get_leaf_header(void);
+
 #endif
