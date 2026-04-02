@@ -437,9 +437,13 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 													  false);
 	}
 
-	while (batch)
+	while (true)
 	{
-		TupleTableSlot *slot = orioledb_multi_insert_get_slot();
+		TupleTableSlot *slot;
+
+		slot = orioledb_multi_insert_get_slot();
+		if (!slot)
+			break;
 		o_tbl_insert(descr, relation, slot, oxid, csn);
 	}
 }
