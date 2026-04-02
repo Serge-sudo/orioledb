@@ -369,7 +369,7 @@ o_reserve_undo_for_modification(UndoLogType undoType, int nmodifications)
 	}
 }
 
-bool
+void
 o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 				   TupleTableSlot **slots, int ntuples,
 				   OXid oxid, CommitSeqNo csn)
@@ -437,17 +437,11 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 													  false);
 	}
 
-	for (;;)
+	while (batch)
 	{
 		TupleTableSlot *slot = orioledb_multi_insert_get_slot();
-
-		if (!slot)
-			break;
-
 		o_tbl_insert(descr, relation, slot, oxid, csn);
 	}
-
-	return true;
 }
 
 static RowLockMode
