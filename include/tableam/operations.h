@@ -94,7 +94,6 @@ typedef struct
 extern TupleTableSlot *o_tbl_insert(OTableDescr *descr, Relation relation,
 									TupleTableSlot *slot, OXid oxid,
 									CommitSeqNo csn);
-extern bool o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples);
 extern bool o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 							   TupleTableSlot **slots, int ntuples,
 							   OXid oxid, CommitSeqNo csn);

@@ -1949,6 +1949,37 @@ orioledb_multi_insert_next(void)
 		batch = batch->next;
 }
 
+static bool
+o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples)
+{
+	OIndexDescr *primary = GET_PRIMARY(descr);
+	bool		use_ctid = primary->primaryIsCtid;
+
+	if (!use_ctid && ntuples > 1)
+	{
+		bool		sorted = true;
+		int			j;
+
+		for (j = 0; j < ntuples - 1 && sorted; j++)
+		{
+			OBTreeKeyBound kb1,
+						kb2;
+
+			tts_orioledb_fill_key_bound(slots[j], primary, &kb1);
+			tts_orioledb_fill_key_bound(slots[j + 1], primary, &kb2);
+			if (o_btree_cmp(&primary->desc,
+							&kb1, BTreeKeyBound,
+							&kb2, BTreeKeyBound) > 0)
+				sorted = false;
+		}
+
+		if (!sorted)
+			return false;
+	}
+
+	return true;
+}
+
 static void
 orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 					  CommandId cid, int options, BulkInsertState bistate)
@@ -1970,10 +2001,7 @@ orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	{
 		fill_current_oxid_osnapshot(&oxid, &oSnapshot);
 		o_set_current_command(cid);
-		if (!o_tbl_batch_insert(descr, relation, slots, ntuples, oxid, oSnapshot.csn))
-			elog(ERROR, "batch insert preparation failed");
-		while (batch)
-			orioledb_tuple_insert(relation, orioledb_multi_insert_get_slot(), cid, options, bistate);
+		o_tbl_batch_insert(descr, relation, slots, ntuples, oxid, oSnapshot.csn);
 		return;
 	}
 

@@ -352,39 +352,6 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 	return slot;
 }
 
-bool
-o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples)
-{
-	OIndexDescr *primary = GET_PRIMARY(descr);
-	bool		use_ctid = primary->primaryIsCtid;
-
-	if (!use_ctid && ntuples > 1)
-	{
-		bool		sorted = true;
-		int			j;
-
-		for (j = 0; j < ntuples - 1 && sorted; j++)
-		{
-			OBTreeKeyBound kb1,
-						kb2;
-
-			tts_orioledb_fill_key_bound(slots[j], primary, &kb1);
-			tts_orioledb_fill_key_bound(slots[j + 1], primary, &kb2);
-			if (o_btree_cmp(&primary->desc,
-							&kb1, BTreeKeyBound,
-							&kb2, BTreeKeyBound) > 0)
-			{
-				sorted = false;
-				break;
-			}
-		}
-		if (!sorted)
-			return false;
-	}
-
-	return true;
-}
-
 static void
 o_reserve_undo_for_modification(UndoLogType undoType, int nmodifications)
 {
@@ -412,9 +379,6 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	bool		use_ctid = primary->primaryIsCtid;
 	int			i;
 	int			pageReserveKind;
-
-	if (!o_can_batch_slots(descr, slots, ntuples))
-		return false;
 
 	o_btree_ensure_initialized(&primary->desc);
 	o_reserve_undo_for_modification(desc->undoType, ntuples);
@@ -471,6 +435,13 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 		state->leaf_header.xactInfo = OXID_GET_XACT_INFO(oxid,
 													  RowLockUpdate,
 													  false);
+	}
+
+	while (orioledb_multi_insert_get_slot())
+	{
+		TupleTableSlot *slot = orioledb_multi_insert_get_slot();
+
+		o_tbl_insert(descr, relation, slot, oxid, csn);
 	}
 
 	return true;
