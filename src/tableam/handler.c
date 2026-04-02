@@ -1852,7 +1852,7 @@ orioledb_getnextslot(TableScanDesc sscan, ScanDirection direction,
 	return true;
 }
 
-OBatchInsertState * batch = NULL;
+OBatchInsertState *batch = NULL;
 
 TupleTableSlot *
 orioledb_multi_insert_get_slot(void)
@@ -1959,11 +1959,12 @@ orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 	descr = relation_get_descr(relation);
 	batch = NULL;
-	fill_current_oxid_osnapshot(&oxid, &oSnapshot);
-	o_set_current_command(cid);
-
-	if (o_tbl_batch_insert(descr, relation, slots, ntuples, oxid, oSnapshot.csn))
+	if (o_can_batch_slots(descr, slots, ntuples))
 	{
+		fill_current_oxid_osnapshot(&oxid, &oSnapshot);
+		o_set_current_command(cid);
+		if (!o_tbl_batch_insert(descr, relation, slots, ntuples, oxid, oSnapshot.csn))
+			elog(ERROR, "batch insert precheck and preparation mismatch");
 		while (batch)
 			orioledb_tuple_insert(relation, orioledb_multi_insert_get_slot(), cid, options, bistate);
 		return;

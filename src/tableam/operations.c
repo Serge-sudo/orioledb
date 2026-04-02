@@ -63,7 +63,7 @@ static OTableModifyResult o_tbl_indices_delete(OTableDescr *descr,
 											   OXid oxid, CommitSeqNo csn,
 											   BTreeLocationHint *hint,
 											   OModifyCallbackArg *arg);
-static bool o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples);
+bool o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples);
 static void o_reserve_undo_for_modification(UndoLogType undoType, int nmodifications);
 static void o_toast_insert_values(Relation rel, OTableDescr *descr,
 								  TupleTableSlot *slot, OXid oxid, CommitSeqNo csn);
@@ -353,7 +353,7 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 	return slot;
 }
 
-static bool
+bool
 o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples)
 {
 	OIndexDescr *primary = GET_PRIMARY(descr);
@@ -361,9 +361,10 @@ o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples)
 
 	if (!use_ctid && ntuples > 1)
 	{
+		bool		sorted = true;
 		int			j;
 
-		for (j = 0; j < ntuples - 1; j++)
+		for (j = 0; j < ntuples - 1 && sorted; j++)
 		{
 			OBTreeKeyBound kb1,
 						kb2;
@@ -373,8 +374,10 @@ o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples)
 			if (o_btree_cmp(&primary->desc,
 							&kb1, BTreeKeyBound,
 							&kb2, BTreeKeyBound) > 0)
-				return false;
+				sorted = false;
 		}
+		if (!sorted)
+			return false;
 	}
 
 	return true;
@@ -424,14 +427,14 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	for (i = ntuples - 1; i >= 0; i--)
 	{
 		TupleTableSlot *slot = slots[i];
-		OBatchInsertState *cur = (OBatchInsertState *) palloc0(sizeof(OBatchInsertState));
+		OBatchInsertState *state = (OBatchInsertState *) palloc0(sizeof(OBatchInsertState));
 
-		cur->slot = slot;
-		cur->needs_wal = (primary->desc.storageType == BTreeStoragePersistence);
-		cur->relreplident = relation->rd_rel->relreplident;
-		cur->version = descr->version;
-		cur->next = batch;
-		batch = cur;
+		state->slot = slot;
+		state->needs_wal = (primary->desc.storageType == BTreeStoragePersistence);
+		state->relreplident = relation->rd_rel->relreplident;
+		state->version = descr->version;
+		state->next = batch;
+		batch = state;
 
 		if (slot->tts_ops != descr->newTuple->tts_ops ||
 			(((OTableSlot *) slot)->descr != NULL &&
@@ -453,18 +456,18 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 		if (descr->bridge)
 			o_apply_new_bridge_index_ctid(descr, relation, slot, csn, true);
 		tts_orioledb_toast(slot, descr);
-		cur->tuple = tts_orioledb_form_tuple(slot, descr);
-		o_btree_check_size_of_tuple(o_tuple_size(cur->tuple, &primary->leafSpec),
+		state->tuple = tts_orioledb_form_tuple(slot, descr);
+		o_btree_check_size_of_tuple(o_tuple_size(state->tuple, &primary->leafSpec),
 									RelationGetRelationName(relation),
 									false);
-		cur->tuplen = o_btree_len(&primary->desc, cur->tuple, OTupleLength);
-		cur->leaf_header.deleted = BTreeLeafTupleNonDeleted;
-		cur->leaf_header.formatFlags = 0;
-		cur->leaf_header.chainHasLocks = false;
-		cur->leaf_header.undoLocation = InvalidUndoLocation;
+		state->tuplen = o_btree_len(&primary->desc, state->tuple, OTupleLength);
+		state->leaf_header.deleted = BTreeLeafTupleNonDeleted;
+		state->leaf_header.formatFlags = 0;
+		state->leaf_header.chainHasLocks = false;
+		state->leaf_header.undoLocation = InvalidUndoLocation;
 		if (primary->desc.undoType == UndoLogRegular && !is_recovery_process())
-			cur->leaf_header.undoLocation |= current_command_get_undo_location();
-		cur->leaf_header.xactInfo = OXID_GET_XACT_INFO(oxid,
+			state->leaf_header.undoLocation |= current_command_get_undo_location();
+		state->leaf_header.xactInfo = OXID_GET_XACT_INFO(oxid,
 													  RowLockUpdate,
 													  false);
 	}

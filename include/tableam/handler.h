@@ -223,6 +223,18 @@ typedef ParallelOScanDescData *ParallelOScanDesc;
 
 extern bool in_nontransactional_truncate;
 
+typedef struct OBatchInsertState
+{
+	OTuple		tuple;
+	BTreeLeafTuphdr leaf_header;
+	LocationIndex tuplen;
+	TupleTableSlot *slot;
+	bool		needs_wal;
+	char		relreplident;
+	uint32		version;
+	struct OBatchInsertState *next;
+} OBatchInsertState;
+
 extern TupleTableSlot * orioledb_multi_insert_get_slot(void);
 extern void orioledb_multi_insert_next(void);
 extern OTuple orioledb_multi_insert_get_tuple(void);
