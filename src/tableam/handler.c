@@ -1862,6 +1862,9 @@ typedef struct OBatchInsertState
 } OBatchInsertState;
 
 OBatchInsertState * batch = NULL;
+static bool batch_needs_wal = false;
+static char batch_relreplident = REPLICA_IDENTITY_DEFAULT;
+static uint32 batch_version = O_TABLE_INVALID_VERSION;
 
 TupleTableSlot *
 orioledb_multi_insert_get_slot(void)
@@ -1918,6 +1921,24 @@ orioledb_multi_insert_get_leaf_header(void)
 	return result;
 }
 
+bool
+orioledb_multi_insert_needs_wal(void)
+{
+	return batch_needs_wal;
+}
+
+char
+orioledb_multi_insert_relreplident(void)
+{
+	return batch_relreplident;
+}
+
+uint32
+orioledb_multi_insert_version(void)
+{
+	return batch_version;
+}
+
 
 
 void
@@ -1964,18 +1985,18 @@ orioledb_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples
 }
 
 static void
-reserve_undo_for_modification(UndoLogType undoType)
+reserve_undo_for_modification(UndoLogType undoType, int nmodifications)
 {
 	if (undoType == UndoLogNone)
 		return;
 
 	if (GET_PAGE_LEVEL_UNDO_TYPE(undoType) == undoType)
 	{
-		(void) reserve_undo_size(undoType, O_MODIFY_UNDO_RESERVE_SIZE);
+		(void) reserve_undo_size(undoType, nmodifications * O_MODIFY_UNDO_RESERVE_SIZE);
 	}
 	else
 	{
-		(void) reserve_undo_size(undoType, 2 * O_UPDATE_MAX_UNDO_SIZE);
+		(void) reserve_undo_size(undoType, nmodifications * 2 * O_UPDATE_MAX_UNDO_SIZE);
 		(void) reserve_undo_size(GET_PAGE_LEVEL_UNDO_TYPE(undoType), 2 * O_MAX_SPLIT_UNDO_IMAGE_SIZE);
 	}
 }
@@ -1997,7 +2018,7 @@ create_batch_list (OTableDescr *descr, Relation relation,
 
 	o_btree_ensure_initialized(&primary->desc);
 
-	reserve_undo_for_modification(desc->undoType);
+	reserve_undo_for_modification(desc->undoType, ntuples);
 
 	if (OIDS_EQ_SYS_TREE(desc->oids, SYS_TREES_SHARED_ROOT_INFO))
 		pageReserveKind = PPOOL_RESERVE_SHARED_INFO_INSERT;
@@ -2070,15 +2091,25 @@ orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		return;
 
 	descr = relation_get_descr(relation);
+	batch = NULL;
+	batch_needs_wal = false;
+	batch_relreplident = REPLICA_IDENTITY_DEFAULT;
+	batch_version = O_TABLE_INVALID_VERSION;
 
 	if (orioledb_can_batch_slots(descr, slots, ntuples))
 	{
 		fill_current_oxid_osnapshot(&oxid, &oSnapshot);
 		o_set_current_command(cid);
+		batch_needs_wal = (GET_PRIMARY(descr)->desc.storageType == BTreeStoragePersistence);
+		batch_relreplident = relation->rd_rel->relreplident;
+		batch_version = descr->version;
 		create_batch_list(descr, relation, slots, ntuples, oxid, oSnapshot.csn);
 
 		while (batch)
 			orioledb_tuple_insert(relation, orioledb_multi_insert_get_slot(), cid, options, bistate);
+		batch_needs_wal = false;
+		batch_relreplident = REPLICA_IDENTITY_DEFAULT;
+		batch_version = O_TABLE_INVALID_VERSION;
 		return;
 	}
 

@@ -228,5 +228,8 @@ extern void orioledb_multi_insert_next(void);
 extern OTuple orioledb_multi_insert_get_tuple(void);
 extern LocationIndex orioledb_multi_insert_get_tuplen(void);
 extern BTreeLeafTuphdr orioledb_multi_insert_get_leaf_header(void);
+extern bool orioledb_multi_insert_needs_wal(void);
+extern char orioledb_multi_insert_relreplident(void);
+extern uint32 orioledb_multi_insert_version(void);
 
 #endif

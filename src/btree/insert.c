@@ -22,6 +22,7 @@
 #include "btree/page_chunks.h"
 #include "btree/undo.h"
 #include "checkpoint/checkpoint.h"
+#include "recovery/wal.h"
 #include "recovery/recovery.h"
 #include "tableam/handler.h"
 #include "transam/undo.h"
@@ -1234,13 +1235,10 @@ o_btree_insert_item_with_batch(BTreeInsertStackItem *insert_item,
 	Assert(OInMemoryBlknoIsValid(blkno));
 	p = O_GET_IN_MEMORY_PAGE(blkno);
 
-	// elog(WARNING, "Trying batch insert for page %u %u %u %u %u", blkno, (int)BTREE_PAGE_ITEMS_COUNT(p),(int) MAXALIGN(insert_item->tuplen),(int) BTreeLeafTuphdrSize, (int)BTREE_PAGE_FREE_SPACE(p));
-
 	if (!(1 <= BTREE_PAGE_ITEMS_COUNT(p) &&
 		MAXALIGN(insert_item->tuplen) + BTreeLeafTuphdrSize + MAXALIGN(sizeof(LocationIndex)) <= BTREE_PAGE_FREE_SPACE(p)))
 	{
 		bool res =  o_btree_insert_item_no_waiters(insert_item, reserve_kind);
-		// elog(WARNING, "Batch insert failed for page %u. Fallback to non-batch insert.", blkno);
 		orioledb_multi_insert_next();
 		return res;
 	}
@@ -1256,7 +1254,6 @@ o_btree_insert_item_with_batch(BTreeInsertStackItem *insert_item,
 		OTuple		tuple;
 		Pointer		ptr;
 
-		// elog(WARNING, "new insert");
 		if (first)
 		{
 			loc = curContext->items[curContext->index].locator;
@@ -1329,6 +1326,10 @@ o_btree_insert_item_with_batch(BTreeInsertStackItem *insert_item,
 		if (!(tuple.formatFlags & O_TUPLE_FLAGS_FIXED_FORMAT))
 			header->chunkDesc[loc.chunkOffset].chunkKeysFixed = 0;
 		MARK_DIRTY(desc, blkno);
+		if (orioledb_multi_insert_needs_wal())
+			o_wal_insert(desc, tuple,
+						 orioledb_multi_insert_relreplident(),
+						 orioledb_multi_insert_version());
 
 		END_CRIT_SECTION();
 		orioledb_multi_insert_next();

@@ -344,7 +344,8 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 	/* Tuple might be changed in the callback */
 	tup = tts_orioledb_form_tuple(slot, descr);
 
-	if (primary->desc.storageType == BTreeStoragePersistence)
+	if (primary->desc.storageType == BTreeStoragePersistence &&
+		!orioledb_multi_insert_needs_wal())
 		o_wal_insert(&primary->desc, tup, relation->rd_rel->relreplident, descr->version);
 
 	return slot;
