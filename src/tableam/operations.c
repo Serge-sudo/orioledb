@@ -402,7 +402,6 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 
 	o_btree_ensure_initialized(&primary->desc);
 	o_reserve_undo_for_modification(desc->undoType, ntuples);
-	CheckCmdReplicaIdentity(relation, CMD_INSERT);
 
 	if (OIDS_EQ_SYS_TREE(desc->oids, SYS_TREES_SHARED_ROOT_INFO))
 		pageReserveKind = PPOOL_RESERVE_SHARED_INFO_INSERT;
@@ -416,11 +415,9 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 		TupleTableSlot *slot = slots[i];
 		OBatchInsertState *state = (OBatchInsertState *) palloc0(sizeof(OBatchInsertState));
 
-		state->slot = slot;
 		state->needs_wal = (primary->desc.storageType == BTreeStoragePersistence);
 		state->relreplident = relation->rd_rel->relreplident;
 		state->version = descr->version;
-		orioledb_multi_insert_push(state);
 
 		if (slot->tts_ops != descr->newTuple->tts_ops ||
 			(((OTableSlot *) slot)->descr != NULL &&
@@ -442,6 +439,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 		if (descr->bridge)
 			o_apply_new_bridge_index_ctid(descr, relation, slot, csn, true);
 		tts_orioledb_toast(slot, descr);
+		state->slot = slot;
 		state->tuple = tts_orioledb_form_tuple(slot, descr);
 		o_btree_check_size_of_tuple(o_tuple_size(state->tuple, &primary->leafSpec),
 									RelationGetRelationName(relation),
@@ -456,6 +454,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 		state->leaf_header.xactInfo = OXID_GET_XACT_INFO(oxid,
 													  RowLockUpdate,
 													  false);
+		orioledb_multi_insert_push(state);
 	}
 
 	while (true)
