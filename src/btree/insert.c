@@ -1235,7 +1235,7 @@ o_btree_insert_item_with_batch(BTreeInsertStackItem *insert_item,
 	Assert(OInMemoryBlknoIsValid(blkno));
 	p = O_GET_IN_MEMORY_PAGE(blkno);
 
-	if (!(1 <= BTREE_PAGE_ITEMS_COUNT(p) &&
+	if (!(BTREE_PAGE_ITEMS_COUNT(p) >= 1 &&
 		MAXALIGN(insert_item->tuplen) + BTreeLeafTuphdrSize + MAXALIGN(sizeof(LocationIndex)) <= BTREE_PAGE_FREE_SPACE(p)))
 	{
 		bool res =  o_btree_insert_item_no_waiters(insert_item, reserve_kind);
