@@ -149,7 +149,6 @@ static void fill_key_bound(TupleTableSlot *slot, OIndexDescr *idx, OBTreeKeyBoun
 static inline bool is_keys_eq(OIndexDescr *id, OBTreeKeyBound *k1, OBTreeKeyBound *k2);
 static void o_report_duplicate(Relation rel, OIndexDescr *id,
 							   TupleTableSlot *slot);
-extern OBatchInsertState *batch;
 
 PG_FUNCTION_INFO_V1(orioledb_int4range_immutable);
 
@@ -374,7 +373,10 @@ o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples)
 			if (o_btree_cmp(&primary->desc,
 							&kb1, BTreeKeyBound,
 							&kb2, BTreeKeyBound) > 0)
+			{
 				sorted = false;
+				break;
+			}
 		}
 		if (!sorted)
 			return false;
@@ -433,8 +435,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 		state->needs_wal = (primary->desc.storageType == BTreeStoragePersistence);
 		state->relreplident = relation->rd_rel->relreplident;
 		state->version = descr->version;
-		state->next = batch;
-		batch = state;
+		orioledb_multi_insert_push(state);
 
 		if (slot->tts_ops != descr->newTuple->tts_ops ||
 			(((OTableSlot *) slot)->descr != NULL &&

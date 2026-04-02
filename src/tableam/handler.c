@@ -1867,6 +1867,13 @@ orioledb_multi_insert_get_slot(void)
 	return NULL;
 }
 
+void
+orioledb_multi_insert_push(OBatchInsertState *state)
+{
+	state->next = batch;
+	batch = state;
+}
+
 OTuple
 orioledb_multi_insert_get_tuple(void)
 {
@@ -1964,7 +1971,7 @@ orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		fill_current_oxid_osnapshot(&oxid, &oSnapshot);
 		o_set_current_command(cid);
 		if (!o_tbl_batch_insert(descr, relation, slots, ntuples, oxid, oSnapshot.csn))
-			elog(ERROR, "failed to prepare batch insert");
+			elog(ERROR, "batch insert preparation failed");
 		while (batch)
 			orioledb_tuple_insert(relation, orioledb_multi_insert_get_slot(), cid, options, bistate);
 		return;

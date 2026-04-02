@@ -236,6 +236,7 @@ typedef struct OBatchInsertState
 } OBatchInsertState;
 
 extern TupleTableSlot * orioledb_multi_insert_get_slot(void);
+extern void orioledb_multi_insert_push(OBatchInsertState *state);
 extern void orioledb_multi_insert_next(void);
 extern OTuple orioledb_multi_insert_get_tuple(void);
 extern LocationIndex orioledb_multi_insert_get_tuplen(void);
