@@ -442,7 +442,6 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 		if (descr->bridge)
 			o_apply_new_bridge_index_ctid(descr, relation, slot, csn, true);
 		tts_orioledb_toast(slot, descr);
-		state->slot = slot;
 		state->tuple = tts_orioledb_form_tuple(slot, descr);
 		o_btree_check_size_of_tuple(o_tuple_size(state->tuple, &primary->leafSpec),
 									RelationGetRelationName(relation),
@@ -463,15 +462,15 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	while (true)
 	{
 		TupleTableSlot *slot;
-		bool		skip_wal;
+		bool		wal_already_done;
 
 		slot = orioledb_multi_insert_get_slot();
 		if (!slot)
 			break;
-		skip_wal = orioledb_multi_insert_needs_wal();
+		wal_already_done = orioledb_multi_insert_needs_wal();
 		o_tbl_insert_indices(descr, relation, slot, oxid, csn);
 		o_tbl_insert_after_indices(descr, relation, slot, oxid, csn,
-								   skip_wal);
+								   wal_already_done);
 	}
 }
 
