@@ -63,7 +63,6 @@ static OTableModifyResult o_tbl_indices_delete(OTableDescr *descr,
 											   OXid oxid, CommitSeqNo csn,
 											   BTreeLocationHint *hint,
 											   OModifyCallbackArg *arg);
-bool o_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples);
 static void o_reserve_undo_for_modification(UndoLogType undoType, int nmodifications);
 static void o_toast_insert_values(Relation rel, OTableDescr *descr,
 								  TupleTableSlot *slot, OXid oxid, CommitSeqNo csn);
@@ -150,6 +149,7 @@ static void fill_key_bound(TupleTableSlot *slot, OIndexDescr *idx, OBTreeKeyBoun
 static inline bool is_keys_eq(OIndexDescr *id, OBTreeKeyBound *k1, OBTreeKeyBound *k2);
 static void o_report_duplicate(Relation rel, OIndexDescr *id,
 							   TupleTableSlot *slot);
+extern OBatchInsertState *batch;
 
 PG_FUNCTION_INFO_V1(orioledb_int4range_immutable);
 

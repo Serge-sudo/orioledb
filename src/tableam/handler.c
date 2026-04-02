@@ -1964,7 +1964,7 @@ orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		fill_current_oxid_osnapshot(&oxid, &oSnapshot);
 		o_set_current_command(cid);
 		if (!o_tbl_batch_insert(descr, relation, slots, ntuples, oxid, oSnapshot.csn))
-			elog(ERROR, "batch insert precheck and preparation mismatch");
+			elog(ERROR, "failed to prepare batch insert");
 		while (batch)
 			orioledb_tuple_insert(relation, orioledb_multi_insert_get_slot(), cid, options, bistate);
 		return;
