@@ -24,6 +24,7 @@
 #include "checkpoint/checkpoint.h"
 #include "recovery/wal.h"
 #include "recovery/recovery.h"
+#include "tableam/descr.h"
 #include "tableam/handler.h"
 #include "transam/undo.h"
 #include "tuple/format.h"
@@ -1775,8 +1776,8 @@ o_btree_try_ctid_batch_append(BTreeDescr *desc)
 		btree_page_reorg(desc, anchor_page, page_items, items_count,
 						 anchor_hikey_len, anchor_hikey);
 		anchor_header->flags &= ~O_BTREE_FLAG_RIGHTMOST;
-		anchor_header->rightLink = MAKE_RIGHTLINK(pages[0].blkno,
-												  O_PAGE_GET_CHANGE_COUNT(O_GET_IN_MEMORY_PAGE(pages[0].blkno)));
+		anchor_header->rightLink = MAKE_IN_MEMORY_RIGHTLINK(pages[0].blkno,
+															O_PAGE_GET_CHANGE_COUNT(O_GET_IN_MEMORY_PAGE(pages[0].blkno)));
 		anchor_header->prevInsertOffset = MaxOffsetNumber;
 		O_GET_IN_MEMORY_PAGEDESC(pages[0].blkno)->leftBlkno = anchor_blkno;
 		MARK_DIRTY(desc, anchor_blkno);
@@ -1808,8 +1809,8 @@ o_btree_try_ctid_batch_append(BTreeDescr *desc)
 							 pages[i + 1].first_key_len,
 							 pages[i + 1].first_key);
 			header->flags &= ~O_BTREE_FLAG_RIGHTMOST;
-			header->rightLink = MAKE_RIGHTLINK(pages[i + 1].blkno,
-											   O_PAGE_GET_CHANGE_COUNT(O_GET_IN_MEMORY_PAGE(pages[i + 1].blkno)));
+			header->rightLink = MAKE_IN_MEMORY_RIGHTLINK(pages[i + 1].blkno,
+														 O_PAGE_GET_CHANGE_COUNT(O_GET_IN_MEMORY_PAGE(pages[i + 1].blkno)));
 			O_GET_IN_MEMORY_PAGEDESC(pages[i + 1].blkno)->leftBlkno = pages[i].blkno;
 		}
 		else
