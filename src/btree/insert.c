@@ -1529,7 +1529,13 @@ o_btree_try_ctid_batch_append(BTreeDescr *desc)
 	int			pages_capacity = 0;
 	int			pages_count = 0;
 	int			i;
-	int			soft_limit = ORIOLEDB_BLCKSZ * (100 - desc->fillfactor) / 100;
+	const int	fill_factor_percent = 100;
+	/*
+	 * Keep this amount of free space on pages (build-style fillfactor tail
+	 * slack), i.e. stop filling once remaining free space would drop below it.
+	 */
+	int			soft_limit = ORIOLEDB_BLCKSZ *
+		(fill_factor_percent - desc->fillfactor) / fill_factor_percent;
 	/* Reserve extra free space for chunk/hikey metadata during page reorg. */
 	const int	attach_overhead = 256;
 	/* Initial dynamic array capacity for preallocated right-edge pages. */
@@ -1645,6 +1651,7 @@ o_btree_try_ctid_batch_append(BTreeDescr *desc)
 		bool		first_key_allocated = false;
 		LocationIndex first_key_len;
 
+		/* Reserve page-by-page to avoid holding many pages unnecessarily. */
 		ppool_reserve_pages(desc->ppool, PPOOL_RESERVE_FIND, 2);
 		blkno = ppool_get_page(desc->ppool, PPOOL_RESERVE_FIND);
 		ppool_release_reserved(desc->ppool, PPOOL_KIND_GET_MASK(PPOOL_RESERVE_FIND));
@@ -1849,6 +1856,7 @@ o_btree_try_ctid_batch_append(BTreeDescr *desc)
 		insert_item.replace = false;
 		insert_item.rightBlkno = OInvalidInMemoryBlkno;
 		insert_item.refind = false;
+		/* o_btree_insert_item() consumes/releases PPOOL_RESERVE_FIND reserve. */
 		o_btree_insert_item(&insert_item, PPOOL_RESERVE_FIND);
 	}
 
@@ -1859,6 +1867,11 @@ o_btree_try_ctid_batch_append(BTreeDescr *desc)
 		if (pages[i].first_key_allocated)
 			pfree(pages[i].first_key.data);
 	}
+	int			linked_tuples = 0;
+
+	for (i = 0; i < pages_count; i++)
+		linked_tuples += pages[i].inserted;
+	Assert(linked_tuples == added_tuples);
 
 	return inserted + added_tuples;
 }
