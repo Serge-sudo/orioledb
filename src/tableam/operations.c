@@ -16,6 +16,7 @@
 #include "orioledb.h"
 
 #include "btree/btree.h"
+#include "btree/insert.h"
 #include "btree/iterator.h"
 #include "btree/modify.h"
 #include "btree/undo.h"
@@ -447,6 +448,10 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	while ((slot = orioledb_multi_insert_get_slot()) != NULL)
 	{
 		TupleTableSlot *orig_slot = orioledb_multi_insert_get_orig_slot();
+
+		if (use_ctid && o_btree_try_ctid_batch_append(&primary->desc) > 0)
+			continue;
+
 		o_tbl_insert_single_batch(descr, relation, orig_slot, slot, oxid, csn);
 	}
 

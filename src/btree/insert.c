@@ -1501,3 +1501,89 @@ o_btree_insert_tuple_to_leaf(OBTreeFindPageContext *context,
 		MemoryContextResetOnly(btree_insert_context);
 	}
 }
+
+int
+o_btree_try_ctid_batch_append(BTreeDescr *desc)
+{
+	OBTreeFindPageContext findContext;
+	OFindPageResult findResult;
+	OInMemoryBlkno blkno;
+	Page		p;
+	BTreePageHeader *header;
+	int			inserted = 0;
+	OIndexDescr *idx = (OIndexDescr *) desc->arg;
+
+	if (orioledb_multi_insert_is_finished())
+		return 0;
+
+	if (idx->type != oIndexPrimary || !idx->primaryIsCtid)
+		return 0;
+
+	init_page_find_context(&findContext, desc, COMMITSEQNO_INPROGRESS,
+						   BTREE_PAGE_FIND_MODIFY |
+						   BTREE_PAGE_FIND_FIX_LEAF_SPLIT);
+	O_TUPLE_SET_NULL(findContext.insertTuple);
+	findResult = find_page(&findContext, NULL, BTreeKeyRightmost, 0);
+	if (findResult != OFindPageResultSuccess)
+		return 0;
+
+	Assert(findContext.index >= 0 && findContext.index < ORIOLEDB_MAX_DEPTH);
+	blkno = findContext.items[findContext.index].blkno;
+	p = O_GET_IN_MEMORY_PAGE(blkno);
+	header = (BTreePageHeader *) p;
+
+	if (!O_PAGE_IS(p, LEAF) || !O_PAGE_IS(p, RIGHTMOST))
+	{
+		unlock_page(blkno);
+		return 0;
+	}
+
+	page_block_reads(blkno);
+
+	while (!orioledb_multi_insert_is_finished())
+	{
+		OTuple		tuple = orioledb_multi_insert_get_tuple();
+		BTreeLeafTuphdr tuphdr = orioledb_multi_insert_get_leaf_header();
+		LocationIndex tuplen = orioledb_multi_insert_get_tuplen();
+		BTreePageItemLocator loc;
+		LocationIndex keyLen;
+		Pointer		ptr;
+
+		BTREE_PAGE_LOCATOR_TAIL(p, &loc);
+		if (!page_locator_fits_new_item(p, &loc,
+										MAXALIGN(tuplen) + BTreeLeafTuphdrSize))
+			break;
+
+		START_CRIT_SECTION();
+
+		if (desc->undoType != UndoLogNone)
+			make_undo_record(desc, tuple, true,
+							 BTreeOperationInsert, blkno,
+							 O_PAGE_GET_CHANGE_COUNT(p),
+							 &tuphdr);
+
+		page_locator_insert_item(p, &loc, MAXALIGN(tuplen) + BTreeLeafTuphdrSize);
+		header->prevInsertOffset = BTREE_PAGE_LOCATOR_GET_OFFSET(p, &loc);
+		keyLen = MAXALIGN(o_btree_len(desc, tuple, OTupleKeyLengthNoVersion));
+		header->maxKeyLen = Max(header->maxKeyLen, keyLen);
+
+		ptr = BTREE_PAGE_LOCATOR_GET_ITEM(p, &loc);
+		memcpy(ptr, &tuphdr, BTreeLeafTuphdrSize);
+		ptr += BTreeLeafTuphdrSize;
+		memcpy(ptr, tuple.data, tuplen);
+		BTREE_PAGE_SET_ITEM_FLAGS(p, &loc, tuple.formatFlags);
+
+		if (!(tuple.formatFlags & O_TUPLE_FLAGS_FIXED_FORMAT))
+			header->chunkDesc[loc.chunkOffset].chunkKeysFixed = 0;
+
+		MARK_DIRTY(desc, blkno);
+		END_CRIT_SECTION();
+
+		orioledb_multi_insert_next();
+		inserted++;
+	}
+
+	unlock_page(blkno);
+
+	return inserted;
+}
