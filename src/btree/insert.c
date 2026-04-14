@@ -230,7 +230,7 @@ o_btree_ctid_batch_insert_downlinks(BTreeDescr *desc,
 
 		insert_item.next = NULL;
 		insert_item.context = &parent_context;
-		o_btree_split_fill_downlink_item_with_key(&insert_item, left_blkno, false,
+		o_btree_split_fill_downlink_item_with_key(&insert_item, left_blkno, true,
 												  pages[i].first_key,
 												  pages[i].first_key_len,
 												  &internal_header);
