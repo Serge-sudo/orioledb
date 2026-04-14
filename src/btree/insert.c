@@ -303,7 +303,6 @@ o_btree_ctid_batch_split_with_prebuilt_right(BTreeDescr *desc,
 	left_header->rightLink = MAKE_IN_MEMORY_RIGHTLINK(right_blkno,
 													  O_PAGE_GET_CHANGE_COUNT(right_page));
 	left_header->prevInsertOffset = MaxOffsetNumber;
-	right_header->prevInsertOffset = MaxOffsetNumber;
 	O_GET_IN_MEMORY_PAGEDESC(right_blkno)->leftBlkno = left_blkno;
 	MARK_DIRTY(desc, left_blkno);
 	if (needsUndo)
