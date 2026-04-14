@@ -1859,13 +1859,13 @@ o_btree_try_ctid_batch_append(BTreeDescr *desc)
 
 		if (i + 1 < pages_count)
 		{
-			BTreePageHeader *next_header = (BTreePageHeader *) O_GET_IN_MEMORY_PAGE(pages[i + 1].blkno);
 			BTreePageItem page_items[BTREE_PAGE_MAX_SPLIT_ITEMS];
 			BTreePageItemLocator loc;
 			int			items_count = 0;
 
 			if (needsSplitUndo)
 			{
+				BTreePageHeader *next_header = (BTreePageHeader *) O_GET_IN_MEMORY_PAGE(pages[i + 1].blkno);
 				UndoLocation undoLocation = page_add_image_to_undo(desc, p, splitCsn,
 																   &pages[i + 1].first_key,
 																   pages[i + 1].first_key_len);
