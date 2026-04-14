@@ -1990,6 +1990,12 @@ orioledb_multi_insert_get_leaf_header(void)
 	return result;
 }
 
+OBatchInsertState *
+orioledb_multi_insert_get_state(void)
+{
+	return batch_head;
+}
+
 void
 orioledb_multi_insert_next(void)
 {

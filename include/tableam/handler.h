@@ -230,6 +230,9 @@ typedef struct OBatchInsertState
 	LocationIndex tuplen;
 	TupleTableSlot *orig_slot;
 	TupleTableSlot *slot;
+	int			batchIndex;
+	int			pageIndex;
+	bool		useCtidBatch;
 	int 	nitems;
 	struct OBatchInsertState *next;
 } OBatchInsertState;
@@ -246,5 +249,6 @@ extern void orioledb_multi_insert_set_head(OBatchInsertState *state);
 extern OTuple orioledb_multi_insert_get_tuple(void);
 extern LocationIndex orioledb_multi_insert_get_tuplen(void);
 extern BTreeLeafTuphdr orioledb_multi_insert_get_leaf_header(void);
+extern OBatchInsertState *orioledb_multi_insert_get_state(void);
 
 #endif

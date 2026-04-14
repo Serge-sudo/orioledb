@@ -382,28 +382,47 @@ o_tbl_insert_single_batch(OTableDescr *descr, Relation relation,
 	}
 }
 
-void
-o_tbl_batch_insert(OTableDescr *descr, Relation relation,
-				   TupleTableSlot **slots, int ntuples,
-				   OXid oxid, CommitSeqNo csn)
+static inline ItemPointerData
+o_batch_ctid_add(ItemPointerData base, uint64 offset)
+{
+	ItemPointerData result;
+	uint64		ctid;
+
+	ctid = (uint64) ItemPointerGetBlockNumber(&base) *
+		(MaxOffsetNumber - FirstOffsetNumber);
+	ctid += base.ip_posid - FirstOffsetNumber;
+	ctid += offset;
+
+	Assert(ctid / (MaxOffsetNumber - FirstOffsetNumber) < InvalidBlockNumber);
+	ItemPointerSet(&result,
+				   (uint32) (ctid / (MaxOffsetNumber - FirstOffsetNumber)),
+				   (OffsetNumber) (ctid % (MaxOffsetNumber - FirstOffsetNumber) + FirstOffsetNumber));
+
+	return result;
+}
+
+static OBatchInsertState *
+o_tbl_batch_insert_prepare(OTableDescr *descr, Relation relation,
+						   TupleTableSlot **slots, int ntuples,
+						   OXid oxid, CommitSeqNo csn, bool use_ctid)
 {
 	OIndexDescr *primary = GET_PRIMARY(descr);
-	bool		use_ctid = primary->primaryIsCtid;
-	int			i;
+	ItemPointerData first_ctid;
 	OBatchInsertState *batch_state = NULL;
-	TupleTableSlot *slot;
+	int			i;
 
-	o_btree_ensure_initialized(&primary->desc);
-
-	reserve_undo_size(UndoLogRegular, MAXIMUM_ALIGNOF);
-	orioledb_multi_insert_reset_head();
+	if (use_ctid)
+		first_ctid = btree_ctid_get_and_inc_n(&primary->desc, ntuples);
 
 	for (i = 0; i < ntuples; i++)
 	{
-		slot = slots[i];
+		TupleTableSlot *slot = slots[i];
 		OBatchInsertState *state = (OBatchInsertState *) palloc0(sizeof(OBatchInsertState));
 
 		state->orig_slot = slot;
+		state->batchIndex = i;
+		state->pageIndex = -1;
+		state->useCtidBatch = use_ctid;
 
 		if (slot->tts_ops != descr->newTuple->tts_ops ||
 			(((OTableSlot *) slot)->descr != NULL &&
@@ -418,9 +437,8 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 
 		if (use_ctid)
 		{
-			ItemPointerData iptr;
+			ItemPointerData iptr = o_batch_ctid_add(first_ctid, i);
 
-			iptr = btree_ctid_get_and_inc(&primary->desc);
 			tts_orioledb_set_ctid(slot, &iptr);
 		}
 
@@ -439,16 +457,34 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 		if (primary->desc.undoType == UndoLogRegular && !is_recovery_process())
 			state->leaf_header.undoLocation |= current_command_get_undo_location();
 		state->leaf_header.xactInfo = OXID_GET_XACT_INFO(oxid,
-													  RowLockUpdate,
-													  false);
+														 RowLockUpdate,
+														 false);
 		batch_state = orioledb_multi_insert_push(state);
 	}
+
+	return batch_state;
+}
+
+static void
+o_tbl_batch_insert_execute_primary(OTableDescr *descr, Relation relation,
+								   OXid oxid, CommitSeqNo csn)
+{
+	TupleTableSlot *slot;
 
 	while ((slot = orioledb_multi_insert_get_slot()) != NULL)
 	{
 		TupleTableSlot *orig_slot = orioledb_multi_insert_get_orig_slot();
+
 		o_tbl_insert_single_batch(descr, relation, orig_slot, slot, oxid, csn);
 	}
+}
+
+static void
+o_tbl_batch_insert_finalize(OTableDescr *descr, Relation relation,
+							OIndexDescr *primary, OBatchInsertState *batch_state,
+							int ntuples, OXid oxid, CommitSeqNo csn)
+{
+	TupleTableSlot *slot;
 
 	pgstat_count_heap_insert(relation, ntuples);
 
@@ -456,6 +492,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	while ((slot = orioledb_multi_insert_get_orig_slot()) != NULL)
 	{
 		OTuple tup;
+
 		o_toast_insert_values(relation, descr, slot, oxid, csn);
 
 		/* Tuple might be changed in the callback */
@@ -469,6 +506,26 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 
 		orioledb_multi_insert_next();
 	}
+}
+
+void
+o_tbl_batch_insert(OTableDescr *descr, Relation relation,
+				   TupleTableSlot **slots, int ntuples,
+				   OXid oxid, CommitSeqNo csn)
+{
+	OIndexDescr *primary = GET_PRIMARY(descr);
+	bool		use_ctid = primary->primaryIsCtid;
+	OBatchInsertState *batch_state;
+
+	o_btree_ensure_initialized(&primary->desc);
+
+	reserve_undo_size(UndoLogRegular, MAXIMUM_ALIGNOF);
+	orioledb_multi_insert_reset_head();
+	batch_state = o_tbl_batch_insert_prepare(descr, relation, slots, ntuples,
+											 oxid, csn, use_ctid);
+	o_tbl_batch_insert_execute_primary(descr, relation, oxid, csn);
+	o_tbl_batch_insert_finalize(descr, relation, primary, batch_state, ntuples,
+								oxid, csn);
 
 	orioledb_multi_insert_reset_head();
 }

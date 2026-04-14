@@ -278,6 +278,26 @@ btree_ctid_get_and_inc(BTreeDescr *desc)
 	return result;
 }
 
+ItemPointerData
+btree_ctid_get_and_inc_n(BTreeDescr *desc, uint64 count)
+{
+	BTreeMetaPage *metaPageBlkno = BTREE_GET_META(desc);
+	ItemPointerData result;
+	uint64		ctid;
+
+	Assert(count > 0);
+	ctid = pg_atomic_fetch_add_u64(&metaPageBlkno->ctid, count);
+
+	Assert(ORootPageIsValid(desc) && OMetaPageIsValid(desc));
+	Assert(ctid / (MaxOffsetNumber - FirstOffsetNumber) < InvalidBlockNumber);
+
+	ItemPointerSet(&result,
+				   (uint32) (ctid / (MaxOffsetNumber - FirstOffsetNumber)),
+				   (OffsetNumber) (ctid % (MaxOffsetNumber - FirstOffsetNumber) + FirstOffsetNumber));
+
+	return result;
+}
+
 void
 btree_ctid_update_if_needed(BTreeDescr *desc, ItemPointerData ctid)
 {
