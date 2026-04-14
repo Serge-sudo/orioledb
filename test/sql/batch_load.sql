@@ -18,6 +18,7 @@ COPY o_test_n FROM '/tmp/o_test_unsort.csv' WITH (FORMAT csv);
 
 SELECT COUNT(*) FROM o_test;
 SELECT COUNT(*) FROM o_test_n;
+-- Verify CTIDs are contiguous and remained on a single block for this load.
 SELECT (COUNT(*) = (MAX(off) - MIN(off) + 1) AND MIN(blk) = MAX(blk))
 FROM (
 	SELECT split_part(trim(both '()' from ctid::text), ',', 1)::int AS blk,

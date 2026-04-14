@@ -1412,7 +1412,7 @@ o_btree_insert_item_with_ctid_batch(BTreeInsertStackItem *insert_item,
 		head = head->next;
 	}
 
-	if (count <= 0)
+	if (count == 0)
 		return true;
 
 	new_blknos = palloc0(sizeof(OInMemoryBlkno) * count);
@@ -1426,7 +1426,7 @@ o_btree_insert_item_with_ctid_batch(BTreeInsertStackItem *insert_item,
 	}
 
 	count = i;
-	if (count <= 0)
+	if (count == 0)
 		return true;
 
 	if (desc->undoType != UndoLogNone)
