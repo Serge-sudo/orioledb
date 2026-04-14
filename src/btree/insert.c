@@ -78,6 +78,13 @@ static void o_btree_ctid_batch_insert_downlinks(BTreeDescr *desc,
 												OInMemoryBlkno anchor_blkno,
 												CtidBulkPage *pages,
 												int pages_count);
+static void o_btree_ctid_batch_split_with_prebuilt_right(BTreeDescr *desc,
+														  OInMemoryBlkno left_blkno,
+														  OInMemoryBlkno right_blkno,
+														  OTuple split_key,
+														  LocationIndex split_key_len,
+														  CommitSeqNo csn,
+														  bool needsUndo);
 
 /*
  * Finishes split of the rootPageBlkno page.
@@ -241,6 +248,64 @@ o_btree_ctid_batch_insert_downlinks(BTreeDescr *desc,
 		/* o_btree_insert_item() consumes/releases PPOOL_RESERVE_FIND reserve. */
 		o_btree_insert_item(&insert_item, PPOOL_RESERVE_FIND);
 	}
+}
+
+static void
+o_btree_ctid_batch_split_with_prebuilt_right(BTreeDescr *desc,
+											 OInMemoryBlkno left_blkno,
+											 OInMemoryBlkno right_blkno,
+											 OTuple split_key,
+											 LocationIndex split_key_len,
+											 CommitSeqNo csn,
+											 bool needsUndo)
+{
+	Page		left_page = O_GET_IN_MEMORY_PAGE(left_blkno);
+	Page		right_page = O_GET_IN_MEMORY_PAGE(right_blkno);
+	BTreePageHeader *left_header = (BTreePageHeader *) left_page;
+	BTreePageHeader *right_header = (BTreePageHeader *) right_page;
+	BTreePageItem page_items[BTREE_PAGE_MAX_SPLIT_ITEMS];
+	BTreePageItemLocator loc;
+	int			items_count = 0;
+
+	if (needsUndo)
+	{
+		UndoLocation undoLocation = page_add_image_to_undo(desc, left_page, csn,
+														   &split_key, split_key_len);
+
+		page_block_reads(left_blkno);
+		page_block_reads(right_blkno);
+		left_header->undoLocation = undoLocation;
+		right_header->undoLocation = undoLocation;
+		pg_write_barrier();
+		left_header->csn = csn;
+		right_header->csn = csn;
+	}
+	else
+	{
+		page_block_reads(left_blkno);
+	}
+
+	BTREE_PAGE_LOCATOR_FIRST(left_page, &loc);
+	while (BTREE_PAGE_LOCATOR_IS_VALID(left_page, &loc))
+	{
+		Assert(items_count < BTREE_PAGE_MAX_SPLIT_ITEMS);
+		page_items[items_count].data = BTREE_PAGE_LOCATOR_GET_ITEM(left_page, &loc);
+		page_items[items_count].size = BTREE_PAGE_GET_ITEM_SIZE(left_page, &loc);
+		page_items[items_count].flags = BTREE_PAGE_GET_ITEM_FLAGS(left_page, &loc);
+		items_count++;
+		BTREE_PAGE_LOCATOR_NEXT(left_page, &loc);
+	}
+
+	btree_page_reorg(desc, left_page, page_items, items_count,
+					 split_key_len, split_key);
+	left_header->flags &= ~O_BTREE_FLAG_RIGHTMOST;
+	left_header->rightLink = MAKE_IN_MEMORY_RIGHTLINK(right_blkno,
+													  O_PAGE_GET_CHANGE_COUNT(right_page));
+	left_header->prevInsertOffset = MaxOffsetNumber;
+	O_GET_IN_MEMORY_PAGEDESC(right_blkno)->leftBlkno = left_blkno;
+	MARK_DIRTY(desc, left_blkno);
+	if (needsUndo)
+		MARK_DIRTY(desc, right_blkno);
 }
 
 static OInMemoryBlkno
@@ -1810,46 +1875,16 @@ o_btree_try_ctid_batch_append(BTreeDescr *desc)
 	CommitSeqNo splitCsn = COMMITSEQNO_INPROGRESS;
 
 	START_CRIT_SECTION();
-	{
-		BTreePageItem page_items[BTREE_PAGE_MAX_SPLIT_ITEMS];
-		BTreePageItemLocator loc;
-		int			items_count = 0;
+	if (needsSplitUndo)
+		splitCsn = pg_atomic_fetch_add_u64(&TRANSAM_VARIABLES->nextCommitSeqNo, 1);
 
-		if (needsSplitUndo)
-		{
-			BTreePageHeader *first_header = (BTreePageHeader *) O_GET_IN_MEMORY_PAGE(pages[0].blkno);
-			splitCsn = pg_atomic_read_u64(&TRANSAM_VARIABLES->nextCommitSeqNo);
-			UndoLocation undoLocation = page_add_image_to_undo(desc, anchor_page, splitCsn,
-															   &anchor_hikey, anchor_hikey_len);
-
-			page_block_reads(anchor_blkno);
-			page_block_reads(pages[0].blkno);
-			anchor_header->undoLocation = undoLocation;
-			first_header->undoLocation = undoLocation;
-			pg_write_barrier();
-			anchor_header->csn = splitCsn;
-			first_header->csn = splitCsn;
-		}
-
-		BTREE_PAGE_LOCATOR_FIRST(anchor_page, &loc);
-		while (BTREE_PAGE_LOCATOR_IS_VALID(anchor_page, &loc))
-		{
-			Assert(items_count < BTREE_PAGE_MAX_SPLIT_ITEMS);
-			page_items[items_count].data = BTREE_PAGE_LOCATOR_GET_ITEM(anchor_page, &loc);
-			page_items[items_count].size = BTREE_PAGE_GET_ITEM_SIZE(anchor_page, &loc);
-			page_items[items_count].flags = BTREE_PAGE_GET_ITEM_FLAGS(anchor_page, &loc);
-			items_count++;
-			BTREE_PAGE_LOCATOR_NEXT(anchor_page, &loc);
-		}
-		btree_page_reorg(desc, anchor_page, page_items, items_count,
-						 anchor_hikey_len, anchor_hikey);
-		anchor_header->flags &= ~O_BTREE_FLAG_RIGHTMOST;
-		anchor_header->rightLink = MAKE_IN_MEMORY_RIGHTLINK(pages[0].blkno,
-															O_PAGE_GET_CHANGE_COUNT(O_GET_IN_MEMORY_PAGE(pages[0].blkno)));
-		anchor_header->prevInsertOffset = MaxOffsetNumber;
-		O_GET_IN_MEMORY_PAGEDESC(pages[0].blkno)->leftBlkno = anchor_blkno;
-		MARK_DIRTY(desc, anchor_blkno);
-	}
+	o_btree_ctid_batch_split_with_prebuilt_right(desc,
+												  anchor_blkno,
+												  pages[0].blkno,
+												  anchor_hikey,
+												  anchor_hikey_len,
+												  splitCsn,
+												  needsSplitUndo);
 
 	for (i = 0; i < pages_count; i++)
 	{
@@ -1858,44 +1893,13 @@ o_btree_try_ctid_batch_append(BTreeDescr *desc)
 
 		if (i + 1 < pages_count)
 		{
-			BTreePageItem page_items[BTREE_PAGE_MAX_SPLIT_ITEMS];
-			BTreePageItemLocator loc;
-			int			items_count = 0;
-
-			if (needsSplitUndo)
-			{
-				BTreePageHeader *next_header = (BTreePageHeader *) O_GET_IN_MEMORY_PAGE(pages[i + 1].blkno);
-				UndoLocation undoLocation = page_add_image_to_undo(desc, p, splitCsn,
-																   &pages[i + 1].first_key,
-																   pages[i + 1].first_key_len);
-
-				page_block_reads(pages[i].blkno);
-				page_block_reads(pages[i + 1].blkno);
-				header->undoLocation = undoLocation;
-				next_header->undoLocation = undoLocation;
-				pg_write_barrier();
-				header->csn = splitCsn;
-				next_header->csn = splitCsn;
-			}
-
-			BTREE_PAGE_LOCATOR_FIRST(p, &loc);
-			while (BTREE_PAGE_LOCATOR_IS_VALID(p, &loc))
-			{
-				Assert(items_count < BTREE_PAGE_MAX_SPLIT_ITEMS);
-				page_items[items_count].data = BTREE_PAGE_LOCATOR_GET_ITEM(p, &loc);
-				page_items[items_count].size = BTREE_PAGE_GET_ITEM_SIZE(p, &loc);
-				page_items[items_count].flags = BTREE_PAGE_GET_ITEM_FLAGS(p, &loc);
-				items_count++;
-				BTREE_PAGE_LOCATOR_NEXT(p, &loc);
-			}
-
-			btree_page_reorg(desc, p, page_items, items_count,
-							 pages[i + 1].first_key_len,
-							 pages[i + 1].first_key);
-			header->flags &= ~O_BTREE_FLAG_RIGHTMOST;
-			header->rightLink = MAKE_IN_MEMORY_RIGHTLINK(pages[i + 1].blkno,
-														 O_PAGE_GET_CHANGE_COUNT(O_GET_IN_MEMORY_PAGE(pages[i + 1].blkno)));
-			O_GET_IN_MEMORY_PAGEDESC(pages[i + 1].blkno)->leftBlkno = pages[i].blkno;
+			o_btree_ctid_batch_split_with_prebuilt_right(desc,
+														 pages[i].blkno,
+														 pages[i + 1].blkno,
+														 pages[i + 1].first_key,
+														 pages[i + 1].first_key_len,
+														 splitCsn,
+														 needsSplitUndo);
 		}
 		else
 		{
