@@ -1807,19 +1807,18 @@ o_btree_try_ctid_batch_append(BTreeDescr *desc)
 	}
 
 	bool		needsSplitUndo = o_btree_insert_needs_page_undo(desc, anchor_page);
-	CommitSeqNo splitCsn = needsSplitUndo ?
-		pg_atomic_read_u64(&TRANSAM_VARIABLES->nextCommitSeqNo) :
-		COMMITSEQNO_INPROGRESS;
+	CommitSeqNo splitCsn = COMMITSEQNO_INPROGRESS;
 
 	START_CRIT_SECTION();
 	{
 		BTreePageItem page_items[BTREE_PAGE_MAX_SPLIT_ITEMS];
 		BTreePageItemLocator loc;
 		int			items_count = 0;
-		BTreePageHeader *first_header = (BTreePageHeader *) O_GET_IN_MEMORY_PAGE(pages[0].blkno);
 
 		if (needsSplitUndo)
 		{
+			BTreePageHeader *first_header = (BTreePageHeader *) O_GET_IN_MEMORY_PAGE(pages[0].blkno);
+			splitCsn = pg_atomic_read_u64(&TRANSAM_VARIABLES->nextCommitSeqNo);
 			UndoLocation undoLocation = page_add_image_to_undo(desc, anchor_page, splitCsn,
 															   &anchor_hikey, anchor_hikey_len);
 
