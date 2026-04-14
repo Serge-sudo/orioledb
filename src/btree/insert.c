@@ -61,10 +61,23 @@ typedef struct BTreeInsertStackItem
 	bool		refind;
 } BTreeInsertStackItem;
 
+typedef struct
+{
+	OInMemoryBlkno blkno;
+	OTuple		first_key;
+	LocationIndex first_key_len;
+	bool		first_key_allocated;
+	int			inserted;
+} CtidBulkPage;
+
 /* Fills BTreeInsertStackItem as a downlink of current incomplete split. */
 static void o_btree_split_fill_downlink_item(BTreeInsertStackItem *insert_item,
 											 OInMemoryBlkno left_blkno,
 											 bool lock);
+static void o_btree_ctid_batch_insert_downlinks(BTreeDescr *desc,
+												OInMemoryBlkno anchor_blkno,
+												CtidBulkPage *pages,
+												int pages_count);
 
 /*
  * Finishes split of the rootPageBlkno page.
@@ -184,6 +197,50 @@ o_btree_split_fill_downlink_item(BTreeInsertStackItem *insert_item,
 
 	o_btree_split_fill_downlink_item_with_key(insert_item, left_blkno, lock,
 											  key, keylen, internal_header);
+}
+
+static void
+o_btree_ctid_batch_insert_downlinks(BTreeDescr *desc,
+									OInMemoryBlkno anchor_blkno,
+									CtidBulkPage *pages,
+									int pages_count)
+{
+	int			i;
+
+	for (i = 0; i < pages_count; i++)
+	{
+		OInMemoryBlkno left_blkno = (i == 0) ? anchor_blkno : pages[i - 1].blkno;
+		OInMemoryBlkno right_blkno = pages[i].blkno;
+		OBTreeFindPageContext parent_context;
+		BTreeInsertStackItem insert_item;
+		BTreeNonLeafTuphdr internal_header;
+		OFindPageResult findResult;
+
+		ppool_reserve_pages(desc->ppool, PPOOL_RESERVE_FIND, 2);
+		init_page_find_context(&parent_context, desc, COMMITSEQNO_INPROGRESS,
+							   BTREE_PAGE_FIND_MODIFY);
+		findResult = find_page(&parent_context, &pages[i].first_key,
+							   BTreeKeyNonLeafKey, 1);
+		if (findResult != OFindPageResultSuccess)
+		{
+			ppool_release_reserved(desc->ppool,
+								   PPOOL_KIND_GET_MASK(PPOOL_RESERVE_FIND));
+			elog(ERROR, "failed to find parent page for CTID bulk append downlink");
+		}
+
+		insert_item.next = NULL;
+		insert_item.context = &parent_context;
+		o_btree_split_fill_downlink_item_with_key(&insert_item, left_blkno, false,
+												  pages[i].first_key,
+												  pages[i].first_key_len,
+												  &internal_header);
+		insert_item.level = 1;
+		insert_item.replace = false;
+		insert_item.rightBlkno = right_blkno;
+		insert_item.refind = false;
+		/* o_btree_insert_item() consumes/releases PPOOL_RESERVE_FIND reserve. */
+		o_btree_insert_item(&insert_item, PPOOL_RESERVE_FIND);
+	}
 }
 
 static OInMemoryBlkno
@@ -1518,14 +1575,6 @@ o_btree_try_ctid_batch_append(BTreeDescr *desc)
 	OTuple		anchor_hikey;
 	LocationIndex anchor_hikey_len;
 	bool		anchor_hikey_allocated = false;
-	typedef struct
-	{
-		OInMemoryBlkno blkno;
-		OTuple		first_key;
-		LocationIndex first_key_len;
-		bool		first_key_allocated;
-		int			inserted;
-	} CtidBulkPage;
 	CtidBulkPage *pages = NULL;
 	int			pages_capacity = 0;
 	int			pages_count = 0;
@@ -1824,42 +1873,14 @@ o_btree_try_ctid_batch_append(BTreeDescr *desc)
 	pg_atomic_fetch_add_u32(&BTREE_GET_META(desc)->leafPagesNum, added_pages);
 	END_CRIT_SECTION();
 
+	for (i = 0; i < pages_count; i++)
+		btree_register_inprogress_split(pages[i].blkno);
+
 	unlock_page(anchor_blkno);
 	for (i = 0; i < pages_count; i++)
 		unlock_page(pages[i].blkno);
 
-	for (i = 0; i < pages_count; i++)
-	{
-		OBTreeFindPageContext parent_context;
-		BTreeInsertStackItem insert_item;
-		BTreeNonLeafTuphdr internal_header;
-
-		ppool_reserve_pages(desc->ppool, PPOOL_RESERVE_FIND, 2);
-		init_page_find_context(&parent_context, desc, COMMITSEQNO_INPROGRESS,
-							   BTREE_PAGE_FIND_MODIFY);
-		findResult = find_page(&parent_context, &pages[i].first_key,
-							   BTreeKeyNonLeafKey, 1);
-		if (findResult != OFindPageResultSuccess)
-		{
-			ppool_release_reserved(desc->ppool,
-								   PPOOL_KIND_GET_MASK(PPOOL_RESERVE_FIND));
-			elog(ERROR, "failed to find parent page for CTID bulk append downlink");
-		}
-
-		internal_header.downlink = MAKE_IN_MEMORY_DOWNLINK(pages[i].blkno,
-														   O_PAGE_GET_CHANGE_COUNT(O_GET_IN_MEMORY_PAGE(pages[i].blkno)));
-		insert_item.next = NULL;
-		insert_item.context = &parent_context;
-		insert_item.tuple = pages[i].first_key;
-		insert_item.tuplen = pages[i].first_key_len;
-		insert_item.tupheader = (Pointer) &internal_header;
-		insert_item.level = 1;
-		insert_item.replace = false;
-		insert_item.rightBlkno = OInvalidInMemoryBlkno;
-		insert_item.refind = false;
-		/* o_btree_insert_item() consumes/releases PPOOL_RESERVE_FIND reserve. */
-		o_btree_insert_item(&insert_item, PPOOL_RESERVE_FIND);
-	}
+	o_btree_ctid_batch_insert_downlinks(desc, anchor_blkno, pages, pages_count);
 
 	if (anchor_hikey_allocated)
 		pfree(anchor_hikey.data);
