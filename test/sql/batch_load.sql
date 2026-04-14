@@ -18,6 +18,12 @@ COPY o_test_n FROM '/tmp/o_test_unsort.csv' WITH (FORMAT csv);
 
 SELECT COUNT(*) FROM o_test;
 SELECT COUNT(*) FROM o_test_n;
+SELECT (COUNT(*) = (MAX(off) - MIN(off) + 1) AND MIN(blk) = MAX(blk))
+FROM (
+	SELECT split_part(trim(both '()' from ctid::text), ',', 1)::int AS blk,
+		   split_part(trim(both '()' from ctid::text), ',', 2)::int AS off
+	FROM o_test
+) s;
 
 DROP TABLE o_test;
 DROP TABLE o_test_n;

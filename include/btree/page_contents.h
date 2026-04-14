@@ -384,6 +384,7 @@ extern void page_cut_first_key(Page node);
 
 typedef struct ItemPointerData ItemPointerData;
 extern ItemPointerData btree_ctid_get_and_inc(BTreeDescr *desc);
+extern ItemPointerData btree_ctid_get_and_inc_n(BTreeDescr *desc, uint64 count);
 extern void btree_ctid_update_if_needed(BTreeDescr *desc, ItemPointerData ctid);
 
 extern void copy_fixed_tuple(BTreeDescr *desc, OFixedTuple *dst, OTuple src);
