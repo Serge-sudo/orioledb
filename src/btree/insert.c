@@ -85,6 +85,11 @@ static void o_btree_ctid_batch_split_with_prebuilt_right(BTreeDescr *desc,
 														  LocationIndex split_key_len,
 														  CommitSeqNo csn,
 														  bool needsUndo);
+static bool o_btree_ctid_batch_make_split_item(BTreeDescr *desc,
+												Page page,
+												OTuple *split_item,
+												LocationIndex *split_item_len,
+												bool *split_item_allocated);
 
 /*
  * Finishes split of the rootPageBlkno page.
@@ -269,8 +274,27 @@ o_btree_ctid_batch_split_with_prebuilt_right(BTreeDescr *desc,
 
 	if (needsUndo)
 	{
-		UndoLocation undoLocation = page_add_image_to_undo(desc, left_page, csn,
-														   &split_key, split_key_len);
+		OTuple		undo_split_item = split_key;
+		LocationIndex undo_split_item_len = split_key_len;
+		bool		undo_split_item_allocated = false;
+		UndoLocation undoLocation;
+
+		if (o_btree_ctid_batch_make_split_item(desc, left_page,
+											   &undo_split_item,
+											   &undo_split_item_len,
+											   &undo_split_item_allocated))
+		{
+			undoLocation = page_add_image_to_undo(desc, left_page, csn,
+												  &undo_split_item,
+												  undo_split_item_len);
+			if (undo_split_item_allocated)
+				pfree(undo_split_item.data);
+		}
+		else
+		{
+			undoLocation = page_add_image_to_undo(desc, left_page, csn,
+												  &split_key, split_key_len);
+		}
 
 		page_block_reads(left_blkno);
 		page_block_reads(right_blkno);
@@ -307,6 +331,41 @@ o_btree_ctid_batch_split_with_prebuilt_right(BTreeDescr *desc,
 	MARK_DIRTY(desc, left_blkno);
 	if (needsUndo)
 		MARK_DIRTY(desc, right_blkno);
+}
+
+static bool
+o_btree_ctid_batch_make_split_item(BTreeDescr *desc,
+								   Page page,
+								   OTuple *split_item,
+								   LocationIndex *split_item_len,
+								   bool *split_item_allocated)
+{
+	BTreePageItemLocator loc;
+	OTuple		last_item;
+
+	*split_item_allocated = false;
+	BTREE_PAGE_LOCATOR_TAIL(page, &loc);
+	if (!BTREE_PAGE_LOCATOR_IS_VALID(page, &loc))
+		return false;
+
+	BTREE_PAGE_READ_LEAF_TUPLE(last_item, page, &loc);
+	last_item = o_btree_tuple_make_key(desc, last_item, NULL, false,
+									   split_item_allocated);
+	*split_item_len = o_btree_len(desc, last_item, OKeyLength);
+
+	if (*split_item_allocated)
+	{
+		*split_item = last_item;
+	}
+	else
+	{
+		split_item->data = (Pointer) palloc(*split_item_len);
+		split_item->formatFlags = last_item.formatFlags;
+		memcpy(split_item->data, last_item.data, *split_item_len);
+		*split_item_allocated = true;
+	}
+
+	return true;
 }
 
 static OInMemoryBlkno
