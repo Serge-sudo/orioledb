@@ -285,8 +285,6 @@ o_btree_ctid_batch_split_with_prebuilt_right(BTreeDescr *desc,
 											   &undo_split_item_allocated))
 			Assert(undo_split_item_len > 0);
 
-		Assert(undo_split_item_len > 0);
-
 		undoLocation = page_add_image_to_undo(desc, left_page, csn,
 											  &undo_split_item,
 											  undo_split_item_len);
@@ -349,12 +347,18 @@ o_btree_ctid_batch_make_split_item(BTreeDescr *desc,
 	last_item = o_btree_tuple_make_key(desc, last_item, NULL, false,
 									   split_item_allocated);
 	*split_item_len = o_btree_len(desc, last_item, OKeyLength);
-	split_item->data = palloc(*split_item_len);
-	split_item->formatFlags = last_item.formatFlags;
-	memcpy(split_item->data, last_item.data, *split_item_len);
+
 	if (*split_item_allocated)
-		pfree(last_item.data);
-	*split_item_allocated = true;
+	{
+		*split_item = last_item;
+	}
+	else
+	{
+		split_item->data = palloc(*split_item_len);
+		split_item->formatFlags = last_item.formatFlags;
+		memcpy(split_item->data, last_item.data, *split_item_len);
+		*split_item_allocated = true;
+	}
 
 	return true;
 }
