@@ -26,6 +26,7 @@ extern void o_btree_insert_tuple_to_leaf(OBTreeFindPageContext *context,
 										 BTreeLeafTuphdr *leaf_header,
 										 bool replace,
 										 int reserve_kind);
+extern int o_btree_try_ctid_batch_append(BTreeDescr *desc);
 extern bool o_btree_split_is_incomplete(OInMemoryBlkno left_blkno,
 										uint32 pageChangeCount,
 										bool *relocked);
