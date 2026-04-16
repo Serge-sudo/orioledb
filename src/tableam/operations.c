@@ -391,7 +391,6 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	bool		use_ctid = primary->primaryIsCtid;
 	int			i;
 	OBatchInsertState batch_state;
-	OTuple	   *batch_tuples = NULL;
 	TupleTableSlot *slot;
 
 	o_btree_ensure_initialized(&primary->desc);
@@ -401,24 +400,15 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	memset(&batch_state, 0, sizeof(batch_state));
 	batch_state.capacity = ntuples;
 	if (ntuples > 0)
-	{
-		batch_state.tuples = palloc(sizeof(OTuple *) * ntuples);
-		batch_state.leaf_headers = palloc(sizeof(BTreeLeafTuphdr) * ntuples);
-		batch_state.tuplens = palloc(sizeof(LocationIndex) * ntuples);
-		batch_state.orig_slots = palloc(sizeof(TupleTableSlot *) * ntuples);
-		batch_state.slots = palloc(sizeof(TupleTableSlot *) * ntuples);
-		batch_tuples = palloc(sizeof(OTuple) * ntuples);
-	}
+		batch_state.entries = palloc(sizeof(OBatchInsertEntry) * ntuples);
 
 	for (i = 0; i < ntuples; i++)
 	{
 		OTuple		tuple;
-		OTuple	   *tuple_ptr;
 		LocationIndex tuplen;
 		BTreeLeafTuphdr leaf_header;
 
 		slot = slots[i];
-		tuple_ptr = &batch_tuples[i];
 
 		if (slot->tts_ops != descr->newTuple->tts_ops ||
 			(((OTableSlot *) slot)->descr != NULL &&
@@ -454,11 +444,10 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 		leaf_header.xactInfo = OXID_GET_XACT_INFO(oxid,
 												  RowLockUpdate,
 												  false);
-		*tuple_ptr = tuple;
 		orioledb_batch_state_add(&batch_state,
 								   slots[i],
 								   slot,
-								   tuple_ptr,
+								   tuple,
 								   tuplen,
 								   leaf_header);
 	}
@@ -491,14 +480,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 
 	orioledb_batch_state_reset();
 	if (ntuples > 0)
-	{
-		pfree(batch_tuples);
-		pfree(batch_state.tuples);
-		pfree(batch_state.leaf_headers);
-		pfree(batch_state.tuplens);
-		pfree(batch_state.orig_slots);
-		pfree(batch_state.slots);
-	}
+		pfree(batch_state.entries);
 }
 
 static RowLockMode

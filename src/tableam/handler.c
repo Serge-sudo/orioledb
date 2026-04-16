@@ -1878,7 +1878,7 @@ orioledb_batch_state_get_slot(void)
 {
 	if (batch_state != NULL &&
 		batch_state->current < batch_state->nitems)
-		return batch_state->slots[batch_state->current];
+		return batch_state->entries[batch_state->current].slot;
 
 	return NULL;
 }
@@ -1888,7 +1888,7 @@ orioledb_batch_state_get_orig_slot(void)
 {
 	if (batch_state != NULL &&
 		batch_state->current < batch_state->nitems)
-		return batch_state->orig_slots[batch_state->current];
+		return batch_state->entries[batch_state->current].orig_slot;
 
 	return NULL;
 }
@@ -1897,10 +1897,12 @@ OBatchInsertState *
 orioledb_batch_state_add(OBatchInsertState *state,
 						   TupleTableSlot *orig_slot,
 						   TupleTableSlot *slot,
-						   OTuple *tuple,
+						   OTuple tuple,
 						   LocationIndex tuplen,
 						   BTreeLeafTuphdr leaf_header)
 {
+	OBatchInsertEntry *entry;
+
 	if (batch_state == NULL)
 	{
 		batch_state = state;
@@ -1913,11 +1915,12 @@ orioledb_batch_state_add(OBatchInsertState *state,
 	if (batch_state->nitems >= batch_state->capacity)
 		elog(ERROR, "batch insert state capacity overflow");
 
-	batch_state->orig_slots[batch_state->nitems] = orig_slot;
-	batch_state->slots[batch_state->nitems] = slot;
-	batch_state->tuples[batch_state->nitems] = tuple;
-	batch_state->tuplens[batch_state->nitems] = tuplen;
-	batch_state->leaf_headers[batch_state->nitems] = leaf_header;
+	entry = &batch_state->entries[batch_state->nitems];
+	entry->orig_slot = orig_slot;
+	entry->slot = slot;
+	entry->tuple = tuple;
+	entry->tuplen = tuplen;
+	entry->leaf_header = leaf_header;
 	batch_state->nitems++;
 
 	return batch_state;
@@ -1953,7 +1956,7 @@ orioledb_batch_state_get_tuple(void)
 
 	if (batch_state != NULL &&
 		batch_state->current < batch_state->nitems)
-		return *batch_state->tuples[batch_state->current];
+		return batch_state->entries[batch_state->current].tuple;
 
 	O_TUPLE_SET_NULL(tuple);
 	return tuple;
@@ -1970,7 +1973,7 @@ orioledb_batch_state_get_tuplen(void)
 {
 	if (batch_state != NULL &&
 		batch_state->current < batch_state->nitems)
-		return batch_state->tuplens[batch_state->current];
+		return batch_state->entries[batch_state->current].tuplen;
 
 	return 0;
 }
@@ -1980,7 +1983,7 @@ orioledb_batch_state_get_leaf_header(void)
 {
 	if (batch_state != NULL &&
 		batch_state->current < batch_state->nitems)
-		return batch_state->leaf_headers[batch_state->current];
+		return batch_state->entries[batch_state->current].leaf_header;
 
 	BTreeLeafTuphdr result = {0};
 	return result;

@@ -223,13 +223,18 @@ typedef ParallelOScanDescData *ParallelOScanDesc;
 
 extern bool in_nontransactional_truncate;
 
+typedef struct OBatchInsertEntry
+{
+	OTuple		tuple;
+	BTreeLeafTuphdr leaf_header;
+	LocationIndex tuplen;
+	TupleTableSlot *orig_slot;
+	TupleTableSlot *slot;
+} OBatchInsertEntry;
+
 typedef struct OBatchInsertState
 {
-	OTuple	  **tuples;
-	BTreeLeafTuphdr *leaf_headers;
-	LocationIndex *tuplens;
-	TupleTableSlot **orig_slots;
-	TupleTableSlot **slots;
+	OBatchInsertEntry *entries;
 	int			nitems;
 	int			capacity;
 	int			current;
@@ -240,7 +245,7 @@ extern TupleTableSlot * orioledb_batch_state_get_orig_slot(void);
 extern OBatchInsertState * orioledb_batch_state_add(OBatchInsertState *state,
 													  TupleTableSlot *orig_slot,
 													  TupleTableSlot *slot,
-													  OTuple *tuple,
+													  OTuple tuple,
 													  LocationIndex tuplen,
 													  BTreeLeafTuphdr leaf_header);
 extern void orioledb_batch_state_advance(void);
