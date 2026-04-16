@@ -1909,23 +1909,9 @@ orioledb_multi_insert_push(OBatchInsertState *state,
 	}
 
 	Assert(batch_state == state);
-
+	Assert(batch_state->nitems < batch_state->capacity);
 	if (batch_state->nitems >= batch_state->capacity)
-	{
-		int			new_capacity = Max(batch_state->capacity * 2, 8);
-
-		batch_state->tuples = repalloc(batch_state->tuples,
-									   sizeof(OTuple *) * new_capacity);
-		batch_state->leaf_headers = repalloc(batch_state->leaf_headers,
-											 sizeof(BTreeLeafTuphdr) * new_capacity);
-		batch_state->tuplens = repalloc(batch_state->tuplens,
-										sizeof(LocationIndex) * new_capacity);
-		batch_state->orig_slots = repalloc(batch_state->orig_slots,
-										   sizeof(TupleTableSlot *) * new_capacity);
-		batch_state->slots = repalloc(batch_state->slots,
-									  sizeof(TupleTableSlot *) * new_capacity);
-		batch_state->capacity = new_capacity;
-	}
+		elog(ERROR, "batch insert state capacity overflow");
 
 	batch_state->orig_slots[batch_state->nitems] = orig_slot;
 	batch_state->slots[batch_state->nitems] = slot;
