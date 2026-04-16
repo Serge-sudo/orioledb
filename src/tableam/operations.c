@@ -397,7 +397,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	o_btree_ensure_initialized(&primary->desc);
 
 	reserve_undo_size(UndoLogRegular, MAXIMUM_ALIGNOF);
-	orioledb_multi_insert_reset_head();
+	orioledb_batch_state_reset();
 	memset(&batch_state, 0, sizeof(batch_state));
 	batch_state.capacity = ntuples;
 	if (ntuples > 0)
@@ -455,7 +455,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 												  RowLockUpdate,
 												  false);
 		*tuple_ptr = tuple;
-		orioledb_multi_insert_push(&batch_state,
+		orioledb_batch_state_add(&batch_state,
 								   slots[i],
 								   slot,
 								   tuple_ptr,
@@ -463,16 +463,16 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 								   leaf_header);
 	}
 
-	while ((slot = orioledb_multi_insert_get_slot()) != NULL)
+	while ((slot = orioledb_batch_state_get_slot()) != NULL)
 	{
-		TupleTableSlot *orig_slot = orioledb_multi_insert_get_orig_slot();
+		TupleTableSlot *orig_slot = orioledb_batch_state_get_orig_slot();
 		o_tbl_insert_single_batch(descr, relation, orig_slot, slot, oxid, csn);
 	}
 
 	pgstat_count_heap_insert(relation, ntuples);
 
-	orioledb_multi_insert_set_head(&batch_state);
-	while ((slot = orioledb_multi_insert_get_orig_slot()) != NULL)
+	orioledb_batch_state_set(&batch_state);
+	while ((slot = orioledb_batch_state_get_orig_slot()) != NULL)
 	{
 		OTuple tup;
 		o_toast_insert_values(relation, descr, slot, oxid, csn);
@@ -486,10 +486,10 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 						 relation->rd_rel->relreplident,
 						 descr->version);
 
-		orioledb_multi_insert_next();
+		orioledb_batch_state_advance();
 	}
 
-	orioledb_multi_insert_reset_head();
+	orioledb_batch_state_reset();
 	if (ntuples > 0)
 	{
 		pfree(batch_tuples);

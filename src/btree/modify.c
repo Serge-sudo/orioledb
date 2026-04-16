@@ -1010,8 +1010,8 @@ o_btree_normal_modify(BTreeDescr *desc, BTreeOperationType action,
 	}
 
 	/* if we are doing multi-insert, reserve undo for all items at once */
-	if (orioledb_multi_insert_get_nitems() > 0)
-		reserve_undo_for_modification(desc->undoType, orioledb_multi_insert_get_nitems());
+	if (orioledb_batch_state_get_nitems() > 0)
+		reserve_undo_for_modification(desc->undoType, orioledb_batch_state_get_nitems());
 	else
 		reserve_undo_for_modification(desc->undoType, 1);
 

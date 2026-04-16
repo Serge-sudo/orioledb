@@ -235,22 +235,22 @@ typedef struct OBatchInsertState
 	int			current;
 } OBatchInsertState;
 
-extern TupleTableSlot * orioledb_multi_insert_get_slot(void);
-extern TupleTableSlot * orioledb_multi_insert_get_orig_slot(void);
-extern OBatchInsertState * orioledb_multi_insert_push(OBatchInsertState *state,
+extern TupleTableSlot * orioledb_batch_state_get_slot(void);
+extern TupleTableSlot * orioledb_batch_state_get_orig_slot(void);
+extern OBatchInsertState * orioledb_batch_state_add(OBatchInsertState *state,
 													  TupleTableSlot *orig_slot,
 													  TupleTableSlot *slot,
 													  OTuple *tuple,
 													  LocationIndex tuplen,
 													  BTreeLeafTuphdr leaf_header);
-extern void orioledb_multi_insert_next(void);
-extern int orioledb_multi_insert_get_nitems(void);
+extern void orioledb_batch_state_advance(void);
+extern int orioledb_batch_state_get_nitems(void);
 extern bool
-orioledb_multi_insert_is_finished(void);
-extern void orioledb_multi_insert_reset_head(void);
-extern void orioledb_multi_insert_set_head(OBatchInsertState *state);
-extern OTuple orioledb_multi_insert_get_tuple(void);
-extern LocationIndex orioledb_multi_insert_get_tuplen(void);
-extern BTreeLeafTuphdr orioledb_multi_insert_get_leaf_header(void);
+orioledb_batch_state_is_finished(void);
+extern void orioledb_batch_state_reset(void);
+extern void orioledb_batch_state_set(OBatchInsertState *state);
+extern OTuple orioledb_batch_state_get_tuple(void);
+extern LocationIndex orioledb_batch_state_get_tuplen(void);
+extern BTreeLeafTuphdr orioledb_batch_state_get_leaf_header(void);
 
 #endif

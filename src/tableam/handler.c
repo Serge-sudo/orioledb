@@ -1874,7 +1874,7 @@ orioledb_getnextslot(TableScanDesc sscan, ScanDirection direction,
 OBatchInsertState *batch_state = NULL;
 
 TupleTableSlot *
-orioledb_multi_insert_get_slot(void)
+orioledb_batch_state_get_slot(void)
 {
 	if (batch_state != NULL &&
 		batch_state->current < batch_state->nitems)
@@ -1884,7 +1884,7 @@ orioledb_multi_insert_get_slot(void)
 }
 
 TupleTableSlot *
-orioledb_multi_insert_get_orig_slot(void)
+orioledb_batch_state_get_orig_slot(void)
 {
 	if (batch_state != NULL &&
 		batch_state->current < batch_state->nitems)
@@ -1894,7 +1894,7 @@ orioledb_multi_insert_get_orig_slot(void)
 }
 
 OBatchInsertState *
-orioledb_multi_insert_push(OBatchInsertState *state,
+orioledb_batch_state_add(OBatchInsertState *state,
 						   TupleTableSlot *orig_slot,
 						   TupleTableSlot *slot,
 						   OTuple *tuple,
@@ -1924,13 +1924,13 @@ orioledb_multi_insert_push(OBatchInsertState *state,
 }
 
 void
-orioledb_multi_insert_reset_head(void)
+orioledb_batch_state_reset(void)
 {
 	batch_state = NULL;
 }
 
 void
-orioledb_multi_insert_set_head(OBatchInsertState *state)
+orioledb_batch_state_set(OBatchInsertState *state)
 {
 	batch_state = state;
 	if (batch_state != NULL)
@@ -1938,7 +1938,7 @@ orioledb_multi_insert_set_head(OBatchInsertState *state)
 }
 
 int
-orioledb_multi_insert_get_nitems(void)
+orioledb_batch_state_get_nitems(void)
 {
 	if (batch_state)
 		return Min(batch_state->nitems, 100);
@@ -1947,7 +1947,7 @@ orioledb_multi_insert_get_nitems(void)
 }
 
 OTuple
-orioledb_multi_insert_get_tuple(void)
+orioledb_batch_state_get_tuple(void)
 {
 	OTuple		tuple;
 
@@ -1960,13 +1960,13 @@ orioledb_multi_insert_get_tuple(void)
 }
 
 bool
-orioledb_multi_insert_is_finished(void)
+orioledb_batch_state_is_finished(void)
 {
 	return batch_state == NULL || batch_state->current >= batch_state->nitems;
 }
 
 LocationIndex
-orioledb_multi_insert_get_tuplen(void)
+orioledb_batch_state_get_tuplen(void)
 {
 	if (batch_state != NULL &&
 		batch_state->current < batch_state->nitems)
@@ -1976,7 +1976,7 @@ orioledb_multi_insert_get_tuplen(void)
 }
 
 BTreeLeafTuphdr
-orioledb_multi_insert_get_leaf_header(void)
+orioledb_batch_state_get_leaf_header(void)
 {
 	if (batch_state != NULL &&
 		batch_state->current < batch_state->nitems)
@@ -1987,7 +1987,7 @@ orioledb_multi_insert_get_leaf_header(void)
 }
 
 void
-orioledb_multi_insert_next(void)
+orioledb_batch_state_advance(void)
 {
 	if (batch_state != NULL &&
 		batch_state->current < batch_state->nitems)

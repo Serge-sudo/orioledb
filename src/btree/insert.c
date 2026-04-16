@@ -1224,7 +1224,7 @@ o_btree_insert_item_with_batch(BTreeInsertStackItem *insert_item,
 		BTreeLeafTuphdrSize + MAXALIGN(sizeof(LocationIndex)) > BTREE_PAGE_FREE_SPACE(p))
 	{
 		bool res =  o_btree_insert_item_no_waiters(insert_item, reserve_kind);
-		orioledb_multi_insert_next();
+		orioledb_batch_state_advance();
 		return res;
 	}
 
@@ -1252,12 +1252,12 @@ o_btree_insert_item_with_batch(BTreeInsertStackItem *insert_item,
 		}
 		else
 		{
-			if (orioledb_multi_insert_is_finished())
+			if (orioledb_batch_state_is_finished())
 				break;
 
-			tuple  = orioledb_multi_insert_get_tuple();
-			tuphdr = orioledb_multi_insert_get_leaf_header();
-			tuplen = orioledb_multi_insert_get_tuplen();
+			tuple  = orioledb_batch_state_get_tuple();
+			tuphdr = orioledb_batch_state_get_leaf_header();
+			tuplen = orioledb_batch_state_get_tuplen();
 
 			if (!O_PAGE_IS(p, RIGHTMOST))
 			{
@@ -1316,7 +1316,7 @@ o_btree_insert_item_with_batch(BTreeInsertStackItem *insert_item,
 			header->chunkDesc[loc.chunkOffset].chunkKeysFixed = 0;
 		MARK_DIRTY(desc, blkno);
 		END_CRIT_SECTION();
-		orioledb_multi_insert_next();
+		orioledb_batch_state_advance();
 	}
 	unlock_page(blkno);
 
@@ -1448,7 +1448,7 @@ o_btree_insert_item(BTreeInsertStackItem *insert_item, int reserve_kind)
 		else
 			tupleWaitersCount = 0;
 
-		if (insert_item->level == 0 && orioledb_multi_insert_get_slot())
+		if (insert_item->level == 0 && orioledb_batch_state_get_slot())
 			next = o_btree_insert_item_with_batch(insert_item, reserve_kind);
 		else if (tupleWaitersCount > 0)
 			next = o_btree_insert_item_with_waiters(insert_item,
