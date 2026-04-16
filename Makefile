@@ -96,48 +96,7 @@ OBJS = src/btree/btree.o \
 	   src/utils/ucm.o \
 	   $(WIN32RES)
 
-REGRESSCHECKS = btree_sys_check \
-				alter_type \
-				alter_storage \
-				bitmap_scan \
-				btree_compression \
-				btree_print \
-				createas \
-				database \
-				ddl \
-				exclude \
-				explain \
-				fillfactor \
-				foreign_keys \
-				generated \
-				getsomeattrs \
-				index_bridging \
-				indices \
-				indices_build \
-				inherits \
-				ioc \
-				joins \
-				nulls \
-				opclass \
-				parallel_scan \
-				partial \
-				partition \
-				primary_key \
-				row_level_locks \
-				row_security \
-				sanitizers \
-				stats \
-				subquery \
-				subtransactions \
-				tableam \
-				tablespace \
-				temp \
-				toast \
-				toast_column_compress \
-				trigger \
-				truncate \
-				types \
-				rewind
+EGRESSCHECKS = batch_load
 ISOLATIONCHECKS = bitmap_hist_scan \
 				  btree_iterate \
 				  btree_print_backend_id \

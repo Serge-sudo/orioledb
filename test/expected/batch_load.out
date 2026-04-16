@@ -1,0 +1,383 @@
+CREATE EXTENSION orioledb;
+-- -- test 1: ctid
+-- CREATE TABLE o_test(
+-- 	id integer NOT NULL,
+-- 	val text NOT NULL
+-- ) USING orioledb;
+-- CREATE TABLE o_test_n(
+-- 	id integer NOT NULL,
+-- 	val text NOT NULL
+-- );
+-- \timing
+-- COPY o_test FROM '/tmp/o_test_unsort.csv' WITH (FORMAT csv);
+-- COPY o_test_n FROM '/tmp/o_test_unsort.csv' WITH (FORMAT csv);
+-- \timing
+-- SELECT COUNT(*) FROM o_test;
+-- SELECT COUNT(*) FROM o_test_n;
+-- DROP TABLE o_test;
+-- DROP TABLE o_test_n;
+-- -- test 2: sorted input with pk
+-- CREATE TABLE o_test(
+-- 	id integer NOT NULL,
+-- 	val text NOT NULL,
+-- 	PRIMARY KEY (id)
+-- ) USING orioledb;
+-- CREATE TABLE o_test_n(
+-- 	id integer NOT NULL,
+-- 	val text NOT NULL,
+-- 	PRIMARY KEY (id)
+-- );
+-- \timing
+-- COPY o_test FROM '/tmp/o_test_sort.csv' WITH (FORMAT csv);
+-- COPY o_test_n FROM '/tmp/o_test_sort.csv' WITH (FORMAT csv);
+-- \timing
+-- SELECT COUNT(*) FROM o_test;
+-- SELECT COUNT(*) FROM o_test_n;
+-- DROP TABLE o_test;
+-- DROP TABLE o_test_n;
+-- -- test 3: unsorted input with pk
+-- CREATE TABLE o_test(
+-- 	id integer NOT NULL,
+-- 	val text NOT NULL,
+-- 	PRIMARY KEY (id)
+-- ) USING orioledb;
+-- CREATE TABLE o_test_n(
+-- 	id integer NOT NULL,
+-- 	val text NOT NULL,
+-- 	PRIMARY KEY (id)
+-- );
+-- \timing
+-- COPY o_test FROM '/tmp/o_test_unsort.csv' WITH (FORMAT csv);
+-- COPY o_test_n FROM '/tmp/o_test_unsort.csv' WITH (FORMAT csv);
+-- \timing
+-- SELECT COUNT(*) FROM o_test;
+-- SELECT COUNT(*) FROM o_test_n;
+-- DROP TABLE o_test;
+-- -- test 4:
+-- CREATE TABLE o_test(
+-- 	id integer NOT NULL,
+-- 	val text NOT NULL,
+-- 	PRIMARY KEY (id)
+-- ) USING orioledb;
+-- INSERT INTO o_test SELECT i, 'val' || i FROM generate_series(1, 170) s(i) where i % 3 = 0;
+-- SELECT orioledb_idx_structure('o_test'::regclass, 'o_test_pkey', 'nue', 3);
+-- COPY o_test FROM '/tmp/o_test_hole.csv' WITH (FORMAT csv);
+-- SELECT orioledb_idx_structure('o_test'::regclass, 'o_test_pkey', 'nue', 3);
+-- SELECT COUNT(*) FROM o_test;
+-- DROP TABLE o_test;
+-- test 5:
+-- CREATE TABLE o_test(
+-- 	id integer NOT NULL,
+-- 	val text NOT NULL,
+-- 	PRIMARY KEY (id)
+-- ) USING orioledb;
+-- INSERT INTO o_test SELECT i, 'val' || i FROM generate_series(1, 170) s(i);
+-- DELETE FROM o_test WHERE id % 3 != 0;
+-- SELECT orioledb_idx_structure('o_test'::regclass, 'o_test_pkey', 'nue', 3);
+-- COPY o_test FROM '/tmp/o_test_hole.csv' WITH (FORMAT csv);
+-- SELECT orioledb_idx_structure('o_test'::regclass, 'o_test_pkey', 'nue', 3);
+-- SELECT COUNT(*) FROM o_test;
+-- DROP TABLE o_test;
+-- -- test 6: unqiue
+-- CREATE TABLE o_test(
+-- 	id integer NOT NULL,
+-- 	val text NOT NULL,
+-- 	PRIMARY KEY (id)
+-- ) USING orioledb;
+-- INSERT INTO o_test SELECT i, 'val' || i FROM generate_series(1, 170) s(i);
+-- SELECT COUNT(*) FROM o_test;
+-- COPY o_test FROM '/tmp/o_test_hole.csv' WITH (FORMAT csv);
+-- SELECT COUNT(*) FROM o_test;
+-- DELETE FROM o_test WHERE id = 1;
+-- COPY o_test FROM '/tmp/o_test_hole.csv' WITH (FORMAT csv);
+-- SELECT COUNT(*) FROM o_test;
+-- DROP TABLE o_test;
+-- DROP EXTENSION orioledb CASCADE;
+-- test 7: undo
+CREATE TABLE o_test(
+	id integer NOT NULL,
+	val text NOT NULL,
+	PRIMARY KEY (id)
+) USING orioledb;
+BEGIN;
+SELECT COUNT(*) FROM o_test;
+ count 
+-------
+     0
+(1 row)
+
+COPY o_test FROM '/tmp/o_test_hole.csv' WITH (FORMAT csv);
+WARNING:  Trying batch insert for page 2050 0 24 16 7936
+WARNING:  Batch insert failed for page 2050. Fallback to non-batch insert.
+WARNING:  Trying batch insert for page 2050 1 24 16 7888
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  new insert
+WARNING:  detected write past chunk end in PortalContext 0x31de318
+SELECT COUNT(*) FROM o_test;
+ count 
+-------
+   114
+(1 row)
+
+SELECT orioledb_idx_structure('o_test'::regclass, 'o_test_pkey', 'nue', 3);
+                        orioledb_idx_structure                         
+-----------------------------------------------------------------------
+ Index o_test_pkey contents                                           +
+ Page 0: level = 0, maxKeyLen = 8, nVacatedBytes = 0                  +
+ state = free, datoid equal, relnode equal, ix_type = primary, dirty  +
+     Leftmost, Rightmost                                              +
+   Chunk 0: offset = 0, location = 256, hikey location = 64           +
+     Item 0: mode = update, offset = 488, tuple = ('1', 'val1')       +
+     Item 1: mode = update, offset = 528, tuple = ('2', 'val2')       +
+     Item 2: mode = update, offset = 568, tuple = ('4', 'val4')       +
+     Item 3: mode = update, offset = 608, tuple = ('5', 'val5')       +
+     Item 4: mode = update, offset = 648, tuple = ('7', 'val7')       +
+     Item 5: mode = update, offset = 688, tuple = ('8', 'val8')       +
+     Item 6: mode = update, offset = 728, tuple = ('10', 'val10')     +
+     Item 7: mode = update, offset = 768, tuple = ('11', 'val11')     +
+     Item 8: mode = update, offset = 808, tuple = ('13', 'val13')     +
+     Item 9: mode = update, offset = 848, tuple = ('14', 'val14')     +
+     Item 10: mode = update, offset = 888, tuple = ('16', 'val16')    +
+     Item 11: mode = update, offset = 928, tuple = ('17', 'val17')    +
+     Item 12: mode = update, offset = 968, tuple = ('19', 'val19')    +
+     Item 13: mode = update, offset = 1008, tuple = ('20', 'val20')   +
+     Item 14: mode = update, offset = 1048, tuple = ('22', 'val22')   +
+     Item 15: mode = update, offset = 1088, tuple = ('23', 'val23')   +
+     Item 16: mode = update, offset = 1128, tuple = ('25', 'val25')   +
+     Item 17: mode = update, offset = 1168, tuple = ('26', 'val26')   +
+     Item 18: mode = update, offset = 1208, tuple = ('28', 'val28')   +
+     Item 19: mode = update, offset = 1248, tuple = ('29', 'val29')   +
+     Item 20: mode = update, offset = 1288, tuple = ('31', 'val31')   +
+     Item 21: mode = update, offset = 1328, tuple = ('32', 'val32')   +
+     Item 22: mode = update, offset = 1368, tuple = ('34', 'val34')   +
+     Item 23: mode = update, offset = 1408, tuple = ('35', 'val35')   +
+     Item 24: mode = update, offset = 1448, tuple = ('37', 'val37')   +
+     Item 25: mode = update, offset = 1488, tuple = ('38', 'val38')   +
+     Item 26: mode = update, offset = 1528, tuple = ('40', 'val40')   +
+     Item 27: mode = update, offset = 1568, tuple = ('41', 'val41')   +
+     Item 28: mode = update, offset = 1608, tuple = ('43', 'val43')   +
+     Item 29: mode = update, offset = 1648, tuple = ('44', 'val44')   +
+     Item 30: mode = update, offset = 1688, tuple = ('46', 'val46')   +
+     Item 31: mode = update, offset = 1728, tuple = ('47', 'val47')   +
+     Item 32: mode = update, offset = 1768, tuple = ('49', 'val49')   +
+     Item 33: mode = update, offset = 1808, tuple = ('50', 'val50')   +
+     Item 34: mode = update, offset = 1848, tuple = ('52', 'val52')   +
+     Item 35: mode = update, offset = 1888, tuple = ('53', 'val53')   +
+     Item 36: mode = update, offset = 1928, tuple = ('55', 'val55')   +
+     Item 37: mode = update, offset = 1968, tuple = ('56', 'val56')   +
+     Item 38: mode = update, offset = 2008, tuple = ('58', 'val58')   +
+     Item 39: mode = update, offset = 2048, tuple = ('59', 'val59')   +
+     Item 40: mode = update, offset = 2088, tuple = ('61', 'val61')   +
+     Item 41: mode = update, offset = 2128, tuple = ('62', 'val62')   +
+     Item 42: mode = update, offset = 2168, tuple = ('64', 'val64')   +
+     Item 43: mode = update, offset = 2208, tuple = ('65', 'val65')   +
+     Item 44: mode = update, offset = 2248, tuple = ('67', 'val67')   +
+     Item 45: mode = update, offset = 2288, tuple = ('68', 'val68')   +
+     Item 46: mode = update, offset = 2328, tuple = ('70', 'val70')   +
+     Item 47: mode = update, offset = 2368, tuple = ('71', 'val71')   +
+     Item 48: mode = update, offset = 2408, tuple = ('73', 'val73')   +
+     Item 49: mode = update, offset = 2448, tuple = ('74', 'val74')   +
+     Item 50: mode = update, offset = 2488, tuple = ('76', 'val76')   +
+     Item 51: mode = update, offset = 2528, tuple = ('77', 'val77')   +
+     Item 52: mode = update, offset = 2568, tuple = ('79', 'val79')   +
+     Item 53: mode = update, offset = 2608, tuple = ('80', 'val80')   +
+     Item 54: mode = update, offset = 2648, tuple = ('82', 'val82')   +
+     Item 55: mode = update, offset = 2688, tuple = ('83', 'val83')   +
+     Item 56: mode = update, offset = 2728, tuple = ('85', 'val85')   +
+     Item 57: mode = update, offset = 2768, tuple = ('86', 'val86')   +
+     Item 58: mode = update, offset = 2808, tuple = ('88', 'val88')   +
+     Item 59: mode = update, offset = 2848, tuple = ('89', 'val89')   +
+     Item 60: mode = update, offset = 2888, tuple = ('91', 'val91')   +
+     Item 61: mode = update, offset = 2928, tuple = ('92', 'val92')   +
+     Item 62: mode = update, offset = 2968, tuple = ('94', 'val94')   +
+     Item 63: mode = update, offset = 3008, tuple = ('95', 'val95')   +
+     Item 64: mode = update, offset = 3048, tuple = ('97', 'val97')   +
+     Item 65: mode = update, offset = 3088, tuple = ('98', 'val98')   +
+     Item 66: mode = update, offset = 3128, tuple = ('100', 'val100') +
+     Item 67: mode = update, offset = 3168, tuple = ('101', 'val101') +
+     Item 68: mode = update, offset = 3208, tuple = ('103', 'val103') +
+     Item 69: mode = update, offset = 3248, tuple = ('104', 'val104') +
+     Item 70: mode = update, offset = 3288, tuple = ('106', 'val106') +
+     Item 71: mode = update, offset = 3328, tuple = ('107', 'val107') +
+     Item 72: mode = update, offset = 3368, tuple = ('109', 'val109') +
+     Item 73: mode = update, offset = 3408, tuple = ('110', 'val110') +
+     Item 74: mode = update, offset = 3448, tuple = ('112', 'val112') +
+     Item 75: mode = update, offset = 3488, tuple = ('113', 'val113') +
+     Item 76: mode = update, offset = 3528, tuple = ('115', 'val115') +
+     Item 77: mode = update, offset = 3568, tuple = ('116', 'val116') +
+     Item 78: mode = update, offset = 3608, tuple = ('118', 'val118') +
+     Item 79: mode = update, offset = 3648, tuple = ('119', 'val119') +
+     Item 80: mode = update, offset = 3688, tuple = ('121', 'val121') +
+     Item 81: mode = update, offset = 3728, tuple = ('122', 'val122') +
+     Item 82: mode = update, offset = 3768, tuple = ('124', 'val124') +
+     Item 83: mode = update, offset = 3808, tuple = ('125', 'val125') +
+     Item 84: mode = update, offset = 3848, tuple = ('127', 'val127') +
+     Item 85: mode = update, offset = 3888, tuple = ('128', 'val128') +
+     Item 86: mode = update, offset = 3928, tuple = ('130', 'val130') +
+     Item 87: mode = update, offset = 3968, tuple = ('131', 'val131') +
+     Item 88: mode = update, offset = 4008, tuple = ('133', 'val133') +
+     Item 89: mode = update, offset = 4048, tuple = ('134', 'val134') +
+     Item 90: mode = update, offset = 4088, tuple = ('136', 'val136') +
+     Item 91: mode = update, offset = 4128, tuple = ('137', 'val137') +
+     Item 92: mode = update, offset = 4168, tuple = ('139', 'val139') +
+     Item 93: mode = update, offset = 4208, tuple = ('140', 'val140') +
+     Item 94: mode = update, offset = 4248, tuple = ('142', 'val142') +
+     Item 95: mode = update, offset = 4288, tuple = ('143', 'val143') +
+     Item 96: mode = update, offset = 4328, tuple = ('145', 'val145') +
+     Item 97: mode = update, offset = 4368, tuple = ('146', 'val146') +
+     Item 98: mode = update, offset = 4408, tuple = ('148', 'val148') +
+     Item 99: mode = update, offset = 4448, tuple = ('149', 'val149') +
+     Item 100: mode = update, offset = 4488, tuple = ('151', 'val151')+
+     Item 101: mode = update, offset = 4528, tuple = ('152', 'val152')+
+     Item 102: mode = update, offset = 4568, tuple = ('154', 'val154')+
+     Item 103: mode = update, offset = 4608, tuple = ('155', 'val155')+
+     Item 104: mode = update, offset = 4648, tuple = ('157', 'val157')+
+     Item 105: mode = update, offset = 4688, tuple = ('158', 'val158')+
+     Item 106: mode = update, offset = 4728, tuple = ('160', 'val160')+
+     Item 107: mode = update, offset = 4768, tuple = ('161', 'val161')+
+     Item 108: mode = update, offset = 4808, tuple = ('163', 'val163')+
+     Item 109: mode = update, offset = 4848, tuple = ('164', 'val164')+
+     Item 110: mode = update, offset = 4888, tuple = ('166', 'val166')+
+     Item 111: mode = update, offset = 4928, tuple = ('167', 'val167')+
+     Item 112: mode = update, offset = 4968, tuple = ('169', 'val169')+
+     Item 113: mode = update, offset = 5008, tuple = ('170', 'val170')+
+                                                                      +
+ 
+(1 row)
+
+ROLLBACK;
+SELECT orioledb_idx_structure('o_test'::regclass, 'o_test_pkey', 'nue', 3);
+                       orioledb_idx_structure                        
+---------------------------------------------------------------------
+ Index o_test_pkey contents                                         +
+ Page 0: level = 0, maxKeyLen = 8, nVacatedBytes = 0                +
+ state = free, datoid equal, relnode equal, ix_type = primary, dirty+
+     Leftmost, Rightmost                                            +
+   Chunk 0: offset = 0, location = 256, hikey location = 64         +
+                                                                    +
+ 
+(1 row)
+
+SELECT COUNT(*) FROM o_test;
+ count 
+-------
+     0
+(1 row)
+
+DROP TABLE o_test;
+-- INSERT INTO o_test SELECT i, 'val' || i FROM generate_series(1, 10000000) s(i);
+-- COPY o_test TO '/tmp/o_test.csv' WITH (FORMAT csv);
+-- TRUNCATE o_test;
+DROP EXTENSION orioledb CASCADE;
