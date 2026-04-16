@@ -391,6 +391,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	bool		use_ctid = primary->primaryIsCtid;
 	int			i;
 	OBatchInsertState batch_state;
+	OTuple	   *batch_tuples = NULL;
 	TupleTableSlot *slot;
 
 	o_btree_ensure_initialized(&primary->desc);
@@ -398,15 +399,14 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	reserve_undo_size(UndoLogRegular, MAXIMUM_ALIGNOF);
 	orioledb_multi_insert_reset_head();
 	memset(&batch_state, 0, sizeof(batch_state));
-	batch_state.capacity = ntuples;
+	batch_state.capacity = Max(ntuples, 8);
+	batch_state.tuples = palloc(sizeof(OTuple *) * batch_state.capacity);
+	batch_state.leaf_headers = palloc(sizeof(BTreeLeafTuphdr) * batch_state.capacity);
+	batch_state.tuplens = palloc(sizeof(LocationIndex) * batch_state.capacity);
+	batch_state.orig_slots = palloc(sizeof(TupleTableSlot *) * batch_state.capacity);
+	batch_state.slots = palloc(sizeof(TupleTableSlot *) * batch_state.capacity);
 	if (ntuples > 0)
-	{
-		batch_state.tuples = palloc(sizeof(OTuple *) * ntuples);
-		batch_state.leaf_headers = palloc(sizeof(BTreeLeafTuphdr) * ntuples);
-		batch_state.tuplens = palloc(sizeof(LocationIndex) * ntuples);
-		batch_state.orig_slots = palloc(sizeof(TupleTableSlot *) * ntuples);
-		batch_state.slots = palloc(sizeof(TupleTableSlot *) * ntuples);
-	}
+		batch_tuples = palloc(sizeof(OTuple) * ntuples);
 
 	for (i = 0; i < ntuples; i++)
 	{
@@ -416,7 +416,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 		BTreeLeafTuphdr leaf_header;
 
 		slot = slots[i];
-		tuple_ptr = palloc(sizeof(OTuple));
+		tuple_ptr = &batch_tuples[i];
 
 		if (slot->tts_ops != descr->newTuple->tts_ops ||
 			(((OTableSlot *) slot)->descr != NULL &&
@@ -488,6 +488,13 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	}
 
 	orioledb_multi_insert_reset_head();
+	if (batch_tuples != NULL)
+		pfree(batch_tuples);
+	pfree(batch_state.tuples);
+	pfree(batch_state.leaf_headers);
+	pfree(batch_state.tuplens);
+	pfree(batch_state.orig_slots);
+	pfree(batch_state.slots);
 }
 
 static RowLockMode
