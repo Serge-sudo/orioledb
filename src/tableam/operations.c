@@ -447,7 +447,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 		orioledb_batch_state_add(&batch_state,
 								   slots[i],
 								   slot,
-								   tuple,
+								   &tuple,
 								   tuplen,
 								   leaf_header);
 	}

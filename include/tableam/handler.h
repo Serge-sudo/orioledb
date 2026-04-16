@@ -245,7 +245,7 @@ extern TupleTableSlot * orioledb_batch_state_get_orig_slot(void);
 extern OBatchInsertState * orioledb_batch_state_add(OBatchInsertState *state,
 													  TupleTableSlot *orig_slot,
 													  TupleTableSlot *slot,
-													  OTuple tuple,
+													  const OTuple *tuple,
 													  LocationIndex tuplen,
 													  BTreeLeafTuphdr leaf_header);
 extern void orioledb_batch_state_advance(void);

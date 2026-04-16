@@ -1897,7 +1897,7 @@ OBatchInsertState *
 orioledb_batch_state_add(OBatchInsertState *state,
 						   TupleTableSlot *orig_slot,
 						   TupleTableSlot *slot,
-						   OTuple tuple,
+						   const OTuple *tuple,
 						   LocationIndex tuplen,
 						   BTreeLeafTuphdr leaf_header)
 {
@@ -1918,7 +1918,7 @@ orioledb_batch_state_add(OBatchInsertState *state,
 	entry = &batch_state->entries[batch_state->nitems];
 	entry->orig_slot = orig_slot;
 	entry->slot = slot;
-	entry->tuple = tuple;
+	entry->tuple = *tuple;
 	entry->tuplen = tuplen;
 	entry->leaf_header = leaf_header;
 	batch_state->nitems++;
