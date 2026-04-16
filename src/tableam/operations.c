@@ -405,8 +405,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	batch_state.tuplens = palloc(sizeof(LocationIndex) * batch_state.capacity);
 	batch_state.orig_slots = palloc(sizeof(TupleTableSlot *) * batch_state.capacity);
 	batch_state.slots = palloc(sizeof(TupleTableSlot *) * batch_state.capacity);
-	if (ntuples > 0)
-		batch_tuples = palloc(sizeof(OTuple) * ntuples);
+	batch_tuples = palloc(sizeof(OTuple) * batch_state.capacity);
 
 	for (i = 0; i < ntuples; i++)
 	{
@@ -488,8 +487,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	}
 
 	orioledb_multi_insert_reset_head();
-	if (batch_tuples != NULL)
-		pfree(batch_tuples);
+	pfree(batch_tuples);
 	pfree(batch_state.tuples);
 	pfree(batch_state.leaf_headers);
 	pfree(batch_state.tuplens);
