@@ -225,18 +225,24 @@ extern bool in_nontransactional_truncate;
 
 typedef struct OBatchInsertState
 {
-	OTuple		tuple;
-	BTreeLeafTuphdr leaf_header;
-	LocationIndex tuplen;
-	TupleTableSlot *orig_slot;
-	TupleTableSlot *slot;
-	int 	nitems;
-	struct OBatchInsertState *next;
+	OTuple	  **tuples;
+	BTreeLeafTuphdr *leaf_headers;
+	LocationIndex *tuplens;
+	TupleTableSlot **orig_slots;
+	TupleTableSlot **slots;
+	int			nitems;
+	int			capacity;
+	int			current;
 } OBatchInsertState;
 
 extern TupleTableSlot * orioledb_multi_insert_get_slot(void);
 extern TupleTableSlot * orioledb_multi_insert_get_orig_slot(void);
-extern OBatchInsertState * orioledb_multi_insert_push(OBatchInsertState *state);
+extern OBatchInsertState * orioledb_multi_insert_push(OBatchInsertState *state,
+													  TupleTableSlot *orig_slot,
+													  TupleTableSlot *slot,
+													  OTuple *tuple,
+													  LocationIndex tuplen,
+													  BTreeLeafTuphdr leaf_header);
 extern void orioledb_multi_insert_next(void);
 extern int orioledb_multi_insert_get_nitems(void);
 extern bool

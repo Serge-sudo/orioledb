@@ -390,20 +390,33 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 	OIndexDescr *primary = GET_PRIMARY(descr);
 	bool		use_ctid = primary->primaryIsCtid;
 	int			i;
-	OBatchInsertState *batch_state = NULL;
+	OBatchInsertState batch_state;
 	TupleTableSlot *slot;
 
 	o_btree_ensure_initialized(&primary->desc);
 
 	reserve_undo_size(UndoLogRegular, MAXIMUM_ALIGNOF);
 	orioledb_multi_insert_reset_head();
+	memset(&batch_state, 0, sizeof(batch_state));
+	batch_state.capacity = ntuples;
+	if (ntuples > 0)
+	{
+		batch_state.tuples = palloc(sizeof(OTuple *) * ntuples);
+		batch_state.leaf_headers = palloc(sizeof(BTreeLeafTuphdr) * ntuples);
+		batch_state.tuplens = palloc(sizeof(LocationIndex) * ntuples);
+		batch_state.orig_slots = palloc(sizeof(TupleTableSlot *) * ntuples);
+		batch_state.slots = palloc(sizeof(TupleTableSlot *) * ntuples);
+	}
 
 	for (i = 0; i < ntuples; i++)
 	{
-		slot = slots[i];
-		OBatchInsertState *state = (OBatchInsertState *) palloc0(sizeof(OBatchInsertState));
+		OTuple		tuple;
+		OTuple	   *tuple_ptr;
+		LocationIndex tuplen;
+		BTreeLeafTuphdr leaf_header;
 
-		state->orig_slot = slot;
+		slot = slots[i];
+		tuple_ptr = palloc(sizeof(OTuple));
 
 		if (slot->tts_ops != descr->newTuple->tts_ops ||
 			(((OTableSlot *) slot)->descr != NULL &&
@@ -413,8 +426,6 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 			ExecCopySlot(descr->newTuple, slot);
 			slot = descr->newTuple;
 		}
-
-		state->slot = slot;
 
 		if (use_ctid)
 		{
@@ -427,21 +438,27 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 		if (descr->bridge)
 			o_apply_new_bridge_index_ctid(descr, relation, slot, csn, true);
 		tts_orioledb_toast(slot, descr);
-		state->tuple = tts_orioledb_form_tuple(slot, descr);
-		o_btree_check_size_of_tuple(o_tuple_size(state->tuple, &primary->leafSpec),
+		tuple = tts_orioledb_form_tuple(slot, descr);
+		o_btree_check_size_of_tuple(o_tuple_size(tuple, &primary->leafSpec),
 									RelationGetRelationName(relation),
 									false);
-		state->tuplen = o_btree_len(&primary->desc, state->tuple, OTupleLength);
-		state->leaf_header.deleted = BTreeLeafTupleNonDeleted;
-		state->leaf_header.formatFlags = 0;
-		state->leaf_header.chainHasLocks = false;
-		state->leaf_header.undoLocation = InvalidUndoLocation;
+		tuplen = o_btree_len(&primary->desc, tuple, OTupleLength);
+		leaf_header.deleted = BTreeLeafTupleNonDeleted;
+		leaf_header.formatFlags = 0;
+		leaf_header.chainHasLocks = false;
+		leaf_header.undoLocation = InvalidUndoLocation;
 		if (primary->desc.undoType == UndoLogRegular && !is_recovery_process())
-			state->leaf_header.undoLocation |= current_command_get_undo_location();
-		state->leaf_header.xactInfo = OXID_GET_XACT_INFO(oxid,
-													  RowLockUpdate,
-													  false);
-		batch_state = orioledb_multi_insert_push(state);
+			leaf_header.undoLocation |= current_command_get_undo_location();
+		leaf_header.xactInfo = OXID_GET_XACT_INFO(oxid,
+												  RowLockUpdate,
+												  false);
+		*tuple_ptr = tuple;
+		orioledb_multi_insert_push(&batch_state,
+								   slots[i],
+								   slot,
+								   tuple_ptr,
+								   tuplen,
+								   leaf_header);
 	}
 
 	while ((slot = orioledb_multi_insert_get_slot()) != NULL)
@@ -452,7 +469,7 @@ o_tbl_batch_insert(OTableDescr *descr, Relation relation,
 
 	pgstat_count_heap_insert(relation, ntuples);
 
-	orioledb_multi_insert_set_head(batch_state);
+	orioledb_multi_insert_set_head(&batch_state);
 	while ((slot = orioledb_multi_insert_get_orig_slot()) != NULL)
 	{
 		OTuple tup;

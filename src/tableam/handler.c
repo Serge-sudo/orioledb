@@ -1871,18 +1871,14 @@ orioledb_getnextslot(TableScanDesc sscan, ScanDirection direction,
 }
 
 
-OBatchInsertState *batch_head = NULL;
-OBatchInsertState *batch_tail = NULL;
+OBatchInsertState *batch_state = NULL;
 
 TupleTableSlot *
 orioledb_multi_insert_get_slot(void)
 {
-	OBatchInsertState * cur = batch_head;
-
-	if (cur)
-	{
-		return cur->slot;
-	}
+	if (batch_state != NULL &&
+		batch_state->current < batch_state->nitems)
+		return batch_state->slots[batch_state->current];
 
 	return NULL;
 }
@@ -1890,54 +1886,76 @@ orioledb_multi_insert_get_slot(void)
 TupleTableSlot *
 orioledb_multi_insert_get_orig_slot(void)
 {
-	OBatchInsertState * cur = batch_head;
-
-	if (cur)
-	{
-		return cur->orig_slot;
-	}
+	if (batch_state != NULL &&
+		batch_state->current < batch_state->nitems)
+		return batch_state->orig_slots[batch_state->current];
 
 	return NULL;
 }
 
 OBatchInsertState *
-orioledb_multi_insert_push(OBatchInsertState *state)
+orioledb_multi_insert_push(OBatchInsertState *state,
+						   TupleTableSlot *orig_slot,
+						   TupleTableSlot *slot,
+						   OTuple *tuple,
+						   LocationIndex tuplen,
+						   BTreeLeafTuphdr leaf_header)
 {
-	if (!batch_head)
+	if (batch_state == NULL)
 	{
-		batch_head = state;
-		batch_tail = state;
-		batch_head->nitems = 1;
-	}
-	else
-	{
-		int num = batch_tail->nitems + 1;
-		batch_tail->next = state;
-		batch_tail = state;
-		batch_tail->nitems = num;
+		batch_state = state;
+		batch_state->current = 0;
+		batch_state->nitems = 0;
 	}
 
-	return batch_head;
+	Assert(batch_state == state);
+
+	if (batch_state->nitems >= batch_state->capacity)
+	{
+		int			new_capacity = Max(batch_state->capacity * 2, 8);
+
+		batch_state->tuples = repalloc(batch_state->tuples,
+									   sizeof(OTuple *) * new_capacity);
+		batch_state->leaf_headers = repalloc(batch_state->leaf_headers,
+											 sizeof(BTreeLeafTuphdr) * new_capacity);
+		batch_state->tuplens = repalloc(batch_state->tuplens,
+										sizeof(LocationIndex) * new_capacity);
+		batch_state->orig_slots = repalloc(batch_state->orig_slots,
+										   sizeof(TupleTableSlot *) * new_capacity);
+		batch_state->slots = repalloc(batch_state->slots,
+									  sizeof(TupleTableSlot *) * new_capacity);
+		batch_state->capacity = new_capacity;
+	}
+
+	batch_state->orig_slots[batch_state->nitems] = orig_slot;
+	batch_state->slots[batch_state->nitems] = slot;
+	batch_state->tuples[batch_state->nitems] = tuple;
+	batch_state->tuplens[batch_state->nitems] = tuplen;
+	batch_state->leaf_headers[batch_state->nitems] = leaf_header;
+	batch_state->nitems++;
+
+	return batch_state;
 }
 
 void
 orioledb_multi_insert_reset_head(void)
 {
-	batch_head = NULL;
-	batch_tail = NULL;
+	batch_state = NULL;
 }
 
 void
 orioledb_multi_insert_set_head(OBatchInsertState *state)
 {
-	batch_head = state;
+	batch_state = state;
+	if (batch_state != NULL)
+		batch_state->current = 0;
 }
 
 int
 orioledb_multi_insert_get_nitems(void)
 {
-	if (batch_tail)
-		return Min(batch_tail->nitems, 100);
+	if (batch_state)
+		return Min(batch_state->nitems, 100);
 
 	return 0;
 }
@@ -1945,13 +1963,11 @@ orioledb_multi_insert_get_nitems(void)
 OTuple
 orioledb_multi_insert_get_tuple(void)
 {
-	OBatchInsertState * cur = batch_head;
 	OTuple		tuple;
 
-	if (cur)
-	{
-		return cur->tuple;
-	}
+	if (batch_state != NULL &&
+		batch_state->current < batch_state->nitems)
+		return *batch_state->tuples[batch_state->current];
 
 	O_TUPLE_SET_NULL(tuple);
 	return tuple;
@@ -1960,18 +1976,15 @@ orioledb_multi_insert_get_tuple(void)
 bool
 orioledb_multi_insert_is_finished(void)
 {
-	return batch_head == NULL;
+	return batch_state == NULL || batch_state->current >= batch_state->nitems;
 }
 
 LocationIndex
 orioledb_multi_insert_get_tuplen(void)
 {
-	OBatchInsertState * cur = batch_head;
-
-	if (cur)
-	{
-		return cur->tuplen;
-	}
+	if (batch_state != NULL &&
+		batch_state->current < batch_state->nitems)
+		return batch_state->tuplens[batch_state->current];
 
 	return 0;
 }
@@ -1979,12 +1992,9 @@ orioledb_multi_insert_get_tuplen(void)
 BTreeLeafTuphdr
 orioledb_multi_insert_get_leaf_header(void)
 {
-	OBatchInsertState * cur = batch_head;
-
-	if (cur)
-	{
-		return cur->leaf_header;
-	}
+	if (batch_state != NULL &&
+		batch_state->current < batch_state->nitems)
+		return batch_state->leaf_headers[batch_state->current];
 
 	BTreeLeafTuphdr result = {0};
 	return result;
@@ -1993,8 +2003,9 @@ orioledb_multi_insert_get_leaf_header(void)
 void
 orioledb_multi_insert_next(void)
 {
-	if (batch_head)
-		batch_head = batch_head->next;
+	if (batch_state != NULL &&
+		batch_state->current < batch_state->nitems)
+		batch_state->current++;
 }
 
 static bool
@@ -2040,8 +2051,7 @@ orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		return;
 
 	descr = relation_get_descr(relation);
-	batch_head = NULL;
-	batch_tail = NULL;
+	batch_state = NULL;
 
 	if (o_can_batch_slots(descr, slots, ntuples))
 	{
