@@ -1,0 +1,122 @@
+---
+id: primary-index-build
+sidebar_label: Primary index build
+---
+
+# Primary index build
+
+OrioleDB tables are index-organized: the primary index is the table storage. Building
+or rebuilding a primary index therefore rewrites the whole table tree together with
+TOAST and bridge structures (when present). The process is implemented in
+`src/catalog/indices.c` and the page builder in `src/btree/build.c`.
+
+## When a primary build runs
+
+- Creating or redefining a primary index calls `rebuild_indices()` to rewrite the
+  table (`indices.c`).
+- Dropping a primary index uses `drop_primary_index()` which recreates table OIDs and
+  then invokes `rebuild_indices()` to produce a new primary tree without the dropped
+  key.
+- Both paths insert shared-root placeholders via `rebuild_indices_insert_placeholders()`
+  so the checkpointer skips incomplete trees until headers are written.
+
+The build is **not concurrent** with user writes: table metadata is locked and the
+operation requires table rewrite privileges (similar to PostgreSQL’s `REINDEX TABLE`,
+not `CREATE INDEX CONCURRENTLY`).
+
+## High-level stages and key functions
+
+1. **Preparation & relfilenodes**
+   - `assign_new_oids()` picks fresh relfilenodes for the table and every index/TOAST
+     tree before the rewrite.
+   - `rebuild_indices_insert_placeholders()` places shared-root placeholders so
+     checkpoint walks skip trees being built.
+
+2. **Choose serial vs parallel build**
+   - `rebuild_indices()` tries `_o_index_begin_parallel()` when
+     `max_parallel_maintenance_workers > 0`, a snapshot is active, the primary is not
+     the synthetic `ctid` index, and no bridge index has to be created.
+   - `_o_index_begin_parallel()` sets up DSM, serializes table metadata, and launches
+     workers (or recovery workers in WAL replay) via `_o_index_parallel_build_inner()`.
+   - If no workers are available the build falls back to the serial path.
+
+3. **Heap (primary tree) scan and spooling**
+   - Serial path: `rebuild_indices_worker_heap_scan()` scans the *old* primary tree
+     with `make_btree_seq_scan()`, detoasts tuples, re-toasts for the new schema, and
+     evaluates predicates.
+   - For each qualifying tuple it:
+     - Forms the new primary tuple with `tts_orioledb_form_orphan_tuple()` (assigning
+       synthetic `ctid` or bridge `ctid` when required).
+     - Builds secondary index tuples with `tts_orioledb_make_secondary_tuple()`.
+     - Adds TOAST and bridge entries to their dedicated tuplesorts.
+   - Parallel path: `rebuild_indices_worker_sort()` performs the same scan in each
+     worker, writing into participant tuplesorts and accumulating tuple counts in
+     shared `oIdxShared`.
+   - Page residency rationale: the sequential scan is expected to pull pages into the
+     shared buffer pool so later batches (workers or leader) can reuse them without
+     repeated disk reads. If pages are not cached, tuplesort accumulation becomes
+     I/O-bound; ensuring scan uses shared buffers (not direct/local buffers) is key to
+     keep heap-to-sort throughput stable. For buffer manager mechanics (separate from
+     WAL/undo buffering), see `doc/architecture/buffering.mdx`.
+
+4. **Sorting**
+   - `tuplesort_begin_orioledb_index()` / `tuplesort_begin_orioledb_toast()` create
+     sort states per index, TOAST, and optional bridge tree; workers call
+     `tuplesort_performsort()` on their partitions.
+   - The leader (or serial path) finishes the coordinated sorts after all workers
+     signal `_o_index_parallel_heapscan()` completion.
+
+5. **Page construction**
+   - `btree_write_index_data()` streams sorted tuples into new tree files. Internally
+     it uses the sort-based builder in `src/btree/build.c` (e.g.
+     `put_item_to_stack()`, `stack_page_split()`, `btree_page_reorg()`) to pack items
+     according to fillfactor, create right-links/high-keys, and assemble the root.
+   - Strategy of `btree_write_index_data()`:
+     1. Read tuples from tuplesort in key order; form leaf pages until they hit
+        fillfactor, splitting with `stack_page_split()` as needed.
+     2. Maintain an in-memory stack of partially built pages at each level; when a
+        leaf splits, a downlink (high-key + right-link) is pushed upward via
+        `put_downlink_to_stack()`.
+     3. Internal pages are filled the same way; splits bubble up until a new root is
+        produced. Right-links and high-keys are assigned as pages are sealed.
+     4. Completed pages are written sequentially with `btree_page_reorg()` ensuring
+        compact layout and flags; the metapage is emitted last with root info and
+        checkpoint number.
+   - Practical tuning levers and typical bottlenecks:
+     - **Fill factor & tuple size spread**: higher fillfactor reduces file size but
+       makes `stack_page_split()` happen more often; uneven tuple sizes can cause
+       repeated split/reorg work.
+     - **Sort output locality**: well-ordered tuples minimize `page_locator` walks and
+       reduce memmove during `btree_page_reorg()`.
+     - **Hot spots in builder**: page zeroing and tuple copies inside
+       `put_item_to_stack()`/`stack_page_split()` dominate CPU; the max-key recalculation
+       (`btree_page_update_max_key_len()`) and high-key generation can be sensitive to
+       wide keys.
+     - **I/O pattern**: `btree_write_index_data()` writes pages sequentially; ensuring
+       enough `work_mem`/`maintenance_work_mem` for sorting reduces backpressure and
+       keeps the write path streaming.
+
+6. **Finalize files and metadata**
+   - `btree_write_file_header()` writes the metapage header (including checkpoint
+     number) for each built tree and removes the shared-root placeholders.
+   - Stats are updated via `index_update_stats()` for the table (heap tuple count) and
+     for each index, and new relfilenodes are registered.
+   - In S3 mode, `s3_queue_wait_for_location()` waits for remote durability.
+
+## Parallelism and recovery support
+
+- Parallel primary builds rely on `max_parallel_maintenance_workers`; the leader may
+  participate unless disabled. Workers run `_o_index_parallel_build_inner()`, execute
+  `rebuild_indices_worker_sort()`, and report progress through shared memory.
+- During crash recovery, `_o_index_begin_parallel()` reuses recovery workers (controlled
+  by `recovery_idx_pool_size_guc`) for the same pipeline, skipping backend parallel
+  contexts.
+- If parallel workers cannot start, the code continues serially to avoid build
+  failure.
+
+## What is not supported
+
+- **Concurrent** primary index build (à la `CREATE INDEX CONCURRENTLY`) is not
+  implemented because the primary index owns the table storage.
+- Parallel build is skipped when the primary is the default `ctid` index or when a
+  bridge index needs to be introduced during the rebuild.
