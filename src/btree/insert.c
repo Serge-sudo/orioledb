@@ -31,6 +31,24 @@
 #include "miscadmin.h"
 #include "utils/memutils.h"
 
+/*
+ * Thread-local context for batch insert operations.
+ * When a batch insert is in progress, this context tracks the remaining tuples
+ * so that when we acquire a page lock during insertion, we can check if there
+ * are more tuples from the same batch that should be inserted together.
+ */
+typedef struct
+{
+	BTreeDescr *desc;
+	TupleTableSlot **slots;
+	int			ntuples;
+	int			current_index;
+	bool	   *inserted;		/* tracks which tuples have been inserted */
+	OTupleXactInfo xactInfo;
+} OBatchInsertContext;
+
+static OBatchInsertContext *currentBatchInsert = NULL;
+
 /* In order to avoid use of the recursion in insert_leaf() we use context. */
 typedef struct BTreeInsertStackItem
 {
@@ -1432,6 +1450,18 @@ o_btree_insert_item(BTreeInsertStackItem *insert_item, int reserve_kind)
 			}
 
 			tupleWaitersCount = get_waiters_with_tuples(desc, blkno, tupleWaiterProcnums);
+
+			/*
+			 * Check if we have a batch insert in progress. If so, check if there
+			 * are more tuples from the batch that can be inserted into this page.
+			 * This leverages the ordered insertion mechanism: when we have the
+			 * page lock, we can insert multiple tuples from the same batch together.
+			 */
+			if (currentBatchInsert != NULL &&
+				currentBatchInsert->desc == desc)
+			{
+				/* TODO: Add batch tuples to the insertion */
+			}
 		}
 		else
 			tupleWaitersCount = 0;
