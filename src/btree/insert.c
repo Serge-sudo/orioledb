@@ -1487,3 +1487,367 @@ o_btree_insert_tuple_to_leaf(OBTreeFindPageContext *context,
 		MemoryContextResetOnly(btree_insert_context);
 	}
 }
+
+/*
+ * Insert multiple tuples to a leaf page at once.
+ *
+ * Tries to insert as many tuples as will fit on the current page.
+ * Returns the number of tuples inserted successfully. If not all
+ * tuples fit, the caller should find a new location for the remaining
+ * tuples and call this function again.
+ *
+ * This function expects the page to already be locked via the find_page
+ * mechanism. It will unlock the page before returning.
+ *
+ * The function processes tuples in order, inserting each one that fits.
+ * Once a tuple doesn't fit, it stops and returns the count of successfully
+ * inserted tuples. The caller is responsible for:
+ * 1. Finding a new page location for the remaining tuples
+ * 2. Calling this function again with the remaining tuples
+ *
+ * Example usage:
+ *   int remaining = ntuples;
+ *   int offset = 0;
+ *   while (remaining > 0) {
+ *       int inserted;
+ *       // Find page for the next tuple
+ *       find_page(context, &tuples[offset], BTreeKeyLeafTuple, 0);
+ *       // Insert as many as fit
+ *       o_btree_insert_tuples_to_leaf(context,
+ *                                      &tuples[offset],
+ *                                      &tuplens[offset],
+ *                                      &headers[offset],
+ *                                      remaining,
+ *                                      reserve_kind,
+ *                                      &inserted);
+ *       offset += inserted;
+ *       remaining -= inserted;
+ *   }
+ *
+ * Parameters:
+ *  - context: page find context with the target page already located and locked
+ *  - tuples: array of tuples to insert (should be sorted if needed)
+ *  - tuplens: array of tuple lengths
+ *  - leaf_headers: array of leaf tuple headers
+ *  - ntuples: number of tuples in the arrays
+ *  - reserve_kind: page pool reservation kind
+ *  - inserted_count: output parameter, set to number of tuples inserted
+ *
+ * Returns: number of tuples successfully inserted (may be less than ntuples
+ *          if page runs out of space)
+ */
+int
+o_btree_insert_tuples_to_leaf(OBTreeFindPageContext *context,
+							   OTuple *tuples, LocationIndex *tuplens,
+							   BTreeLeafTuphdr *leaf_headers, int ntuples,
+							   int reserve_kind, int *inserted_count,
+							   bool check_unique, int *dup_idx_out)
+{
+	BTreeDescr *desc = context->desc;
+	OInMemoryBlkno blkno;
+	Page		p;
+	BTreePageHeader *header;
+	BTreePageItemLocator loc;
+	MemoryContext prev_context;
+	bool		nested_call;
+	int			i;
+	int			inserted = 0;
+	int			dup_idx = -1;
+	CommitSeqNo csn;
+	bool		loc_initialized = false;
+	bool		append_hint = false;
+
+	if (dup_idx_out)
+		*dup_idx_out = -1;
+
+	if (ntuples <= 0)
+	{
+		*inserted_count = 0;
+		return 0;
+	}
+
+	nested_call = CurrentMemoryContext == btree_insert_context;
+	if (!nested_call)
+		prev_context = MemoryContextSwitchTo(btree_insert_context);
+
+	context->flags &= ~(BTREE_PAGE_FIND_FIX_LEAF_SPLIT);
+
+	blkno = context->items[context->index].blkno;
+	Assert(OInMemoryBlknoIsValid(blkno));
+	Assert(page_is_locked(blkno));
+
+	p = O_GET_IN_MEMORY_PAGE(blkno);
+	header = (BTreePageHeader *) p;
+	csn = pg_atomic_read_u64(&TRANSAM_VARIABLES->nextCommitSeqNo);
+
+	/*
+	 * Try to insert each tuple in sequence. Stop when we run out of space,
+	 * encounter a tuple that doesn't fit, or find a duplicate key.
+	 */
+	START_CRIT_SECTION();
+	page_block_reads(blkno);
+
+	for (i = 0; i < ntuples; i++)
+	{
+		LocationIndex newItemSize;
+		BTreeItemPageFitType fit;
+		Pointer		ptr;
+		LocationIndex keyLen;
+
+		/*
+		 * For index-organized tables the tuples are sorted, so stop as soon
+		 * as we hit a tuple whose key is >= the page high key — it belongs on
+		 * the next page.  The outer wrapper will call find_page() for this
+		 * tuple and restart the batch there.  For ctid (heap-organized) tables
+		 * the page is usually rightmost, so this check is a no-op.
+		 */
+		if (!O_PAGE_IS(p, RIGHTMOST))
+		{
+			OTuple		hikey;
+
+			BTREE_PAGE_GET_HIKEY(hikey, p);
+			if (o_btree_cmp(desc, &tuples[i], BTreeKeyLeafTuple,
+							&hikey, BTreeKeyNonLeafKey) >= 0)
+				break;
+		}
+
+		/*
+		 * Search for the appropriate location for this tuple.  When we know
+		 * the tuples are already in order and there are no existing items
+		 * after the previous insert position on this page, we can append to
+		 * the tail without calling btree_page_search() again.
+		 */
+		if (loc_initialized && append_hint)
+		{
+			BTREE_PAGE_LOCATOR_TAIL(p, &loc);
+		}
+		else
+		{
+			btree_page_search(desc, p, (Pointer) &tuples[i],
+							  BTreeKeyLeafTuple, NULL, &loc);
+			loc_initialized = true;
+		}
+
+		/*
+		 * Check for a duplicate key on this page (handles both existing page
+		 * tuples and in-batch tuples already inserted in this critical
+		 * section).  We look at the item at the found location: if it has the
+		 * same key and is not deleted, it is a conflict.
+		 *
+		 * Deleted tuples (deleted != BTreeLeafTupleNonDeleted) are intentionally
+		 * excluded: a key whose only on-page representation is a tombstone no
+		 * longer occupies the unique key space and may be reused by a new
+		 * insertion without violation.
+		 */
+		if (check_unique)
+		{
+			if (BTREE_PAGE_LOCATOR_IS_VALID(p, &loc))
+			{
+				BTreeLeafTuphdr *existingHdr;
+				OTuple		existingTup;
+
+				BTREE_PAGE_READ_LEAF_ITEM(existingHdr, existingTup, p, &loc);
+
+				if (existingHdr->deleted == BTreeLeafTupleNonDeleted &&
+					o_btree_cmp(desc,
+								&tuples[i], BTreeKeyLeafTuple,
+								&existingTup, BTreeKeyLeafTuple) == 0)
+				{
+					dup_idx = i;
+					break;
+				}
+			}
+			else if (loc.chunk != NULL && loc.itemOffset == loc.chunkItemsCount)
+			{
+				/*
+				 * We're appending to the end of the page.  Check the previous
+				 * tuple only, since keys are sorted and any duplicate would be
+				 * adjacent.
+				 */
+				BTreePageItemLocator prev_loc = loc;
+
+				if (BTREE_PAGE_LOCATOR_PREV(p, &prev_loc))
+				{
+					BTreeLeafTuphdr *existingHdr;
+					OTuple		existingTup;
+
+					BTREE_PAGE_READ_LEAF_ITEM(existingHdr, existingTup, p, &prev_loc);
+
+					if (existingHdr->deleted == BTreeLeafTupleNonDeleted &&
+						o_btree_cmp(desc,
+									&tuples[i], BTreeKeyLeafTuple,
+									&existingTup, BTreeKeyLeafTuple) == 0)
+					{
+						dup_idx = i;
+						break;
+					}
+				}
+			}
+		}
+
+		newItemSize = MAXALIGN(tuplens[i]) + BTreeLeafTuphdrSize;
+
+		/* Check if this tuple fits on the current page */
+		fit = page_locator_fits_item(desc, p, &loc, newItemSize, false, csn);
+
+		if (fit != BTreeItemPageFitAsIs)
+		{
+			/* No more space on this page, stop here */
+			break;
+		}
+
+		/* Insert this tuple */
+		page_locator_insert_item(p, &loc, newItemSize);
+		header->prevInsertOffset = BTREE_PAGE_LOCATOR_GET_OFFSET(p, &loc);
+
+		keyLen = MAXALIGN(o_btree_len(desc, tuples[i], OTupleKeyLengthNoVersion));
+		header->maxKeyLen = Max(header->maxKeyLen, keyLen);
+
+		/* Copy tuple header and data */
+		ptr = BTREE_PAGE_LOCATOR_GET_ITEM(p, &loc);
+		memcpy(ptr, &leaf_headers[i], BTreeLeafTuphdrSize);
+		ptr += BTreeLeafTuphdrSize;
+		memcpy(ptr, tuples[i].data, tuplens[i]);
+		BTREE_PAGE_SET_ITEM_FLAGS(p, &loc, tuples[i].formatFlags);
+
+		if (!(tuples[i].formatFlags & O_TUPLE_FLAGS_FIXED_FORMAT))
+			header->chunkDesc[loc.chunkOffset].chunkKeysFixed = 0;
+
+		page_split_chunk_if_needed(desc, p, &loc);
+
+		inserted++;
+
+		/*
+		 * Prepare a hint for the next tuple: if there are no items after the
+		 * current insertion point on this page, the next tuple (which is
+		 * greater or equal) can be appended without an additional page search.
+		 */
+		{
+			BTreePageItemLocator next_loc = loc;
+
+			append_hint = !BTREE_PAGE_LOCATOR_NEXT(p, &next_loc);
+		}
+	}
+
+	if (inserted > 0)
+	{
+		MARK_DIRTY(desc, blkno);
+	}
+
+	unlock_page(blkno);
+
+	END_CRIT_SECTION();
+
+	*inserted_count = inserted;
+	if (dup_idx_out)
+		*dup_idx_out = dup_idx;
+
+	if (!nested_call)
+	{
+		MemoryContextSwitchTo(prev_context);
+		MemoryContextResetOnly(btree_insert_context);
+	}
+
+	return inserted;
+}
+
+/*
+ * Insert all tuples to leaf pages, finding new pages as needed.
+ *
+ * This is a convenience wrapper around o_btree_insert_tuples_to_leaf()
+ * that handles the page finding loop automatically. It will keep calling
+ * find_page() and o_btree_insert_tuples_to_leaf() until all tuples are
+ * inserted.
+ *
+ * If on_duplicate is non-NULL, duplicate-key detection is enabled.  When a
+ * duplicate is found the callback is called with the absolute index of the
+ * offending tuple (relative to the original tuples[] array) and the caller-
+ * supplied duplicate_arg.  The callback is expected to call ereport(ERROR) or
+ * similar to abort the operation.
+ *
+ * Parameters:
+ *  - desc: B-tree descriptor
+ *  - tuples: array of tuples to insert
+ *  - tuplens: array of tuple lengths
+ *  - leaf_headers: array of leaf tuple headers
+ *  - ntuples: number of tuples in the arrays
+ *  - csn: commit sequence number
+ *  - reserve_kind: page pool reservation kind
+ *  - on_duplicate: optional callback invoked on duplicate key (may be NULL)
+ *  - duplicate_arg: opaque argument forwarded to on_duplicate
+ *
+ * All tuples will be inserted successfully or the function will error out.
+ */
+void
+o_btree_insert_tuples_to_leaf_all(BTreeDescr *desc,
+								   OTuple *tuples, LocationIndex *tuplens,
+								   BTreeLeafTuphdr *leaf_headers, int ntuples,
+								   CommitSeqNo csn, int reserve_kind,
+								   OBTreeBatchDuplicateCallback on_duplicate,
+								   void *duplicate_arg)
+{
+	int			remaining = ntuples;
+	int			offset = 0;
+	bool		check_unique = (on_duplicate != NULL);
+
+	if (ntuples <= 0)
+		return;
+
+	while (remaining > 0)
+	{
+		OBTreeFindPageContext context;
+		int			inserted;
+		int			dup_idx;
+
+		/* Reserve pages for potential splits */
+		ppool_reserve_pages(desc->ppool, reserve_kind, 2);
+
+		/* Find page for the next tuple */
+		init_page_find_context(&context, desc, csn,
+							   BTREE_PAGE_FIND_MODIFY | BTREE_PAGE_FIND_FIX_LEAF_SPLIT);
+
+		find_page(&context, &tuples[offset], BTreeKeyLeafTuple, 0);
+
+		/* Insert as many tuples as fit on this page */
+		o_btree_insert_tuples_to_leaf(&context,
+									   &tuples[offset],
+									   &tuplens[offset],
+									   &leaf_headers[offset],
+									   remaining,
+									   reserve_kind,
+									   &inserted,
+									   check_unique,
+									   &dup_idx);
+
+		/* Report duplicate if detected (callback is expected to ereport) */
+		if (dup_idx >= 0)
+		{
+			Assert(on_duplicate != NULL);
+			on_duplicate(offset + dup_idx, duplicate_arg);
+		}
+
+		if (inserted == 0)
+		{
+			/*
+			 * Fall back to the single-tuple insert path to allow the regular
+			 * insertion logic (including splits and compaction) to make
+			 * progress when the batch insert cannot fit the first tuple.
+			 */
+			find_page(&context, &tuples[offset], BTreeKeyLeafTuple, 0);
+			o_btree_insert_tuple_to_leaf(&context,
+										 tuples[offset],
+										 tuplens[offset],
+										 &leaf_headers[offset],
+										 false,
+										 reserve_kind);
+			offset++;
+			remaining--;
+			continue;
+		}
+
+		offset += inserted;
+		remaining -= inserted;
+	}
+
+	ppool_release_reserved(desc->ppool, PPOOL_KIND_GET_MASK(reserve_kind));
+}

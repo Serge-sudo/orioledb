@@ -1914,11 +1914,48 @@ orioledb_getnextslot(TableScanDesc sscan, ScanDirection direction,
 	return true;
 }
 
+static bool
+orioledb_can_batch_slots(OTableDescr *descr, TupleTableSlot **slots, int ntuples)
+{
+	int			i;
+
+	for (i = 0; i < ntuples; i++)
+	{
+		TupleTableSlot *slot = slots[i];
+
+		if (slot->tts_ops != descr->newTuple->tts_ops ||
+			(((OTableSlot *) slot)->descr != NULL &&
+			 ((OTableSlot *) slot)->descr != descr))
+			return false;
+	}
+
+	return true;
+}
+
 static void
 orioledb_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 					  CommandId cid, int options, BulkInsertState bistate)
 {
+	OTableDescr *descr;
+	OSnapshot	oSnapshot;
+	OXid		oxid;
 	int			i;
+
+	if (ntuples <= 0)
+		return;
+
+	if (OidIsValid(relation->rd_rel->relrewrite))
+		return;
+
+	descr = relation_get_descr(relation);
+
+	if (orioledb_can_batch_slots(descr, slots, ntuples))
+	{
+		fill_current_oxid_osnapshot(&oxid, &oSnapshot);
+		o_set_current_command(cid);
+		o_tbl_multi_insert(descr, relation, slots, ntuples, oxid, oSnapshot.csn);
+		return;
+	}
 
 	for (i = 0; i < ntuples; i++)
 		orioledb_tuple_insert(relation, slots[i], cid, options, bistate);

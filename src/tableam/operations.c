@@ -16,6 +16,7 @@
 #include "orioledb.h"
 
 #include "btree/btree.h"
+#include "btree/insert.h"
 #include "btree/iterator.h"
 #include "btree/modify.h"
 #include "btree/undo.h"
@@ -467,6 +468,199 @@ o_tbl_insert(OTableDescr *descr, Relation relation,
 		o_wal_insert(&primary->desc, tup, relation->rd_rel->relreplident, descr->version);
 
 	return slot;
+}
+
+/*
+ * Callback context for reporting duplicate key violations during batch insert.
+ */
+typedef struct
+{
+	Relation	relation;
+	OIndexDescr *primary;
+	TupleTableSlot **slots;
+} OBatchInsertDupArg;
+
+static void
+o_batch_insert_dup_callback(int tuple_idx, void *arg)
+{
+	OBatchInsertDupArg *cbarg = (OBatchInsertDupArg *) arg;
+
+	Assert(tuple_idx >= 0);
+	o_report_duplicate(cbarg->relation, cbarg->primary, cbarg->slots[tuple_idx]);
+}
+
+void
+o_tbl_multi_insert(OTableDescr *descr, Relation relation,
+				   TupleTableSlot **slots, int ntuples,
+				   OXid oxid, CommitSeqNo csn)
+{
+	OIndexDescr *primary = GET_PRIMARY(descr);
+	OTuple	   *tuples;
+	LocationIndex *tuplens;
+	BTreeLeafTuphdr *leaf_headers;
+	TupleTableSlot **prepared_slots;
+	int			i;
+	int			reserve_kind;
+	UndoLogType undoType = primary->desc.undoType;
+	bool		undo_reserved = false;
+	bool		page_undo_reserved = false;
+	bool		use_ctid = primary->primaryIsCtid;
+	OBatchInsertDupArg dup_arg;
+	OBTreeBatchDuplicateCallback dup_cb = NULL;
+
+	if (ntuples <= 0)
+		return;
+
+	/*
+	 * For index-organized (non-ctid) tables the batch insert path requires
+	 * the input to be ordered by the primary key so that each page only
+	 * receives the tuples that belong there (determined by the page high key).
+	 * Check sortedness up-front using key bounds derived from the slots.  If
+	 * the input is not sorted, fall through to per-tuple inserts which handle
+	 * arbitrary order correctly without any pre-conditions.
+	 */
+	if (!use_ctid && ntuples > 1)
+	{
+		bool		sorted = true;
+		int			j;
+
+		for (j = 0; j < ntuples - 1 && sorted; j++)
+		{
+			OBTreeKeyBound kb1,
+						kb2;
+
+			tts_orioledb_fill_key_bound(slots[j], primary, &kb1);
+			tts_orioledb_fill_key_bound(slots[j + 1], primary, &kb2);
+			if (o_btree_cmp(&primary->desc,
+							&kb1, BTreeKeyBound,
+							&kb2, BTreeKeyBound) > 0)
+				sorted = false;
+		}
+
+		if (!sorted)
+		{
+			/* Input is unsorted: use per-tuple inserts (handles own undo). */
+			for (j = 0; j < ntuples; j++)
+				o_tbl_insert(descr, relation, slots[j], oxid, csn);
+			return;
+		}
+	}
+
+	tuples = (OTuple *) palloc(sizeof(OTuple) * ntuples);
+	tuplens = (LocationIndex *) palloc(sizeof(LocationIndex) * ntuples);
+	leaf_headers = (BTreeLeafTuphdr *) palloc(sizeof(BTreeLeafTuphdr) * ntuples);
+	prepared_slots = (TupleTableSlot **) palloc(sizeof(TupleTableSlot *) * ntuples);
+
+	if (undoType != UndoLogNone && !is_recovery_process())
+	{
+		if (GET_PAGE_LEVEL_UNDO_TYPE(undoType) == undoType)
+		{
+			reserve_undo_size(undoType, O_MODIFY_UNDO_RESERVE_SIZE);
+			undo_reserved = true;
+		}
+		else
+		{
+			reserve_undo_size(undoType, 2 * O_UPDATE_MAX_UNDO_SIZE);
+			reserve_undo_size(GET_PAGE_LEVEL_UNDO_TYPE(undoType),
+							  2 * O_MAX_SPLIT_UNDO_IMAGE_SIZE);
+			undo_reserved = true;
+			page_undo_reserved = true;
+		}
+	}
+
+	if (use_ctid)
+		o_btree_load_shmem(&primary->desc);
+
+	for (i = 0; i < ntuples; i++)
+	{
+		TupleTableSlot *slot = slots[i];
+
+		if (slot->tts_ops != descr->newTuple->tts_ops ||
+			(((OTableSlot *) slot)->descr != NULL &&
+			 ((OTableSlot *) slot)->descr != descr))
+		{
+			((OTableSlot *) descr->newTuple)->descr = descr;
+			ExecCopySlot(descr->newTuple, slot);
+			slot = descr->newTuple;
+		}
+
+		prepared_slots[i] = slot;
+
+		if (use_ctid)
+		{
+			ItemPointerData iptr;
+
+			iptr = btree_ctid_get_and_inc(&primary->desc);
+			tts_orioledb_set_ctid(slot, &iptr);
+		}
+
+		if (descr->bridge)
+			o_apply_new_bridge_index_ctid(descr, relation, slot, csn, true);
+
+		tts_orioledb_toast(slot, descr);
+
+		tuples[i] = tts_orioledb_form_tuple(slot, descr);
+		o_btree_check_size_of_tuple(o_tuple_size(tuples[i], &primary->leafSpec),
+									RelationGetRelationName(relation),
+									false);
+		tuplens[i] = o_btree_len(&primary->desc, tuples[i], OTupleLength);
+
+		leaf_headers[i].deleted = BTreeLeafTupleNonDeleted;
+		leaf_headers[i].formatFlags = 0;
+		leaf_headers[i].chainHasLocks = false;
+		leaf_headers[i].undoLocation = InvalidUndoLocation;
+		if (primary->desc.undoType != UndoLogNone && !is_recovery_process())
+			leaf_headers[i].undoLocation |= current_command_get_undo_location();
+		leaf_headers[i].xactInfo = OXID_GET_XACT_INFO(oxid,
+													  RowLockUpdate,
+													  false);
+	}
+
+	if (OIDS_EQ_SYS_TREE(primary->desc.oids, SYS_TREES_SHARED_ROOT_INFO))
+		reserve_kind = PPOOL_RESERVE_SHARED_INFO_INSERT;
+	else
+		reserve_kind = PPOOL_RESERVE_INSERT;
+
+	/*
+	 * For unique primary indexes, wire up a duplicate-reporting callback so
+	 * that the batch insert path can detect conflicts on the page and report
+	 * them via the usual error path.
+	 */
+	if (primary->unique)
+	{
+		dup_arg.relation = relation;
+		dup_arg.primary = primary;
+		dup_arg.slots = prepared_slots;
+		dup_cb = o_batch_insert_dup_callback;
+	}
+
+	o_btree_insert_tuples_to_leaf_all(&primary->desc,
+									  tuples,
+									  tuplens,
+									  leaf_headers,
+									  ntuples,
+									  csn,
+									  reserve_kind,
+									  dup_cb,
+									  primary->unique ? &dup_arg : NULL);
+
+	pgstat_count_heap_insert(relation, ntuples);
+
+	for (i = 0; i < ntuples; i++)
+	{
+		o_toast_insert_values(relation, descr, prepared_slots[i], oxid, csn);
+
+		if (primary->desc.storageType == BTreeStoragePersistence)
+			o_wal_insert(&primary->desc,
+						 tuples[i],
+						 relation->rd_rel->relreplident,
+						 descr->version);
+	}
+
+	if (undo_reserved)
+		release_undo_size(undoType);
+	if (page_undo_reserved)
+		release_undo_size(GET_PAGE_LEVEL_UNDO_TYPE(undoType));
 }
 
 static RowLockMode
